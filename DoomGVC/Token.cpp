@@ -8,7 +8,7 @@ Token::Token(const string& lexeme)
 
 void Token::print()
 {
-    cout << _lexeme << " with type: " << tokenTypeToString(_type) << endl;
+    cout << _lexeme << "\r\t\twith type:\t" << tokenTypeToString(_type) << endl;
 }
 
 string Token::getLexeme()

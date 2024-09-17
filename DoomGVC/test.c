@@ -1,12 +1,9 @@
-﻿int main()
+int main()
 {
 	bool b = 100 <= 1000;
-	return "Lera";
+	for (int i = 0; i < 16; i++)
+	{
+		continue;
+	}
+	return 1;
 }
-//
-//מספר מיין()
-//{
-//	כןלא ב = 100 >= 1000;
-//
-//}
-

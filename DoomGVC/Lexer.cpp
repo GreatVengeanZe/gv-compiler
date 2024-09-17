@@ -15,7 +15,7 @@ Lexer::Lexer(const string& filePath)
 void Lexer::open()
 {
     // Openning the file binary for faster reading
-	std::ifstream in(_filePath, std::ios::binary); 
+	std::ifstream in(_filePath, std::ios::in);
 
 	if (!in.is_open())
 		ErrorHandle::raise(errorHandleType::LEXER, "File not found!");
