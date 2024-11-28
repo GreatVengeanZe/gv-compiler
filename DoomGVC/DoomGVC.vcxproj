@@ -22,6 +22,7 @@
     <ClInclude Include="ErrorHandle.h" />
     <ClInclude Include="Lexer.h" />
     <ClInclude Include="Parser.h" />
+    <ClInclude Include="SyntaxTree.h" />
     <ClInclude Include="Token.h" />
   </ItemGroup>
   <ItemGroup>
