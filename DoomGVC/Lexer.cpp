@@ -275,7 +275,7 @@ void Lexer::parseDefine(const std::string& line, std::unordered_map<std::string,
     {
         std::string name = match[1].str();
         std::string value = match[2].str();
-        defines[name] = value; // Сохраняем определение
+        defines[name] = value;
     }
 }
 
@@ -283,7 +283,7 @@ std::string Lexer::replaceDefines(const std::string& text, const std::unordered_
     std::string result = text;
     for (const auto& define : defines)
     {
-        std::regex defineRegex("\\b" + define.first + "\\b"); // Только полные совпадения
+        std::regex defineRegex("\\b" + define.first + "\\b");
         result = std::regex_replace(result, defineRegex, define.second);
     }
     return result;
