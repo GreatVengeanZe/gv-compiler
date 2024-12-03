@@ -1,5 +1,15 @@
-﻿int int main()
+#define DEF 1000
+
+
+int main()
 {
-	bool b = 100 <= 1000;
-	return "Lera";
+	bool b = 100 <= DEF;
+	for (int i = 0; i < 16; i++)
+	{
+		continue;
+	}
+	return 1;
 }
+/*
+asdasdasd
+*/

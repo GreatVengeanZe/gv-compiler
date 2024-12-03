@@ -1,6 +1,7 @@
-#include "Lexer.h"
-#include <fstream>
+﻿#include "Lexer.h"
 #include "ErrorHandle.h"
+#include <fstream>
+
 
 Lexer::Lexer(const string& filePath)
 {
@@ -27,6 +28,22 @@ void Lexer::open()
 	_code.resize(size);
 	in.read(&_code[0], size);
 	in.close();
+
+    std::unordered_map<std::string, std::string> defines;
+    std::istringstream stream(_code);
+    std::string line;
+    std::ostringstream processedCode;
+
+    while (std::getline(stream, line))
+    {
+        if (line.find("#define") == 0)
+            parseDefine(line, defines);
+        else
+            processedCode << replaceDefines(line, defines) << '\n';
+    }
+    _code = processedCode.str();
+    _code.pop_back();
+
 }
 
 void Lexer::split()
@@ -248,4 +265,26 @@ tokenType Lexer::getCurrTokenType()
 void Lexer::nextToken()
 {
     currTokenIndex++;
+}
+
+void Lexer::parseDefine(const std::string& line, std::unordered_map<std::string, std::string>& defines) {
+    std::regex defineRegex(R"(#define\s+(\w+)\s+(.+))");
+    std::smatch match;
+
+    if (std::regex_match(line, match, defineRegex))
+    {
+        std::string name = match[1].str();
+        std::string value = match[2].str();
+        defines[name] = value; // Сохраняем определение
+    }
+}
+
+std::string Lexer::replaceDefines(const std::string& text, const std::unordered_map<std::string, std::string>& defines) {
+    std::string result = text;
+    for (const auto& define : defines)
+    {
+        std::regex defineRegex("\\b" + define.first + "\\b"); // Только полные совпадения
+        result = std::regex_replace(result, defineRegex, define.second);
+    }
+    return result;
 }

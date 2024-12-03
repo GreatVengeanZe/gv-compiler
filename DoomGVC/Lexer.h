@@ -1,5 +1,8 @@
 #pragma once
 #include <vector>
+#include <unordered_map>
+#include <sstream>
+#include <regex>
 #include "Token.h"
 
 
@@ -21,6 +24,8 @@ private:
 	void split();
 	void merge();
 	void check();
+	static void parseDefine(const std::string& line, std::unordered_map<std::string, std::string>& defines);
+	static std::string replaceDefines(const std::string& text, const std::unordered_map<std::string, std::string>& defines);
 	static bool isCorrectIdentifier(const string& lexeme);
 	static bool isSeparateSymbol(char symbol);
 	static bool isComplexOperator(char s1, char s2);

@@ -114,6 +114,7 @@ enum class tokenType
     LINE_COMMENT, // //
     BLOCK_COMMENT_START, // /*
     BLOCK_COMMENT_END, // */
+    COMMENT,
 
     NEW,
     DELETE,
