@@ -30,20 +30,25 @@ void Lexer::open()
 	in.close();
 
     std::unordered_map<std::string, std::string> defines;
-    std::istringstream stream(_code);
-    std::string line;
-    std::ostringstream processedCode;
 
-    while (std::getline(stream, line))
+    try
     {
-        if (line.find("#define") == 0)
-            parseDefine(line, defines);
-        else
-            processedCode << replaceDefines(line, defines) << '\n';
-    }
-    _code = processedCode.str();
-    _code.pop_back();
+        std::string output = processCode(_code, defines);
+        _code = output;
+        _code = cleanString(_code);
 
+        std::string outputFileName = "output.c";
+        std::ofstream file(outputFileName);
+        if (!file.is_open())
+            throw std::runtime_error("Can't open file: " + outputFileName);
+        file << _code;
+        file.close();
+
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
 }
 
 void Lexer::split()
@@ -267,8 +272,33 @@ void Lexer::nextToken()
     currTokenIndex++;
 }
 
-void Lexer::parseDefine(const std::string& line, std::unordered_map<std::string, std::string>& defines) {
-    std::regex defineRegex(R"(#define\s+(\w+)\s+(.+))");
+string Lexer::cleanString(const std::string& input)
+{
+    std::string cleaned;
+    for (char ch : input) {
+        if (ch != '\0') {
+            cleaned += ch;
+        }
+    }
+    return cleaned;
+}
+
+
+string Lexer::readFile(const std::string& fileName)
+{
+    std::ifstream file(fileName);
+    if (!file.is_open()) {
+        throw std::runtime_error("Can't open file: " + fileName);
+    }
+
+    std::ostringstream content;
+    content << file.rdbuf();
+    return content.str();
+}
+
+void Lexer::parseDefine(const std::string& line, std::unordered_map<std::string, std::string>& defines)
+{
+    std::regex defineRegex("#define\\s+(\\w+)\\s+(.+)");
     std::smatch match;
 
     if (std::regex_match(line, match, defineRegex))
@@ -279,7 +309,8 @@ void Lexer::parseDefine(const std::string& line, std::unordered_map<std::string,
     }
 }
 
-std::string Lexer::replaceDefines(const std::string& text, const std::unordered_map<std::string, std::string>& defines) {
+string Lexer::replaceDefines(const std::string& text, const std::unordered_map<std::string, std::string>& defines)
+{
     std::string result = text;
     for (const auto& define : defines)
     {
@@ -287,4 +318,37 @@ std::string Lexer::replaceDefines(const std::string& text, const std::unordered_
         result = std::regex_replace(result, defineRegex, define.second);
     }
     return result;
+}
+
+string Lexer::processCode(const std::string& code, std::unordered_map<std::string, std::string>& defines)
+{
+    std::istringstream stream(code);
+    std::ostringstream processedCode;
+    std::string line;
+
+    while (std::getline(stream, line))
+    {
+        if (line.find("#define") == 0)
+            parseDefine(line, defines);
+
+        else if (line.find("#include") == 0)
+        {
+            std::regex includeRegex("#include\\s+\"(.+?)\"");
+            std::smatch match;
+
+            if (std::regex_match(line, match, includeRegex))
+            {
+                std::string fileName = match[1].str();
+                std::string includedContent = readFile(fileName);
+                processedCode << processCode(includedContent, defines) << '\n';
+            }
+            else
+                throw std::runtime_error("Incorrect directory #include: " + line);
+        }
+        else
+            processedCode << replaceDefines(line, defines) << '\n';
+    }
+
+
+    return processedCode.str();
 }

@@ -24,6 +24,9 @@ private:
 	void split();
 	void merge();
 	void check();
+	static string cleanString(const std::string& input);
+	static string readFile(const std::string& fileName);
+	static string processCode(const std::string& code, std::unordered_map<std::string, std::string>& defines);
 	static void parseDefine(const std::string& line, std::unordered_map<std::string, std::string>& defines);
 	static std::string replaceDefines(const std::string& text, const std::unordered_map<std::string, std::string>& defines);
 	static bool isCorrectIdentifier(const string& lexeme);
