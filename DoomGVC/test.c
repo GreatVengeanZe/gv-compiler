@@ -1,15 +1,16 @@
 #include "test.h"
 #include "libtest.h"
 
-#define DEF 1000
-#define HAHA "asdasd"
+int X = NUM;
+int Y = VAL;
+
+int sum(int a, int b)
+{
+	return a + b;
+}
 
 int main()
 {
-	int b = HAHA <= DEF;
-	for (int i = 0; i < 16; i++)
-	{
-		continue;
-	}
-	return HAHA;
+	int a = sum(Y, X);
+	return 0;
 }

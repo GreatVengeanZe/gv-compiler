@@ -275,11 +275,9 @@ void Lexer::nextToken()
 string Lexer::cleanString(const std::string& input)
 {
     std::string cleaned;
-    for (char ch : input) {
-        if (ch != '\0') {
+    for (char ch : input)
+        if (ch != '\0')
             cleaned += ch;
-        }
-    }
     return cleaned;
 }
 

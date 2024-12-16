@@ -10,7 +10,8 @@ public:
 
     SyntaxTreeNode(const std::string& val) : value(val) {}
 
-    void addChild(const std::shared_ptr<SyntaxTreeNode>& child) {
+    void addChild(const std::shared_ptr<SyntaxTreeNode>& child)
+    {
         children.push_back(child);
     }
 };
@@ -21,7 +22,8 @@ class SyntaxTree
 public:
     SyntaxTree() : root(nullptr) {}
 
-    void setRoot(const std::shared_ptr<SyntaxTreeNode>& node) {
+    void setRoot(const std::shared_ptr<SyntaxTreeNode>& node)
+    {
         root = node;
     }
 

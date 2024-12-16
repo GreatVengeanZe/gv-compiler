@@ -1,6 +1,7 @@
+
 int notMain()
 {
-	int b = 5;
+	int b = 10;
 	for (int i = 0; i < 12; i++)
 	{
 		b += i;
@@ -8,19 +9,24 @@ int notMain()
 	return b;
 }
 
+
 int func(int a, int b)
 {
-	return a+b;
+	return a+b + 5;
 }
 
 
+int X = 10;
+int Y = 5;
+
+int sum(int a, int b)
+{
+	return a + b;
+}
 
 int main()
 {
-	int b = "asdasd" <= 1000;
-	for (int i = 0; i < 16; i++)
-	{
-		continue;
-	}
-	return "asdasd";
+	int a = sum(Y, X);
+	return 0;
 }
+
