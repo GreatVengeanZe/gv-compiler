@@ -36,6 +36,11 @@ private:
     void checkFunctionDeclaration(const std::string& funcName, const std::string& returnType, const std::vector<std::string>& paramTypes);
     void checkFunctionCall(const std::string& funcName, const std::vector<std::string>& argTypes);
     void checkTypeCompatibility(const std::string& type1, const std::string& type2);
+    void checkUndeclaredVariable(const std::string& varName);
+    void checkUninitializedVariable(const std::string& varName);
+    void checkFunctionOverloading(const std::string& funcName, const std::vector<std::string>& paramTypes);
+    void checkReturnStatements(const std::shared_ptr<SyntaxTreeNode>& node, const std::string& expectedType);
+    void analyzeNode(const std::shared_ptr<SyntaxTreeNode>& node);
 
     // Recursive syntax tree analysis
     void analyzeNode(const std::shared_ptr<SyntaxTreeNode>& node);

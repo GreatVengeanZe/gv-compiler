@@ -169,3 +169,116 @@ std::string SemanticAnalyzer::inferExpressionType(const std::shared_ptr<SyntaxTr
 
     throw std::runtime_error("Unable to infer type of expression: " + node->value);
 }
+
+void SemanticAnalyzer::checkUndeclaredVariable(const std::string& varName)
+{
+    for (auto scope = _scopes.rbegin(); scope != _scopes.rend(); ++scope)
+        if (scope->variables.count(varName))
+            return;
+
+    throw std::runtime_error("Variable '" + varName + "' is used but not declared.");
+}
+
+void SemanticAnalyzer::checkUninitializedVariable(const std::string& varName)
+{
+    for (auto scope = _scopes.rbegin(); scope != _scopes.rend(); ++scope)
+    {
+        if (scope->variables.count(varName))
+        {
+            if (scope->variables[varName] == "UNDEFINED")
+                throw std::runtime_error("Variable '" + varName + "' is used but not initialized.");
+
+            return;
+        }
+    }
+
+    throw std::runtime_error("Variable '" + varName + "' is used but not declared.");
+}
+
+void SemanticAnalyzer::checkFunctionOverloading(const std::string& funcName, const std::vector<std::string>& paramTypes)
+{
+    auto& functions = _scopes.back().functions;
+    for (const auto& funcEntry : functions)
+    {
+        const std::string& existingFuncName = funcEntry.first;
+        const auto& existingFuncData = funcEntry.second;
+        const auto& existingParamTypes = existingFuncData.second;
+
+        if (existingFuncName == funcName && existingParamTypes == paramTypes)
+            throw std::runtime_error("Function '" + funcName + "' with the same parameters already exists.");
+    }
+}
+
+
+void SemanticAnalyzer::checkReturnStatements(const std::shared_ptr<SyntaxTreeNode>& node, const std::string& expectedType)
+{
+    if (node->value == "RETURN")
+    {
+        auto exprType = inferExpressionType(node->children[0]);
+        checkTypeCompatibility(expectedType, exprType);
+        return;
+    }
+    for (const auto& child : node->children)
+        checkReturnStatements(child, expectedType);
+}
+
+// Analyze a syntax tree node with new checks
+void SemanticAnalyzer::analyzeNode(const std::shared_ptr<SyntaxTreeNode>& node)
+{
+    if (!node) return;
+
+    if (node->value == "DECLARATION")
+    {
+        auto varName = node->children[0]->value;
+        auto type = node->children.size() > 1 ? node->children[1]->value : "UNDEFINED";
+        checkVariableDeclaration(varName);
+        _scopes.back().variables[varName] = type;
+    }
+    else if (node->value == "ASSIGNMENT")
+    {
+        auto varName = node->children[0]->value;
+        auto exprType = inferExpressionType(node->children[1]);
+        checkAssignment(varName, exprType);
+    }
+    else if (node->value == "FUNCTION")
+    {
+        auto funcName = node->value;
+        std::string returnType = "VOID"; // Default return type
+        std::vector<std::string> paramTypes;
+
+        for (const auto& param : node->children[0]->children)
+            paramTypes.push_back(param->value);
+
+        checkFunctionOverloading(funcName, paramTypes);
+        checkFunctionDeclaration(funcName, returnType, paramTypes);
+
+        enterScope();
+        for (const auto& param : node->children[0]->children)
+            _scopes.back().variables[param->value] = param->value;
+
+        for (size_t i = 1; i < node->children.size(); ++i)
+            analyzeNode(node->children[i]);
+
+        if (returnType != "VOID")
+            checkReturnStatements(node, returnType);
+
+        leaveScope();
+    }
+
+    else if (node->value == "CALL")
+    {
+        auto funcName = node->children[0]->value;
+        std::vector<std::string> argTypes;
+        for (size_t i = 1; i < node->children.size(); ++i)
+            argTypes.push_back(inferExpressionType(node->children[i]));
+        
+        checkFunctionCall(funcName, argTypes);
+    }
+
+    else
+    {
+        for (const auto& child : node->children)
+            analyzeNode(child);
+    }
+        
+}
