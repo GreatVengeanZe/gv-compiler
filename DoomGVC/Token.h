@@ -129,9 +129,10 @@ class Token
 {
 public:
     explicit Token(const string& lexeme);
-    void print();
-    string getLexeme();
-    tokenType getTokenType();
+    explicit Token(const string& lexeme, tokenType type);
+    void print() const ;
+    string getLexeme() const;
+    tokenType getTokenType() const;
 
 private:
 	string _lexeme;

@@ -6,17 +6,23 @@ Token::Token(const string& lexeme)
     this->_type = whichTokenType(lexeme);
 }
 
-void Token::print()
+Token::Token(const string& lexeme, tokenType type)
+{
+    this->_lexeme = lexeme;
+    this->_type = type;
+}
+
+void Token::print() const
 {
     cout << _lexeme << "\r\t\twith type:\t" << tokenTypeToString(_type) << endl;
 }
 
-string Token::getLexeme()
+string Token::getLexeme() const
 {
     return this->_lexeme;
 }
 
-tokenType Token::getTokenType()
+tokenType Token::getTokenType() const
 {
     return this->_type;
 }

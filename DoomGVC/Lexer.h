@@ -13,6 +13,7 @@ public:
 	void print();
 	Token getCurrToken();
 	tokenType getCurrTokenType();
+	std::vector<Token> getTokens();
 	void nextToken();
 
 private:
