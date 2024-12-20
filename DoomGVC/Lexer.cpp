@@ -167,6 +167,51 @@ void Lexer::merge()
 
     _tokens = tempTokens;
     tempTokens.clear();
+
+    for (int i = 0; i < _tokens.size(); i++)
+    {
+        // Check for valid function declaration: TYPE IDENTIFIER LPAR (ARGS) RPAR
+        if (i + 3 < _tokens.size() &&
+            (_tokens[i].getTokenType() == tokenType::INT ||
+                _tokens[i].getTokenType() == tokenType::DOUBLE ||
+                _tokens[i].getTokenType() == tokenType::BOOL ||
+                _tokens[i].getTokenType() == tokenType::CHAR) &&
+            _tokens[i + 1].getTokenType() == tokenType::IDENTIFIER &&
+            _tokens[i + 2].getTokenType() == tokenType::LPAR)
+        {
+            int j = i + 3;
+            // Check if there are arguments inside the parentheses
+            while (j < _tokens.size() && _tokens[j].getTokenType() != tokenType::RPAR)
+            {
+                j++;
+            }
+
+            // If a closing RPAR is found, treat it as a function token
+            if (j < _tokens.size() && _tokens[j].getTokenType() == tokenType::RPAR)
+            {
+                string newLexeme = _tokens[i].getLexeme() + " " + _tokens[i + 1].getLexeme() + "(";
+                // Add arguments inside parentheses if any
+                for (int k = i + 3; k < j; k++)
+                {
+                    newLexeme += _tokens[k].getLexeme();
+                    if (k + 1 < j) newLexeme += ", ";  // Add commas between arguments
+                }
+                newLexeme += ")";
+
+                Token newToken(newLexeme, tokenType::FUNCTION);  // Create FUNCTION token
+                tempTokens.push_back(newToken);
+
+                // Skip the tokens that formed the function (identifier, LPAR, args, RPAR)
+                i = j;
+                continue;
+            }
+        }
+
+        tempTokens.push_back(_tokens[i]);
+    }
+
+    _tokens = tempTokens;
+    tempTokens.clear();
 }
 
 void Lexer::check()
@@ -265,6 +310,11 @@ Token Lexer::getCurrToken()
 tokenType Lexer::getCurrTokenType()
 {
     return getCurrToken().getTokenType();
+}
+
+std::vector<Token> Lexer::getTokens()
+{
+    return this->_tokens;
 }
 
 void Lexer::nextToken()
