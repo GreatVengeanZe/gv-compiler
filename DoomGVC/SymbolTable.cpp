@@ -24,12 +24,8 @@ bool SymbolTable::insert(const Symbol& symbol)
         return false;
     }
     const std::string& name = symbol.getName();
-    if (scopes.top().find(name) == scopes.top().end())
-    {
-        scopes.top()[name] = symbol;
-        return true;
-    }
-    return false; // Symbol already exists in the current scope
+    scopes.top()[name] = symbol; // Allow shadowing by updating the symbol
+    return true;
 }
 
 Symbol* SymbolTable::search(const std::string& name)
@@ -41,6 +37,7 @@ Symbol* SymbolTable::search(const std::string& name)
         if (it != tempScopes.top().end()) return &it->second;
         tempScopes.pop();
     }
+    std::cerr << "Error: Symbol '" << name << "' undeclared." << std::endl;
     return nullptr; // Symbol not found
 }
 
@@ -50,13 +47,44 @@ bool SymbolTable::existsInCurrentScope(const std::string& name)
     return scopes.top().find(name) != scopes.top().end();
 }
 
+void SymbolTable::listCurrentScopeSymbols() const
+{
+    if (scopes.empty())
+    {
+        std::cerr << "Error: No current scope available." << std::endl;
+        return;
+    }
+    for (const auto& entry : scopes.top())
+        std::cout << "Name: " << entry.second.getName()
+            << ", Type: " << entry.second.getType()
+            << ", Value: " << entry.second.getValue() << std::endl;
+    
+}
+
 void SymbolTable::display() const
 {
     std::stack<std::unordered_map<std::string, Symbol>> tempScopes = scopes;
     while (!tempScopes.empty())
     {
         for (const auto& entry : tempScopes.top())
-            std::cout << "Name: " << entry.second.getName() << ", Type: " << entry.second.getType() << std::endl;
+            std::cout << "Name: " << entry.second.getName()
+                << ", Type: " << entry.second.getType()
+                << ", Value: " << entry.second.getValue() << std::endl;
         tempScopes.pop();
     }
+}
+
+void SymbolTable::listParentScopeSymbols() const
+{
+    std::stack<std::unordered_map<std::string, Symbol>> tempScopes = scopes;
+    if (tempScopes.size() < 2)
+    {
+        std::cerr << "Error: No parent scope available." << std::endl;
+        return;
+    }
+    tempScopes.pop(); // Remove current scope
+    for (const auto& entry : tempScopes.top())
+        std::cout << "Name: " << entry.second.getName()
+            << ", Type: " << entry.second.getType()
+            << ", Value: " << entry.second.getValue() << std::endl;
 }
