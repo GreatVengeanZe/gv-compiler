@@ -1,3 +1,0 @@
-/home/gvengeance/Documents/Magshimim/GVCompiler/doomgv-compiler/DoomGVC/cmake-build-debug/CMakeFiles/DoomGVC.dir
-/home/gvengeance/Documents/Magshimim/GVCompiler/doomgv-compiler/DoomGVC/cmake-build-debug/CMakeFiles/edit_cache.dir
-/home/gvengeance/Documents/Magshimim/GVCompiler/doomgv-compiler/DoomGVC/cmake-build-debug/CMakeFiles/rebuild_cache.dir
