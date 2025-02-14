@@ -23,7 +23,7 @@
 enum TokenType
 {
     TOKEN_INT, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_SEMICOLON,
-    TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_MINUS, TOKEN_MULTIPLY, TOKEN_DIVIDE,
+    TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE,
     TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
     TOKEN_IF, TOKEN_ELSE, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
     TOKEN_LOGICAL_AND, TOKEN_LOGICAL_OR, TOKEN_RETURN, TOKEN_COMMA, TOKEN_EOF
@@ -133,12 +133,22 @@ public:
         else if (ch == '+')
 	    {
             advance();
+            if (peek() == '+')
+            {
+                advance();
+                return { TOKEN_INCREMENT, "++" };
+            }
             return { TOKEN_PLUS, "+" };
         }
 
         else if (ch == '-')
 	    {
             advance();
+            if (peek() == '-')
+            {
+                advance();
+                return { TOKEN_DECREMENT, "--" };
+            }
             return { TOKEN_MINUS, "-" };
         }
 
@@ -736,6 +746,56 @@ struct BinaryOpNode : ASTNode
 };
 
 
+struct UnaryOpNode : ASTNode
+{
+    std::string op;
+    std::string name; // Store the name of the operand
+    bool isPrefix;
+
+    UnaryOpNode(const std::string& op, const std::string& name, bool isPrefix)
+        : op(op), name(name), isPrefix(isPrefix) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        // No data to emit for unary operations
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        if (isPrefix)
+        {
+            // Prefix: increment/decrement before using the value
+            f << "    mov eax, [" << name << "] ; Load " << name << " into eax" << std::endl;
+            if (op == "++")
+            {
+                f << "    add eax, 1 ; Increment" << std::endl;
+            }
+            else if (op == "--")
+            {
+                f << "    sub eax, 1 ; Decrement" << std::endl;
+            }
+            f << "    mov [" << name << "], eax ; Store result back in " << name << std::endl;
+        }
+        else
+        {
+            // Postfix: use the value, then increment/decrement
+            f << "    mov eax, [" << name << "] ; Load " << name << " into eax" << std::endl;
+            f << "    mov ecx, eax ; Save original value in ecx" << std::endl;
+            if (op == "++")
+            {
+                f << "    add eax, 1 ; Increment" << std::endl;
+            }
+            else if (op == "--")
+            {
+                f << "    sub eax, 1 ; Decrement" << std::endl;
+            }
+            f << "    mov [" << name << "], eax ; Store result back in " << name << std::endl;
+            f << "    mov eax, ecx ; Restore original value for postfix" << std::endl;
+        }
+    }
+};
+
+
 /**********************************************************
  *      _   _  _    _  __  __  ____   ______  _____       *
  *     | \ | || |  | ||  \/  ||  _ \ |  ____||  __ \      *
@@ -855,6 +915,16 @@ class Parser
     std::unique_ptr<ASTNode> factor(const FunctionNode* currentFunction = nullptr)
     {
         Token token = currentToken;
+
+        // Handle prefix ++ and --
+        if (token.type == TOKEN_INCREMENT || token.type == TOKEN_DECREMENT)
+        {
+            eat(token.type); // Consume the operator
+            std::string identifier = currentToken.value;
+            eat(TOKEN_IDENTIFIER); // Consume the identifier
+            return std::make_unique<UnaryOpNode>(token.value, identifier, true); // true for prefix
+        }
+
         if (token.type == TOKEN_NUMBER)
 	    {
             eat(TOKEN_NUMBER);
@@ -866,6 +936,13 @@ class Parser
             // Handle variables or function calls
             std::string identifier = token.value;
             eat(TOKEN_IDENTIFIER);
+
+            if (currentToken.type == TOKEN_INCREMENT || currentToken.type == TOKEN_DECREMENT)
+            {
+                Token opToken = currentToken;
+                eat(opToken.type); // Consume the operator
+                return std::make_unique<UnaryOpNode>(opToken.value, identifier, false); // false for postfix
+            }
 
             // Check if this is a function call
             if (currentToken.type == TOKEN_LPAREN)
@@ -1010,10 +1087,40 @@ class Parser
 	    {
             std::string identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
-            eat(TOKEN_ASSIGN);
-            auto expr = expression(currentFunction); // Pass the current function context
-            eat(TOKEN_SEMICOLON);
-            return std::make_unique<AssignmentNode>(identifier, std::move(expr));
+    
+            // Check if this is an assignment (e.g., x = ...)
+            if (currentToken.type == TOKEN_ASSIGN)
+            {
+                eat(TOKEN_ASSIGN);
+                auto expr = expression(currentFunction); // Parse the right-hand side
+                eat(TOKEN_SEMICOLON);
+                return std::make_unique<AssignmentNode>(identifier, std::move(expr));
+            }
+
+            // Check if this is a postfix increment/decrement (e.g., x++; or x--;)
+            else if (currentToken.type == TOKEN_INCREMENT || currentToken.type == TOKEN_DECREMENT)
+            {
+                Token opToken = currentToken;
+                eat(opToken.type); // Consume the operator
+                eat(TOKEN_SEMICOLON); // Consume the semicolon
+                return std::make_unique<UnaryOpNode>(opToken.value, identifier, false); // false for postfix
+            }
+
+            else
+            {
+                throw std::runtime_error("Unexpected token after identifier");
+            }
+        }
+
+        else if (token.type == TOKEN_INCREMENT || token.type == TOKEN_DECREMENT)
+        {
+            // Handle prefix increment/decrement (e.g., ++x; or --x;)
+            Token opToken = currentToken;
+            eat(opToken.type); // Consume the operator
+            std::string identifier = currentToken.value;
+            eat(TOKEN_IDENTIFIER); // Consume the identifier
+            eat(TOKEN_SEMICOLON); // Consume the semicolon
+            return std::make_unique<UnaryOpNode>(opToken.value, identifier, true); // true for prefix
         }
 
         else if (token.type == TOKEN_IF) 
