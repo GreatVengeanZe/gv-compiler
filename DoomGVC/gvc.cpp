@@ -25,7 +25,7 @@ enum TokenType
     TOKEN_INT, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_SEMICOLON,
     TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE,
     TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
-    TOKEN_IF, TOKEN_ELSE, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
+    TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
     TOKEN_LOGICAL_AND, TOKEN_LOGICAL_OR, TOKEN_RETURN, TOKEN_COMMA, TOKEN_EOF
 };
 
@@ -110,6 +110,7 @@ public:
             if (ident == "if")      return { TOKEN_IF    , ident };
             if (ident == "else")    return { TOKEN_ELSE  , ident };
             if (ident == "return")  return { TOKEN_RETURN, ident };
+            if (ident == "while")   return { TOKEN_WHILE , ident };
             return { TOKEN_IDENTIFIER, ident };
         }
 
@@ -648,6 +649,44 @@ struct IfStatementNode : ASTNode
 };
 
 
+struct WhileLoopNode : ASTNode
+{
+    std::unique_ptr<ASTNode> condition;
+    std::vector<std::unique_ptr<ASTNode>> body;
+
+    WhileLoopNode(std::unique_ptr<ASTNode> cond, std::vector<std::unique_ptr<ASTNode>> body)
+        : condition(std::move(cond)), body(std::move(body)) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        for (const auto& stmt : body)
+        {
+            stmt->emitData(f);
+        }
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        size_t loopStartLabel = labelCounter++;
+        size_t loopEndLabel = labelCounter++;
+
+        f << ".loop_start_" << loopStartLabel << ":" << std::endl;
+        condition->emitCode(f); // Evaluate the condition
+        f << "    cmp eax, 0 ; Compare condition result with 0" << std::endl;
+        f << "    je .loop_end_" << loopEndLabel << " ; Jump to end if condition is false" << std::endl;
+
+        // Emit the loop body
+        for (const auto& stmt : body)
+        {
+            stmt->emitCode(f);
+        }
+
+        f << "    jmp .loop_start_" << loopStartLabel << " ; Jump back to start of loop" << std::endl;
+        f << ".loop_end_" << loopEndLabel << ":" << std::endl;
+    }
+};
+
+
 /*****************************************************************************************************************************************
  *      ____   _____  _   _            _____ __     __   ____   _____   ______  _____          _______  _____  ____   _   _   _____      *
  *     |  _ \ |_   _|| \ | |    /\    |  __ \\ \   / /  / __ \ |  __ \ |  ____||  __ \     /\ |__   __||_   _|/ __ \ | \ | | / ____|     *
@@ -1180,6 +1219,25 @@ class Parser
             }
 
             return std::make_unique<IfStatementNode>(std::move(cond), std::move(body), std::move(elseIfBlocks), std::move(elseBody));
+        }
+
+        else if (token.type == TOKEN_WHILE)
+        {
+            // Handle while loops
+            eat(TOKEN_WHILE);
+            eat(TOKEN_LPAREN);
+            auto cond = condition(currentFunction); // Parse the condition
+            eat(TOKEN_RPAREN);
+            eat(TOKEN_LBRACE);
+    
+            std::vector<std::unique_ptr<ASTNode>> body;
+            while (currentToken.type != TOKEN_RBRACE)
+            {
+                body.push_back(statement(currentFunction)); // Parse the body
+            }
+            eat(TOKEN_RBRACE);
+    
+            return std::make_unique<WhileLoopNode>(std::move(cond), std::move(body));
         }
 
         else if (token.type == TOKEN_RETURN)
