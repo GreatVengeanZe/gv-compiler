@@ -1,7 +1,7 @@
 int main() {
-    int x = 0;
-    while (x < 10 && x != 5) {
-        x++;
+    int y = 0;
+    for (int i = 0; i <= 10; i++) {
+        y = y + i;
     }
-    return x;
+    return y;
 }

@@ -25,7 +25,7 @@ enum TokenType
     TOKEN_INT, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_SEMICOLON,
     TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE,
     TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
-    TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
+    TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
     TOKEN_LOGICAL_AND, TOKEN_LOGICAL_OR, TOKEN_RETURN, TOKEN_COMMA, TOKEN_EOF
 };
 
@@ -106,11 +106,12 @@ public:
 	    {
             std::string ident;
             while (isalnum(peek()) || peek() == '_') ident += advance();
-            if (ident == "int")     return { TOKEN_INT   , ident };
             if (ident == "if")      return { TOKEN_IF    , ident };
+            if (ident == "int")     return { TOKEN_INT   , ident };
+            if (ident == "for")     return { TOKEN_FOR   , ident };
             if (ident == "else")    return { TOKEN_ELSE  , ident };
-            if (ident == "return")  return { TOKEN_RETURN, ident };
             if (ident == "while")   return { TOKEN_WHILE , ident };
+            if (ident == "return")  return { TOKEN_RETURN, ident };
             return { TOKEN_IDENTIFIER, ident };
         }
 
@@ -295,15 +296,15 @@ struct LogicalOrNode : ASTNode
     {
         size_t labelID = labelCounter++;
         left->emitCode(f);
-        f << "    cmp eax, 0 ; Compare left operand with 0" << std::endl;
-        f << "    jne .logical_or_true_" << labelID << " ; Jump if left operand is true" << std::endl;
+        f << "    cmp eax, 0\t\t\t;Compare left operand with 0" << std::endl;
+        f << "    jne .logical_or_true_" << labelID << "\t\t\t;Jump if left operand is true" << std::endl;
         right->emitCode(f);
-        f << "    cmp eax, 0 ; compare right operand with 0" << std::endl;
-        f << "    jne .logical_or_true_" << labelID << " ; Jump if right operand is true" << std::endl;
-        f << "    mov eax, 0 ; Set result to false" << std::endl;
-        f << "    jmp .logical_or_end_" << labelID << " ; Jump to end" << std::endl;
+        f << "    cmp eax, 0\t\t\t;compare right operand with 0" << std::endl;
+        f << "    jne .logical_or_true_" << labelID << "\t\t\t;Jump if right operand is true" << std::endl;
+        f << "    mov eax, 0\t\t\t;Set result to false" << std::endl;
+        f << "    jmp .logical_or_end_" << labelID << "\t\t\t;Jump to end" << std::endl;
         f << ".logical_or_true_" << labelID << ":" << std::endl;
-        f << "    mov eax, 1 ; Set result to true" << std::endl;
+        f << "    mov eax, 1\t\t\t;Set result to true" << std::endl;
         f << ".logical_or_end_" << labelID << ":" << std::endl;
     }
 };
@@ -327,15 +328,15 @@ struct LogicalAndNode : ASTNode
     {
         size_t labelID = labelCounter++;
         left->emitCode(f);
-        f << "    cmp eax, 0 ; Compare left operand with 0" << std::endl;
-        f << "    je .logical_and_false_" << labelID << " ; Jump if left operand is false" << std::endl;
+        f << "    cmp eax, 0\t\t\t;Compare left operand with 0" << std::endl;
+        f << "    je .logical_and_false_" << labelID << "\t\t\t;Jump if left operand is false" << std::endl;
         right->emitCode(f);
-        f << "    cmp eax, 0 ; Compare Right operand with 0" << std::endl;
-        f << "    je .logical_and_false_"<< labelID <<" ; Jump if right operand is false" << std::endl;
-        f << "    mov eax, 1 ; Set result to true" << std::endl;
-        f << "    jmp .logical_and_end_" << labelID << " ; Jump to end" << std::endl;
+        f << "    cmp eax, 0\t\t\t;Compare Right operand with 0" << std::endl;
+        f << "    je .logical_and_false_"<< labelID <<"\t\t\t;Jump if right operand is false" << std::endl;
+        f << "    mov eax, 1\t\t\t;Set result to true" << std::endl;
+        f << "    jmp .logical_and_end_" << labelID << "\t\t\t;Jump to end" << std::endl;
         f << ".logical_and_false_" << labelID << ":" << std::endl;
-        f << "    mov eax, 0 ; Set result to false" << std::endl;
+        f << "    mov eax, 0\t\t\t;Set result to false" << std::endl;
         f << ".logical_and_end_" << labelID << ":" << std::endl;
     }
 };
@@ -371,16 +372,16 @@ struct FunctionCallNode : ASTNode
         for (auto it = arguments.rbegin(); it != arguments.rend(); ++it)
         {
             (*it)->emitCode(f);
-            f << "    push eax ; Push argument onto stack" << std::endl;
+            f << "    push eax\t\t\t;Push argument onto stack" << std::endl;
         }
 
         // Call the function
-        f << "    call " << functionName << " ; Call function " << functionName << std::endl;
+        f << "    call " << functionName << "\t\t\t;Call function " << functionName << std::endl;
 
         // Clean up the stack (remove arguments)
         if (!arguments.empty())
         {
-            f << "    add esp, " << (arguments.size() * 4) << " ; Clean up stack" << std::endl;
+            f << "    add esp, " << (arguments.size() * 4) << "\t\t\t;Clean up stack" << std::endl;
         }
     }
 };
@@ -484,7 +485,7 @@ struct DeclarationNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        f << "    " << identifier << " dd 0 ; Declare variable " << identifier << std::endl;
+        f << "    " << identifier << " dd 0\t\t\t;Declare variable " << identifier << std::endl;
     }
 
     void emitCode(std::ofstream& f) const override
@@ -492,7 +493,7 @@ struct DeclarationNode : ASTNode
         if (initializer)
         {
             initializer->emitCode(f);
-            f << "    mov [" << identifier << "], eax ; Initialize " << identifier << std::endl;
+            f << "    mov [" << identifier << "], eax\t\t\t;Initialize " << identifier << std::endl;
         }
     }
 };
@@ -525,7 +526,7 @@ struct AssignmentNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         expression->emitCode(f);
-        f << "    mov [" << identifier << "], eax ; Store result in " << identifier << std::endl;
+        f << "    mov [" << identifier << "], eax\t\t\t;Store result in " << identifier << std::endl;
     }
 };
 
@@ -577,22 +578,22 @@ struct IfStatementNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         condition->emitCode(f);
-        f << "    cmp eax, 0 ; Compare condition result with 0" << std::endl;
+        f << "    cmp eax, 0\t\t\t;Compare condition result with 0" << std::endl;
 
         // Jump to the appropriate block bassed on whether there are 'else if' blocks
         if (!elseIfBlocks.empty())
         {
-            f << "    je .else_if_0 ; Jump to first else_if block if condition is false" << std::endl;
+            f << "    je .else_if_0\t\t\t;Jump to first else_if block if condition is false" << std::endl;
         }
 
         else if (!elseBody.empty())
         {
-            f << "    je .else ; Jump to else block if condition is false" << std::endl;
+            f << "    je .else\t\t\t;Jump to else block if condition is false" << std::endl;
         }
 
         else
         {
-            f << "    je .endif ; Jump to .endif if condition is false" << std::endl;
+            f << "    je .endif\t\t\t;Jump to .endif if condition is false" << std::endl;
         }
         
 
@@ -602,28 +603,28 @@ struct IfStatementNode : ASTNode
             stmt->emitCode(f);
         }
 
-        f << "    jmp .endif ; Jump to .endif to skip all else-if and else block" << std::endl;
+        f << "    jmp .endif\t\t\t;Jump to .endif to skip all else-if and else block" << std::endl;
         
         // Emit code for 'else if' blocks (if they exist)
         for (size_t i = 0; i < elseIfBlocks.size(); ++i)
         {
             f << ".else_if_" << i << ":" << std::endl;
             elseIfBlocks[i].first->emitCode(f);
-            f << "    cmp eax, 0 ; Compare condition result with 0" << std::endl;
+            f << "    cmp eax, 0\t\t\t;Compare condition result with 0" << std::endl;
 
             if (i + 1 < elseIfBlocks.size())
             {
-                f << "    je .else_if_" << (i + 1) << " ; Jump to next else-if block if condition is false" << std::endl;
+                f << "    je .else_if_" << (i + 1) << "\t\t\t;Jump to next else-if block if condition is false" << std::endl;
             }
 
             else if (!elseBody.empty())
             {
-                f << "    je .else ; Jump to else block if condition is false" << std::endl;
+                f << "    je .else\t\t\t;Jump to else block if condition is false" << std::endl;
             }
 
             else
             {
-                f << "    je .endif ; Jump to .endif if condition is false" << std::endl;
+                f << "    je .endif\t\t\t;Jump to .endif if condition is false" << std::endl;
             }
 
             for (const auto& stmt : elseIfBlocks[i].second)
@@ -631,7 +632,7 @@ struct IfStatementNode : ASTNode
                 stmt->emitCode(f);
             }
 
-            f << "    jmp .endif ; Jump to .endif to skip remaining else-if and else blocks" << std::endl;
+            f << "    jmp .endif\t\t\t;Jump to .endif to skip remaining else-if and else blocks" << std::endl;
         }
         
         // Emit code for the 'else' block (if it exist)
@@ -672,8 +673,8 @@ struct WhileLoopNode : ASTNode
 
         f << ".loop_start_" << loopStartLabel << ":" << std::endl;
         condition->emitCode(f); // Evaluate the condition
-        f << "    cmp eax, 0 ; Compare condition result with 0" << std::endl;
-        f << "    je .loop_end_" << loopEndLabel << " ; Jump to end if condition is false" << std::endl;
+        f << "    cmp eax, 0\t\t\t;Compare condition result with 0" << std::endl;
+        f << "    je .loop_end_" << loopEndLabel << "\t\t\t;Jump to end if condition is false" << std::endl;
 
         // Emit the loop body
         for (const auto& stmt : body)
@@ -681,7 +682,70 @@ struct WhileLoopNode : ASTNode
             stmt->emitCode(f);
         }
 
-        f << "    jmp .loop_start_" << loopStartLabel << " ; Jump back to start of loop" << std::endl;
+        f << "    jmp .loop_start_" << loopStartLabel << "\t\t\t;Jump back to start of loop" << std::endl;
+        f << ".loop_end_" << loopEndLabel << ":" << std::endl;
+    }
+};
+
+
+struct ForLoopNode : ASTNode
+{
+    std::unique_ptr<ASTNode> initialization;
+    std::unique_ptr<ASTNode> condition;
+    std::unique_ptr<ASTNode> iteration;
+    std::vector<std::unique_ptr<ASTNode>> body;
+
+    ForLoopNode(std::unique_ptr<ASTNode> init, std::unique_ptr<ASTNode> cond,
+                std::unique_ptr<ASTNode> iter, std::vector<std::unique_ptr<ASTNode>> body)
+        : initialization(std::move(init)), condition(std::move(cond)),
+        iteration(std::move(iter)), body(std::move(body)) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        if (initialization)
+        {
+            initialization->emitData(f);
+        }
+        for (const auto& stmt : body)
+        {
+            stmt->emitData(f);
+        }
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        size_t loopStartLabel = labelCounter++;
+        size_t loopEndLabel = labelCounter++;
+
+        // Emit the initialization
+        if (initialization)
+        {
+            initialization->emitCode(f);
+        }
+
+        f << ".loop_start_" << loopStartLabel << ":" << std::endl;
+
+        // Emit the condition
+        if (condition)
+        {
+            condition->emitCode(f); // Evaluate the condition
+            f << "    cmp eax, 0\t\t\t;Compare condition result with 0" << std::endl;
+            f << "    je .loop_end_" << loopEndLabel << "\t\t\t;Jump to end if condition is false" << std::endl;
+        }
+
+        // Emit the loop body
+        for (const auto& stmt : body)
+        {
+            stmt->emitCode(f);
+        }
+
+        // Emit the iteration
+        if (iteration)
+        {
+            iteration->emitCode(f);
+        }
+
+        f << "    jmp .loop_start_" << loopStartLabel << "\t\t\t;Jump back to start of loop" << std::endl;
         f << ".loop_end_" << loopEndLabel << ":" << std::endl;
     }
 };
@@ -715,71 +779,71 @@ struct BinaryOpNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         left->emitCode(f);
-        f << "    push eax ; Push left operand onto stack" << std::endl;
+        f << "    push eax\t\t\t;Push left operand onto stack" << std::endl;
         right->emitCode(f);
-        f << "    pop ecx ; Pop left operand into ecx" << std::endl;
+        f << "    pop ecx\t\t\t;Pop left operand into ecx" << std::endl;
 
         if (op == "+")
 	    {
-            f << "    add eax, ecx ; Add ecx to eax" << std::endl;
+            f << "    add eax, ecx\t\t\t;Add ecx to eax" << std::endl;
         }
 
         else if (op == "-")
 	    {
-            f << "    sub eax, ecx ; Subtract ecx from eax" << std::endl;
+            f << "    sub eax, ecx\t\t\t;Subtract ecx from eax" << std::endl;
         }
 
         else if (op == "*")
     	{
-            f << "    imul eax, ecx ; Multiply eax by ecx" << std::endl;
+            f << "    imul eax, ecx\t\t\t;Multiply eax by ecx" << std::endl;
         }
 
         else if (op == "/")
     	{
-            f << "    cdq ; Sign-extend eax into edx" << std::endl;
-            f << "    idiv ecx ; Divide edx:eax by ecx" << std::endl;
+            f << "    cdq\t\t\t;Sign-extend eax into edx" << std::endl;
+            f << "    idiv ecx\t\t\t;Divide edx:eax by ecx" << std::endl;
         }
 
         else if (op == "==")
     	{
-            f << "    cmp ecx, eax ; Compare ecx and eax" << std::endl;
-            f << "    sete al ; Set al to 1 if equal, else 0" << std::endl;
-            f << "    movzx eax, al ; Zero-extend al to eax" << std::endl;
+            f << "    cmp ecx, eax\t\t\t;Compare ecx and eax" << std::endl;
+            f << "    sete al\t\t\t;Set al to 1 if equal, else 0" << std::endl;
+            f << "    movzx eax, al\t\t\t;Zero-extend al to eax" << std::endl;
         }
 
         else if (op == "!=") 
     	{
-            f << "    cmp ecx, eax ; Compare ecx and eax" << std::endl;
-            f << "    setne al ; Set al to 1 if not equal, else 0" << std::endl;
-            f << "    movzx eax, al ; Zero-extend al to eax" << std::endl;
+            f << "    cmp ecx, eax\t\t\t;Compare ecx and eax" << std::endl;
+            f << "    setne al\t\t\t;Set al to 1 if not equal, else 0" << std::endl;
+            f << "    movzx eax, al\t\t\t;Zero-extend al to eax" << std::endl;
         }
 
         else if (op == "<")
     	{
-            f << "    cmp ecx, eax ; Compare ecx and eax" << std::endl;
-            f << "    setl al ; Set al to 1 if less, else 0" << std::endl;
-            f << "    movzx eax, al ; Zero-extend al to eax" << std::endl;
+            f << "    cmp ecx, eax\t\t\t;Compare ecx and eax" << std::endl;
+            f << "    setl al\t\t\t;Set al to 1 if less, else 0" << std::endl;
+            f << "    movzx eax, al\t\t\t;Zero-extend al to eax" << std::endl;
         }
 
         else if (op == ">")
     	{
-            f << "    cmp ecx, eax ; Compare ecx and eax" << std::endl;
-            f << "    setg al ; Set al to 1 if greater, else 0" << std::endl;
-            f << "    movzx eax, al ; Zero-extend al to eax" << std::endl;
+            f << "    cmp ecx, eax\t\t\t;Compare ecx and eax" << std::endl;
+            f << "    setg al\t\t\t;Set al to 1 if greater, else 0" << std::endl;
+            f << "    movzx eax, al\t\t\t;Zero-extend al to eax" << std::endl;
         }
 
         else if (op == "<=")
     	{
-            f << "    cmp ecx, eax ; Compare ecx and eax" << std::endl;
-            f << "    setle al ; Set al to 1 if less or equal, else 0" << std::endl;
-            f << "    movzx eax, al ; Zero-extend al to eax" << std::endl;
+            f << "    cmp ecx, eax\t\t\t;Compare ecx and eax" << std::endl;
+            f << "    setle al\t\t\t;Set al to 1 if less or equal, else 0" << std::endl;
+            f << "    movzx eax, al\t\t\t;Zero-extend al to eax" << std::endl;
         }
 
         else if (op == ">=")
     	{
-            f << "    cmp ecx, eax ; Compare ecx and eax" << std::endl;
-            f << "    setge al ; Set al to 1 if greater or equal, else 0" << std::endl;
-            f << "    movzx eax, al ; Zero-extend al to eax" << std::endl;
+            f << "    cmp ecx, eax\t\t\t;Compare ecx and eax" << std::endl;
+            f << "    setge al\t\t\t;Set al to 1 if greater or equal, else 0" << std::endl;
+            f << "    movzx eax, al\t\t\t;Zero-extend al to eax" << std::endl;
         }
     }
 };
@@ -804,32 +868,32 @@ struct UnaryOpNode : ASTNode
         if (isPrefix)
         {
             // Prefix: increment/decrement before using the value
-            f << "    mov eax, [" << name << "] ; Load " << name << " into eax" << std::endl;
+            f << "    mov eax, [" << name << "]\t\t\t;Load " << name << " into eax" << std::endl;
             if (op == "++")
             {
-                f << "    add eax, 1 ; Increment" << std::endl;
+                f << "    add eax, 1\t\t\t;Increment" << std::endl;
             }
             else if (op == "--")
             {
-                f << "    sub eax, 1 ; Decrement" << std::endl;
+                f << "    sub eax, 1\t\t\t;Decrement" << std::endl;
             }
-            f << "    mov [" << name << "], eax ; Store result back in " << name << std::endl;
+            f << "    mov [" << name << "], eax\t\t\t;Store result back in " << name << std::endl;
         }
         else
         {
             // Postfix: use the value, then increment/decrement
-            f << "    mov eax, [" << name << "] ; Load " << name << " into eax" << std::endl;
-            f << "    mov ecx, eax ; Save original value in ecx" << std::endl;
+            f << "    mov eax, [" << name << "]\t\t\t;Load " << name << " into eax" << std::endl;
+            f << "    mov ecx, eax\t\t\t;Save original value in ecx" << std::endl;
             if (op == "++")
             {
-                f << "    add eax, 1 ; Increment" << std::endl;
+                f << "    add eax, 1\t\t\t;Increment" << std::endl;
             }
             else if (op == "--")
             {
-                f << "    sub eax, 1 ; Decrement" << std::endl;
+                f << "    sub eax, 1\t\t\t;Decrement" << std::endl;
             }
-            f << "    mov [" << name << "], eax ; Store result back in " << name << std::endl;
-            f << "    mov eax, ecx ; Restore original value for postfix" << std::endl;
+            f << "    mov [" << name << "], eax\t\t\t;Store result back in " << name << std::endl;
+            f << "    mov eax, ecx\t\t\t;Restore original value for postfix" << std::endl;
         }
     }
 };
@@ -859,7 +923,7 @@ struct NumberNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        f << "    mov eax, " << value << " ; Load constant " << value << " into eax" << std::endl;
+        f << "    mov eax, " << value << "\t\t\t;Load constant " << value << " into eax" << std::endl;
     }
 };
 
@@ -899,13 +963,13 @@ struct IdentifierNode : ASTNode
                 {
                     // Calculate the stack offset for the parameter
                     int offset = 8 + i * 4; // First parameter is at [ebp + 8], second at [ebp + 12], etc.
-                    f << "    mov eax, [ebp + " << offset << "] ; Load parameter " << name << " into eax" << std::endl;
+                    f << "    mov eax, [ebp + " << offset << "]\t\t\t;Load parameter " << name << " into eax" << std::endl;
                     return;
                 }
             }
         }
         // If not a parameter, treat it as a global variable
-        f << "    mov eax, [" << name << "] ; Load variable " << name << " into eax" << std::endl;
+        f << "    mov eax, [" << name << "]\t\t\t;Load variable " << name << " into eax" << std::endl;
     }
 };
 
@@ -1141,10 +1205,23 @@ class Parser
             {
                 Token opToken = currentToken;
                 eat(opToken.type); // Consume the operator
-                eat(TOKEN_SEMICOLON); // Consume the semicolon
-                return std::make_unique<UnaryOpNode>(opToken.value, identifier, false); // false for postfix
+    
+                // Check if this is part of an expression (e.g., in a for loop)
+                if (currentToken.type == TOKEN_SEMICOLON || currentToken.type == TOKEN_RPAREN)
+                {
+                    // If followed by a semicolon or closing parenthesis, treat it as a standalone statement
+                    if (currentToken.type == TOKEN_SEMICOLON)
+                    {
+                        eat(TOKEN_SEMICOLON); // Consume the semicolon
+                    }
+                    return std::make_unique<UnaryOpNode>(opToken.value, identifier, false); // false for postfix
+                }
+                else
+                {
+                    // If not followed by a semicolon or closing parenthesis, treat it as part of an expression
+                    return std::make_unique<UnaryOpNode>(opToken.value, identifier, false); // false for postfix
+                }
             }
-
             else
             {
                 throw std::runtime_error("Unexpected token after identifier");
@@ -1158,8 +1235,22 @@ class Parser
             eat(opToken.type); // Consume the operator
             std::string identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER); // Consume the identifier
-            eat(TOKEN_SEMICOLON); // Consume the semicolon
-            return std::make_unique<UnaryOpNode>(opToken.value, identifier, true); // true for prefix
+    
+            // Check if this is part of an expression (e.g., in a for loop)
+            if (currentToken.type == TOKEN_SEMICOLON || currentToken.type == TOKEN_RPAREN)
+            {
+                // If followed by a semicolon or closing parenthesis, treat it as a standalone statement
+                if (currentToken.type == TOKEN_SEMICOLON)
+                {
+                    eat(TOKEN_SEMICOLON); // Consume the semicolon
+                }
+                return std::make_unique<UnaryOpNode>(opToken.value, identifier, true); // true for prefix
+            }
+            else
+            {
+                // If not followed by a semicolon or closing parenthesis, treat it as part of an expression
+                return std::make_unique<UnaryOpNode>(opToken.value, identifier, true); // true for prefix
+            }
         }
 
         else if (token.type == TOKEN_IF) 
@@ -1238,6 +1329,52 @@ class Parser
             eat(TOKEN_RBRACE);
     
             return std::make_unique<WhileLoopNode>(std::move(cond), std::move(body));
+        }
+
+        else if (token.type == TOKEN_FOR)
+        {
+            // Handle for loops
+            eat(TOKEN_FOR);
+            eat(TOKEN_LPAREN);
+
+            // Parse the initialization (optional)
+            std::unique_ptr<ASTNode> initialization = nullptr;
+            if (currentToken.type != TOKEN_SEMICOLON)
+            {
+                initialization = statement(currentFunction); // Parse the initialization statement
+            }
+            else
+            {
+                eat(TOKEN_SEMICOLON); // Skip the semicolon if there's no initialization
+            }
+
+            // Parse the condition (optional)
+            std::unique_ptr<ASTNode> cond = nullptr;
+            if (currentToken.type != TOKEN_SEMICOLON)
+            {
+                cond = condition(currentFunction); // Use the condition() function to parse the condition
+            }
+            eat(TOKEN_SEMICOLON); // Consume the semicolon
+
+            // Parse the iteration (optional)
+            std::unique_ptr<ASTNode> iteration = nullptr;
+            if (currentToken.type != TOKEN_RPAREN)
+            {
+                // Parse the iteration as a statement (e.g., i++)
+                iteration = statement(currentFunction); // Parse the iteration statement
+            }
+            eat(TOKEN_RPAREN); // Consume the closing parenthesis
+
+            // Parse the loop body
+            eat(TOKEN_LBRACE);
+            std::vector<std::unique_ptr<ASTNode>> body;
+            while (currentToken.type != TOKEN_RBRACE)
+            {
+                body.push_back(statement(currentFunction)); // Parse the body
+            }
+            eat(TOKEN_RBRACE);
+
+            return std::make_unique<ForLoopNode>(std::move(initialization), std::move(cond), std::move(iteration), std::move(body));
         }
 
         else if (token.type == TOKEN_RETURN)
@@ -1442,13 +1579,13 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
     }
 
     // Emit text section
-    f << "section .text" << std::endl;
+    f << "\nsection .text" << std::endl;
     f << "global _start" << std::endl;
-    f << "_start:" << std::endl;
-    f << "    call main ; Call the main function" << std::endl;
-    f << "    mov ebx, eax ; moving the exit code returned from main" << std::endl;
-    f << "    mov eax, 1 ; sys_exit" << std::endl;
-    f << "    int 0x80 ; invoke syscall" << std::endl << std::endl;
+    f << "\n_start:" << std::endl;
+    f << "    call main\t\t\t;Call the main function\n" << std::endl;
+    f << "    mov ebx, eax\t\t\t;moving the exit code returned from main" << std::endl;
+    f << "    mov eax, 1\t\t\t;sys_exit" << std::endl;
+    f << "    int 0x80\t\t\t;invoke syscall" << std::endl << std::endl;
     
     for (const auto& node : ast)
     {
