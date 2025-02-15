@@ -2,12 +2,15 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <set>
 #include <memory>
 #include <cctype>
 #include <sstream>
 #include <stdexcept>
 #include <cstdlib>
 
+// Global set to track declared variables
+std::set<std::string> declaredVariables;
 
 /*********************************************************
  *      _______  ____   _  __ ______  _   _   _____      *
@@ -485,7 +488,11 @@ struct DeclarationNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        f << "    " << identifier << " dd 0\t\t\t;Declare variable " << identifier << std::endl;
+        if (declaredVariables.find(identifier) == declaredVariables.end())
+        {
+            f << "    " << identifier << " dd 0\t\t\t;Declare variable " << identifier << std::endl;
+            declaredVariables.insert(identifier);
+        }
     }
 
     void emitCode(std::ofstream& f) const override
@@ -1571,6 +1578,9 @@ public:
 
 void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstream& f)
 {
+    // Reset the global set
+    declaredVariables.clear();
+    
     // Emit data section
     f << "section .data" << std::endl;
     for (const auto& node : ast)

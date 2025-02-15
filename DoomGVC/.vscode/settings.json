@@ -43,7 +43,8 @@
         "ostream": "cpp",
         "sstream": "cpp",
         "stdexcept": "cpp",
-        "streambuf": "cpp"
+        "streambuf": "cpp",
+        "set": "cpp"
     },
     "C_Cpp.default.cppStandard": "c++17"
 }
