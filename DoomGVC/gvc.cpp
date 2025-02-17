@@ -1,16 +1,25 @@
+#include <stdexcept>
 #include <iostream>
+#include <sstream>
+#include <cstdlib>
 #include <fstream>
-#include <string>
-#include <vector>
-#include <set>
 #include <memory>
 #include <cctype>
-#include <sstream>
-#include <stdexcept>
-#include <cstdlib>
+#include <string>
+#include <vector>
+#include <stack>
+#include <set>
+#include <map>
 
-// Global set to track declared variables
-std::set<std::string> declaredVariables;
+// Global stack to track scopes
+std::stack<std::map<std::string, std::pair<std::string, size_t>>> scopes;
+
+// Function to generate a unique name for a variable
+std::string generateUniqueName(const std::string& name)
+{
+    static size_t counter = 0;
+    return name + "_" + std::to_string(counter++);
+}
 
 /*********************************************************
  *      _______  ____   _  __ ______  _   _   _____      *
@@ -412,26 +421,53 @@ struct FunctionNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        for (const auto& stmt : body)
-	    {
-            stmt->emitData(f);
-        }
+        // Functions don't declare variables in the .data section
     }
 
     void emitCode(std::ofstream& f) const override
     {
+        // Push a new scope onto the stack
+        scopes.push({});
+
+        // Emit function prologue
         f << name << ":" << std::endl;
         f << "    push ebp" << std::endl;
         f << "    mov ebp, esp" << std::endl;
 
+        // Allocate space for local variables
+        size_t localVarCount = body.size();
+        f << "    sub esp, " << (localVarCount * 4) << " ; Allocate space for local variables" << std::endl;
+
+        // Store function parameters in local variables
+        for (size_t i = 0; i < parameters.size(); i++)
+        {
+            std::string paramName = parameters[i].second;
+            std::string uniqueName = generateUniqueName(paramName);
+
+            // Calculate the index for the parameter
+            size_t index = i + 1; // Parameters start at index 1
+
+            // Add the parameter to the current scope
+            scopes.top()[paramName] = {uniqueName, index};
+
+            // Parameters are located at [ebp + 8 + i * 4]
+            f << "    mov eax, [ebp + " << (8 + i * 4) << "] ; Load parameter " << paramName << std::endl;
+            f << "    mov [ebp - " << (index * 4) << "], eax ; Store parameter in local variable " << uniqueName << std::endl;
+        }
+
+        // Emit the function body
         for (const auto& stmt : body)
-	    {
+        {
             stmt->emitCode(f);
         }
 
+        // Emit function epilogue
         f << "    mov esp, ebp" << std::endl;
         f << "    pop ebp" << std::endl;
         f << "    ret" << std::endl << std::endl;
+
+        // Pop the scope from the stack
+        scopes.pop();
     }
 };
 
@@ -488,19 +524,28 @@ struct DeclarationNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        if (declaredVariables.find(identifier) == declaredVariables.end())
-        {
-            f << "    " << identifier << " dd 0\t\t\t;Declare variable " << identifier << std::endl;
-            declaredVariables.insert(identifier);
-        }
+        // Local variables are alocated on the stack, so no need to emit them in the .data section
     }
 
     void emitCode(std::ofstream& f) const override
     {
+        // Generate a unique name for the local variable
+        std::string uniqueName = generateUniqueName(identifier);
+
+        // Calculate the index for the new variable
+        size_t index = scopes.top().size() + 1;
+
+        // Add the variable to the current scope
+        scopes.top()[identifier] = {uniqueName, index};
+
+        // Allocate space for the local variable on the stack
+        f << "    sub esp, 4 ; Allocate space for " << uniqueName << std::endl;
+
+        // Initialize the variable (if an initializer is provided)
         if (initializer)
         {
             initializer->emitCode(f);
-            f << "    mov [" << identifier << "], eax\t\t\t;Initialize " << identifier << std::endl;
+            f << "    mov [ebp - " << (index * 4) << "], eax ; Initialize " << uniqueName << std::endl;
         }
     }
 };
@@ -532,8 +577,20 @@ struct AssignmentNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
+        // Evaluate the expression
         expression->emitCode(f);
-        f << "    mov [" << identifier << "], eax\t\t\t;Store result in " << identifier << std::endl;
+
+        // Look up the variable in the current scope
+        if (scopes.top().find(identifier) != scopes.top().end())
+        {
+            auto [uniqueName, index] = scopes.top()[identifier];
+            f << "    mov [ebp - " << (index * 4) << "], eax ; Store result in local variable " << uniqueName << std::endl;
+        }
+        else
+        {
+            // The variable is global (in the .data section)
+            f << "    mov [" << identifier << "], eax ; Store result in global variable " << identifier << std::endl;
+        }
     }
 };
 
@@ -872,35 +929,74 @@ struct UnaryOpNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        if (isPrefix)
+        // Look up the variable in the current scope
+        if (scopes.top().find(name) != scopes.top().end())
         {
-            // Prefix: increment/decrement before using the value
-            f << "    mov eax, [" << name << "]\t\t\t;Load " << name << " into eax" << std::endl;
-            if (op == "++")
+            auto [uniqueName, index] = scopes.top()[name];
+            if (isPrefix)
             {
-                f << "    add eax, 1\t\t\t;Increment" << std::endl;
+                // Prefix: increment/decrement before using the value
+                f << "    mov eax, [ebp - " << (index * 4) << "] ; Load " << uniqueName << " into eax" << std::endl;
+                if (op == "++")
+                {
+                    f << "    add eax, 1 ; Increment" << std::endl;
+                }
+                else if (op == "--")
+                {
+                    f << "    sub eax, 1 ; Decrement" << std::endl;
+                }
+                f << "    mov [ebp - " << (index * 4) << "], eax ; Store result back in " << uniqueName << std::endl;
             }
-            else if (op == "--")
+            else
             {
-                f << "    sub eax, 1\t\t\t;Decrement" << std::endl;
+                // Postfix: use the value, then increment/decrement
+                f << "    mov eax, [ebp - " << (index * 4) << "] ; Load " << uniqueName << " into eax" << std::endl;
+                f << "    mov ecx, eax ; Save original value in ecx" << std::endl;
+                if (op == "++")
+                {
+                    f << "    add eax, 1 ; Increment" << std::endl;
+                }
+                else if (op == "--")
+                {
+                    f << "    sub eax, 1 ; Decrement" << std::endl;
+                }
+                f << "    mov [ebp - " << (index * 4) << "], eax ; Store result back in " << uniqueName << std::endl;
+                f << "    mov eax, ecx ; Restore original value for postfix" << std::endl;
             }
-            f << "    mov [" << name << "], eax\t\t\t;Store result back in " << name << std::endl;
         }
         else
         {
-            // Postfix: use the value, then increment/decrement
-            f << "    mov eax, [" << name << "]\t\t\t;Load " << name << " into eax" << std::endl;
-            f << "    mov ecx, eax\t\t\t;Save original value in ecx" << std::endl;
-            if (op == "++")
+            // The variable is global (in the .data section)
+            if (isPrefix)
             {
-                f << "    add eax, 1\t\t\t;Increment" << std::endl;
+                // Prefix: increment/decrement before using the value
+                f << "    mov eax, [" << name << "] ; Load " << name << " into eax" << std::endl;
+                if (op == "++")
+                {
+                    f << "    add eax, 1 ; Increment" << std::endl;
+                }
+                else if (op == "--")
+                {
+                    f << "    sub eax, 1 ; Decrement" << std::endl;
+                }
+                f << "    mov [" << name << "], eax ; Store result back in " << name << std::endl;
             }
-            else if (op == "--")
+            else
             {
-                f << "    sub eax, 1\t\t\t;Decrement" << std::endl;
+                // Postfix: use the value, then increment/decrement
+                f << "    mov eax, [" << name << "] ; Load " << name << " into eax" << std::endl;
+                f << "    mov ecx, eax ; Save original value in ecx" << std::endl;
+                if (op == "++")
+                {
+                    f << "    add eax, 1 ; Increment" << std::endl;
+                }
+                else if (op == "--")
+                {
+                    f << "    sub eax, 1 ; Decrement" << std::endl;
+                }
+                f << "    mov [" << name << "], eax ; Store result back in " << name << std::endl;
+                f << "    mov eax, ecx ; Restore original value for postfix" << std::endl;
             }
-            f << "    mov [" << name << "], eax\t\t\t;Store result back in " << name << std::endl;
-            f << "    mov eax, ecx\t\t\t;Restore original value for postfix" << std::endl;
         }
     }
 };
@@ -961,22 +1057,17 @@ struct IdentifierNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        if (currentFunction)
+        // Look up the variable in the current scope
+        if (scopes.top().find(name) != scopes.top().end())
         {
-            // Check if the identifier is a function parameter
-            for (size_t i = 0; i < currentFunction->parameters.size(); i++)
-            {
-                if (currentFunction->parameters[i].second == name)
-                {
-                    // Calculate the stack offset for the parameter
-                    int offset = 8 + i * 4; // First parameter is at [ebp + 8], second at [ebp + 12], etc.
-                    f << "    mov eax, [ebp + " << offset << "]\t\t\t;Load parameter " << name << " into eax" << std::endl;
-                    return;
-                }
-            }
+            auto [uniqueName, index] = scopes.top()[name];
+            f << "    mov eax, [ebp - " << (index * 4) << "] ; Load local variable " << uniqueName << std::endl;
         }
-        // If not a parameter, treat it as a global variable
-        f << "    mov eax, [" << name << "]\t\t\t;Load variable " << name << " into eax" << std::endl;
+        else
+        {
+            // The variable is global (in the .data section)
+            f << "    mov eax, [" << name << "] ; Load global variable " << name << std::endl;
+        }
     }
 };
 
@@ -1578,10 +1669,13 @@ public:
 
 void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstream& f)
 {
-    // Reset the global set
-    declaredVariables.clear();
+    // Reset the global stack
+    while(!scopes.empty())
+    {
+        scopes.pop();
+    }
     
-    // Emit data section
+    // Emit data section (for global variables)
     f << "section .data" << std::endl;
     for (const auto& node : ast)
     {
