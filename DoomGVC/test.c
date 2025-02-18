@@ -1,16 +1,11 @@
-int main() {
+#include <libtest.h>
+
+int main()
+{
     int x = 0;
-    if (x == 0)
+    for (int i = 0; i <= sum(VALUE, 1); i++)
     {
-        x = 3;
-        if (x == 3)
-        {
-            x = 5;
-            if (x == 5)
-            {
-                x = 10;
-            }
-        }
+        x = x + i;
     }
     return x;
 }

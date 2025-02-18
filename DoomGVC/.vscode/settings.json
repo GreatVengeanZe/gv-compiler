@@ -44,7 +44,11 @@
         "sstream": "cpp",
         "stdexcept": "cpp",
         "streambuf": "cpp",
-        "set": "cpp"
+        "set": "cpp",
+        "compare": "cpp",
+        "concepts": "cpp",
+        "map": "cpp",
+        "numbers": "cpp"
     },
     "C_Cpp.default.cppStandard": "c++17"
 }
