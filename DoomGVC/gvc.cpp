@@ -641,23 +641,24 @@ struct IfStatementNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
+        size_t labelID = labelCounter++;
         condition->emitCode(f);
         f << "    cmp eax, 0\t\t\t;Compare condition result with 0" << std::endl;
 
         // Jump to the appropriate block bassed on whether there are 'else if' blocks
         if (!elseIfBlocks.empty())
         {
-            f << "    je .else_if_0\t\t\t;Jump to first else_if block if condition is false" << std::endl;
+            f << "    je .else_if_0_" << labelID << "\t\t\t;Jump to first else_if block if condition is false" << std::endl;
         }
 
         else if (!elseBody.empty())
         {
-            f << "    je .else\t\t\t;Jump to else block if condition is false" << std::endl;
+            f << "    je .else_" << labelID << "\t\t\t;Jump to else block if condition is false" << std::endl;
         }
 
         else
         {
-            f << "    je .endif\t\t\t;Jump to .endif if condition is false" << std::endl;
+            f << "    je .endif_" << labelID << "\t\t\t;Jump to .endif if condition is false" << std::endl;
         }
         
 
@@ -667,28 +668,28 @@ struct IfStatementNode : ASTNode
             stmt->emitCode(f);
         }
 
-        f << "    jmp .endif\t\t\t;Jump to .endif to skip all else-if and else block" << std::endl;
+        f << "    jmp .endif_" << labelID << "\t\t\t;Jump to .endif to skip all else-if and else block" << std::endl;
         
         // Emit code for 'else if' blocks (if they exist)
         for (size_t i = 0; i < elseIfBlocks.size(); ++i)
         {
-            f << ".else_if_" << i << ":" << std::endl;
+            f << ".else_if_" << i << "_" << labelID << ":" << std::endl;
             elseIfBlocks[i].first->emitCode(f);
             f << "    cmp eax, 0\t\t\t;Compare condition result with 0" << std::endl;
 
             if (i + 1 < elseIfBlocks.size())
             {
-                f << "    je .else_if_" << (i + 1) << "\t\t\t;Jump to next else-if block if condition is false" << std::endl;
+                f << "    je .else_if_" << (i + 1) << "_" << labelID << "\t\t\t;Jump to next else-if block if condition is false" << std::endl;
             }
 
             else if (!elseBody.empty())
             {
-                f << "    je .else\t\t\t;Jump to else block if condition is false" << std::endl;
+                f << "    je .else_" << labelID << "\t\t\t;Jump to else block if condition is false" << std::endl;
             }
 
             else
             {
-                f << "    je .endif\t\t\t;Jump to .endif if condition is false" << std::endl;
+                f << "    je .endif_" << labelID << "\t\t\t;Jump to .endif if condition is false" << std::endl;
             }
 
             for (const auto& stmt : elseIfBlocks[i].second)
@@ -696,20 +697,20 @@ struct IfStatementNode : ASTNode
                 stmt->emitCode(f);
             }
 
-            f << "    jmp .endif\t\t\t;Jump to .endif to skip remaining else-if and else blocks" << std::endl;
+            f << "    jmp .endif_" << labelID << "\t\t\t;Jump to .endif to skip remaining else-if and else blocks" << std::endl;
         }
         
         // Emit code for the 'else' block (if it exist)
         if (!elseBody.empty())
         {
-            f << ".else:" << std::endl;
+            f << ".else_" << labelID << ":" << std::endl;
             for (const auto& stmt : elseBody)
             {
                 stmt->emitCode(f);
             }
         }
 
-        f << ".endif:" << std::endl;
+        f << ".endif_" << labelID << ":" << std::endl;
     }
 };
 
