@@ -49,7 +49,8 @@
         "concepts": "cpp",
         "map": "cpp",
         "numbers": "cpp",
-        "iomanip": "cpp"
+        "iomanip": "cpp",
+        "ctime": "cpp"
     },
     "C_Cpp.default.cppStandard": "c++17"
 }
