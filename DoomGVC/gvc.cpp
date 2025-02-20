@@ -39,7 +39,7 @@ std::string generateUniqueName(const std::string& name)
 
 enum TokenType
 {
-    TOKEN_INT, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_SEMICOLON,
+    TOKEN_INT, TOKEN_CHAR, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_CHAR_LITERAL, TOKEN_SEMICOLON,
     TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE,
     TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
     TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
@@ -112,6 +112,19 @@ public:
     {
         skipWhitespace();
         char ch = peek();
+
+        if (ch == '\'')                 // Handle char literals
+        {
+            advance();                  // Consume the opening quote
+            char charValue = advance(); // Get the character
+            if (peek() != '\'')
+            {
+                throw std::runtime_error("Expected closing quote for char literal");
+            }
+            advance();                  // Consume the closing quote
+            return { TOKEN_CHAR_LITERAL, std::string(1, charValue) };
+        }
+
         if (isdigit(ch))
 	    {
             std::string num;
@@ -126,6 +139,7 @@ public:
             if (ident == "if")      return { TOKEN_IF    , ident };
             if (ident == "int")     return { TOKEN_INT   , ident };
             if (ident == "for")     return { TOKEN_FOR   , ident };
+            if (ident == "char")    return { TOKEN_CHAR  , ident };
             if (ident == "else")    return { TOKEN_ELSE  , ident };
             if (ident == "while")   return { TOKEN_WHILE , ident };
             if (ident == "return")  return { TOKEN_RETURN, ident };
@@ -525,9 +539,10 @@ struct DeclarationNode : ASTNode
 {
     std::string identifier;
     std::unique_ptr<ASTNode> initializer;
+    TokenType type;
 
-    DeclarationNode(const std::string& id, std::unique_ptr<ASTNode> init = nullptr)
-        : identifier(id), initializer(std::move(init)) {}
+    DeclarationNode(const std::string& id, std::unique_ptr<ASTNode> init = nullptr, TokenType t = TOKEN_INT)
+        : identifier(id), initializer(std::move(init)), type(t) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1056,7 +1071,26 @@ struct NumberNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         std::string instruction = "    mov eax, " + std::to_string(value);
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "" << "; Load constant " << value << " into eax" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load constant " << value << " into eax" << std::endl;
+    }
+};
+
+
+struct CharLiteralNode : ASTNode
+{
+    char value;
+
+    CharLiteralNode(char v) : value(v) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        // No data to emit for char literals
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        std::string instruction = "    mov eax, " + std::to_string(static_cast<int>(value));
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load char literal '" << value << "' into eax" << std::endl;
     }
 };
 
@@ -1171,10 +1205,16 @@ class Parser
             return std::make_unique<UnaryOpNode>(token.value, identifier, true); // true for prefix
         }
 
-        if (token.type == TOKEN_NUMBER)
+        else if (token.type == TOKEN_NUMBER)
 	    {
             eat(TOKEN_NUMBER);
             return std::make_unique<NumberNode>(std::stoi(token.value));
+        }
+
+        else if (token.type == TOKEN_CHAR_LITERAL)
+        {
+            eat(TOKEN_CHAR_LITERAL);
+            return std::make_unique<CharLiteralNode>(token.value.data()[0]);
         }
 
         else if (token.type == TOKEN_IDENTIFIER)
@@ -1311,9 +1351,10 @@ class Parser
     {
         Token token = currentToken;
 
-        if (token.type == TOKEN_INT)
+        if (token.type == TOKEN_INT || token.type == TOKEN_CHAR)
 	    {
-            eat(TOKEN_INT);
+            TokenType type = token.type;
+            eat(type);  // Consume the token type
             std::string identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
 
@@ -1326,7 +1367,7 @@ class Parser
             }
             eat(TOKEN_SEMICOLON);
 
-            return std::make_unique<DeclarationNode>(identifier, std::move(initializer));
+            return std::make_unique<DeclarationNode>(identifier, std::move(initializer), type);
         }
 
         else if (token.type == TOKEN_IDENTIFIER)
@@ -1528,7 +1569,7 @@ class Parser
             return std::make_unique<ReturnNode>(std::move(expr));
         }
 
-        throw std::runtime_error("Unexpected token in statement");
+        throw std::runtime_error("Unexpected token in statement " + token.value);
     }
 
 
@@ -1946,7 +1987,7 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
  *     | \  / |   /  \     | |  |  \| |     *
  *     | |\/| |  / /\ \    | |  | . ` |     *
  *     | |  | | / ____ \  _| |_ | |\  |     *
- *     |_|  |_|/_/    \_\|_____||_| \_|     *                         
+ *     |_|  |_|/_/    \_\|_____||_| \_|     *
  *                                          *
  ********************************************/
 
