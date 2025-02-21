@@ -39,7 +39,7 @@ std::string generateUniqueName(const std::string& name)
 
 enum TokenType
 {
-    TOKEN_INT, TOKEN_CHAR, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_CHAR_LITERAL, TOKEN_SEMICOLON,
+    TOKEN_INT, TOKEN_CHAR, TOKEN_VOID, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_CHAR_LITERAL, TOKEN_SEMICOLON,
     TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE,
     TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
     TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
@@ -140,6 +140,7 @@ public:
             if (ident == "int")     return { TOKEN_INT   , ident };
             if (ident == "for")     return { TOKEN_FOR   , ident };
             if (ident == "char")    return { TOKEN_CHAR  , ident };
+            if (ident == "void")    return { TOKEN_VOID  , ident };
             if (ident == "else")    return { TOKEN_ELSE  , ident };
             if (ident == "while")   return { TOKEN_WHILE , ident };
             if (ident == "return")  return { TOKEN_RETURN, ident };
@@ -440,11 +441,12 @@ struct FunctionCallNode : ASTNode
 struct FunctionNode : ASTNode
 {
     std::string name;
+    TokenType returnType; // Store the return type (TOKEN_INT, TOKEN_CHAR, or TOKEN_VOID)
     std::vector<std::pair<std::string, std::string>> parameters; // (type, name) pairs
     std::vector<std::unique_ptr<ASTNode>> body;
 
-    FunctionNode(const std::string& name, std::vector<std::pair<std::string, std::string>> params, std::vector<std::unique_ptr<ASTNode>> body)
-        : name(name), parameters(std::move(params)), body(std::move(body)) {}
+    FunctionNode(const std::string& name, TokenType rtype, std::vector<std::pair<std::string, std::string>> params, std::vector<std::unique_ptr<ASTNode>> body)
+        : name(name), returnType(rtype), parameters(std::move(params)), body(std::move(body)) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -458,8 +460,9 @@ struct FunctionNode : ASTNode
 
         // Emit function prologue
         f << std::endl << name << ":" << std::endl;
+        f << "; Prologue" << std::endl;
         f << "    push ebp" << std::endl;
-        f << "    mov ebp, esp" << std::endl;
+        f << "    mov ebp, esp\n" << std::endl;
 
         // Allocate space for local variables
         size_t localVarCount = body.size();
@@ -486,9 +489,10 @@ struct FunctionNode : ASTNode
         }
 
         // Emit function epilogue
+        f << "\n; Epilogue" << std::endl;
         f << "    mov esp, ebp" << std::endl;
         f << "    pop ebp" << std::endl;
-        f << "    ret" << std::endl << std::endl;
+        f << "    ret" << std::endl;
 
         // Pop the scope from the stack
         scopes.pop();
@@ -510,7 +514,9 @@ struct FunctionNode : ASTNode
 struct ReturnNode : ASTNode
 {
     std::unique_ptr<ASTNode> expression;
-    ReturnNode(std::unique_ptr<ASTNode> expr) : expression(std::move(expr)) {}
+    const FunctionNode* currentFunction; // Track the current function context
+
+    ReturnNode(std::unique_ptr<ASTNode> expr, const FunctionNode* currentFunction) : expression(std::move(expr)), currentFunction(currentFunction) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -519,7 +525,20 @@ struct ReturnNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        expression->emitCode(f);
+        if (currentFunction->returnType != TOKEN_VOID)
+        {
+            // Non-void function: evaluate the expression and return its value
+            expression->emitCode(f); 
+        }
+
+        else
+        {
+            // Void function: no return value
+            if (expression)
+            {
+                throw std::runtime_error("void function cannot return a value");
+            }
+        }
     }
 };
 
@@ -1351,8 +1370,9 @@ class Parser
     {
         Token token = currentToken;
 
-        if (token.type == TOKEN_INT || token.type == TOKEN_CHAR)
+        if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID)
 	    {
+            // Handle variable declarations
             TokenType type = token.type;
             eat(type);  // Consume the token type
             std::string identifier = currentToken.value;
@@ -1374,6 +1394,18 @@ class Parser
 	    {
             std::string identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
+
+            // Check if this is a function call
+            if (currentToken.type == TOKEN_LPAREN)
+            {
+                // Parse the function call
+                auto funcCall = functionCall(identifier);
+                
+                // Consume the semicolumn
+                eat(TOKEN_SEMICOLON);
+            
+                return funcCall;
+            }
     
             // Check if this is an assignment (e.g., x = ...)
             if (currentToken.type == TOKEN_ASSIGN)
@@ -1566,7 +1598,7 @@ class Parser
             eat(TOKEN_RETURN);
             auto expr = expression(currentFunction); // Pass the current function context
             eat(TOKEN_SEMICOLON);
-            return std::make_unique<ReturnNode>(std::move(expr));
+            return std::make_unique<ReturnNode>(std::move(expr), currentFunction);
         }
 
         throw std::runtime_error("Unexpected token in statement " + token.value);
@@ -1586,8 +1618,13 @@ class Parser
 
     std::unique_ptr<FunctionNode> function()
     {
-        // Parse the return type (assume 'int' for simplicity)
-        eat(TOKEN_INT);
+        // Parse the return type (int, char or void)
+        TokenType returnType = currentToken.type;
+        if (returnType != TOKEN_INT && returnType != TOKEN_CHAR && returnType != TOKEN_VOID)
+        {
+            throw std::runtime_error("Expected return type (int, char of void)");
+        }
+        eat(returnType);
         
         // Parse the function name
         std::string name = currentToken.value;
@@ -1598,12 +1635,13 @@ class Parser
         std::vector<std::pair<std::string, std::string>> parameters; // Store (type, name) pairs
         while (currentToken.type != TOKEN_RPAREN)
 	    {
-            // Parse the parameter type (assume 'int' for simplicity)
-            if (currentToken.type != TOKEN_INT)
+            // Parse the parameter type (int, char or void)
+            TokenType paramType = currentToken.type;
+            if (paramType != TOKEN_INT && paramType != TOKEN_CHAR && paramType != TOKEN_VOID)
             {
-                throw std::runtime_error("Expected parameter type 'int'");
+                throw std::runtime_error("Expected parameter type (int, char or void)");
             }
-            std::string type = currentToken.value;
+            
             eat(TOKEN_INT);
             
             // Parse the parameter name
@@ -1611,7 +1649,7 @@ class Parser
             eat(TOKEN_IDENTIFIER);
 
             // Add the parameter to the list
-            parameters.push_back({type, name});
+            parameters.push_back({paramType == TOKEN_INT ? "int" : "char", name});
 
             // Check for a comma (more parameters)
             if (currentToken.type == TOKEN_COMMA)
@@ -1623,7 +1661,7 @@ class Parser
         eat(TOKEN_RPAREN);
 
         // Create the FunctionNode
-        auto functionNode = std::make_unique<FunctionNode>(name, parameters, std::vector<std::unique_ptr<ASTNode>>());
+        auto functionNode = std::make_unique<FunctionNode>(name, returnType, parameters, std::vector<std::unique_ptr<ASTNode>>());
 
         // Parse the function body
         eat(TOKEN_LBRACE);
@@ -1726,7 +1764,7 @@ public:
 
         while (currentToken.type != TOKEN_EOF)
 	    {
-            if (currentToken.type == TOKEN_INT)
+            if (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID)
             {
                 functions.push_back(function());
             }
