@@ -40,7 +40,7 @@ std::string generateUniqueName(const std::string& name)
 enum TokenType
 {
     TOKEN_INT, TOKEN_CHAR, TOKEN_VOID, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_CHAR_LITERAL, TOKEN_SEMICOLON,
-    TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE,
+    TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE, TOKEN_ADDRESS_OF,
     TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
     TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
     TOKEN_LOGICAL_AND, TOKEN_LOGICAL_OR, TOKEN_RETURN, TOKEN_COMMA, TOKEN_EOF
@@ -268,6 +268,7 @@ public:
                 advance();
                 return { TOKEN_LOGICAL_AND, "&&"};
             }
+            return { TOKEN_ADDRESS_OF, "&" };
         }
 
         else if (ch == '|')
@@ -460,7 +461,6 @@ struct FunctionNode : ASTNode
 
         // Emit function prologue
         f << std::endl << name << ":" << std::endl;
-        f << "; Prologue" << std::endl;
         f << "    push ebp" << std::endl;
         f << "    mov ebp, esp\n" << std::endl;
 
@@ -489,8 +489,7 @@ struct FunctionNode : ASTNode
         }
 
         // Emit function epilogue
-        f << "\n; Epilogue" << std::endl;
-        f << "    mov esp, ebp" << std::endl;
+        f << "\n    mov esp, ebp" << std::endl;
         f << "    pop ebp" << std::endl;
         f << "    ret" << std::endl;
 
@@ -559,9 +558,10 @@ struct DeclarationNode : ASTNode
     std::string identifier;
     std::unique_ptr<ASTNode> initializer;
     TokenType type;
+    int pointerLevel;   // 0 fon non-pointer, 1 for *, 2 for **, etc.
 
-    DeclarationNode(const std::string& id, std::unique_ptr<ASTNode> init = nullptr, TokenType t = TOKEN_INT)
-        : identifier(id), initializer(std::move(init)), type(t) {}
+    DeclarationNode(const std::string& id, std::unique_ptr<ASTNode> init = nullptr, TokenType t = TOKEN_INT, int pLevel = 0)
+        : identifier(id), initializer(std::move(init)), type(t), pointerLevel(pLevel) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -570,16 +570,11 @@ struct DeclarationNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        // Generate a unique name for the local variable
-        std::string uniqueName = generateUniqueName(identifier);
+        std::string uniqueName = generateUniqueName(identifier);    // Generate a unique name for the local variable
+        size_t index = scopes.top().size() + 1;                     // Calculate the index for the new variable
+        scopes.top()[identifier] = {uniqueName, index};             // Add the variable to the current scope
 
-        // Calculate the index for the new variable
-        size_t index = scopes.top().size() + 1;
-
-        // Add the variable to the current scope
-        scopes.top()[identifier] = {uniqueName, index};
-
-        // Allocate space for the local variable on the stack
+        // Allocate space for the local variable on the stack (pointer or not, it's still 4 bytes on 32-bit)
         f << std::left << std::setw(COMMENT_COLUMN) << "    sub esp, 4" << "; Allocate space for " << uniqueName << std::endl;
 
         // Initialize the variable (if an initializer is provided)
@@ -587,7 +582,67 @@ struct DeclarationNode : ASTNode
         {
             initializer->emitCode(f);
             std::string instruction = "    mov [ebp - " + std::to_string(index * 4) + "], eax";
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Initialize " << uniqueName << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Initialize " << uniqueName;
+            if (pointerLevel > 0) f << " (pointer level " << pointerLevel << ")";
+            f << std::endl;
+        }
+    }
+};
+
+
+struct DereferenceNode : ASTNode
+{
+    std::unique_ptr<ASTNode> operand;
+    const FunctionNode* currentFuction;
+
+    DereferenceNode(std::unique_ptr<ASTNode> op, const FunctionNode* func)
+        : operand(std::move(op)), currentFuction(func) {}
+
+    void emitData (std::ofstream& f) const override {}
+
+    void emitCode(std::ofstream& f) const override
+    {
+        operand->emitCode(f); // Get the pointer calue into eax
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, [eax]" << "; Dereference pointer" << std::endl;
+    }
+};
+
+
+struct AddressOfNode : ASTNode
+{
+    std::string Identifier;
+    const FunctionNode* currentFunction;
+
+    AddressOfNode(const std::string& id, const FunctionNode* func)
+        : Identifier(id), currentFunction(func) {}
+
+    void emitData(std::ofstream& f) const override {}
+
+    void emitCode(std::ofstream& f) const override
+    {
+        if (scopes.top().find(Identifier) != scopes.top().end())
+        {
+            auto [uniqueName, index] = scopes.top()[Identifier];
+            if (currentFunction && index <= currentFunction->parameters.size())
+            {
+                // Parameter
+                std::string instruction = "    lea eax, [ebp + " + std::to_string(8 + (index -1) * 4) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Address of parameter " << uniqueName << std::endl;
+            }
+
+            else
+            {
+                // Local variable
+                std::string instruction = "    lea eax, [ebp - " + std::to_string(index * 4) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Address of local variable " << uniqueName << std::endl;
+            }
+        }
+
+        else
+        {
+            // Global variable
+            std::string instruction = "    mov eax, " + Identifier;
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Address of global variable " << Identifier << std::endl; 
         }
     }
 };
@@ -608,9 +663,10 @@ struct AssignmentNode : ASTNode
 {
     std::string identifier;
     std::unique_ptr<ASTNode> expression;
+    int dereferenceLevel; // Flag to indicate if this is a dereference assignment (e.g., *ptr = ...)
 
-    AssignmentNode(const std::string& id, std::unique_ptr<ASTNode> expr)
-        : identifier(id), expression(std::move(expr)) {}
+    AssignmentNode(const std::string& id, std::unique_ptr<ASTNode> expr, int derefLevel = 0)
+        : identifier(id), expression(std::move(expr)), dereferenceLevel(derefLevel) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -622,18 +678,50 @@ struct AssignmentNode : ASTNode
         // Evaluate the expression
         expression->emitCode(f);
 
-        // Look up the variable in the current scope
-        if (scopes.top().find(identifier) != scopes.top().end())
+        if (dereferenceLevel > 0)
         {
-            auto [uniqueName, index] = scopes.top()[identifier];
-            std::string instruction = "    mov [ebp - " + std::to_string(index * 4) + "], eax";
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store result in local variable " << uniqueName << std::endl;
+            // Handle multi-level dereference assignment
+            if (scopes.top().find(identifier) != scopes.top().end())
+            {
+                auto [uniqueName, index] = scopes.top()[identifier];
+                f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Save the value" << std::endl;
+
+                // Load the pointer
+                std::string instruction = "    mov eax, [ebp - " + std::to_string(index * 4) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load pointer " << uniqueName << std::endl;
+
+                // Dereference the pointer (dereferenceLevel - 1) times to get the final address
+                for (int i = 1; i < dereferenceLevel; i++)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, [eax]" << "; Dereference level " << i << std::endl;
+                }
+
+                // Store the value at the final address
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Restore the value" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [eax], ecx" << "; Store value at pointer address" << std::endl;
+            }
+
+            else
+            {
+                throw std::runtime_error("Dereference assignment to undefined variable " + identifier);
+            }
         }
+
         else
         {
-            // The variable is global (in the .data section)
-            std::string instruction = "    mov [" + identifier + "], eax";
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store result in global variable " << identifier << std::endl;
+            // Regular assign,ent (no dereferencing)
+            if (scopes.top().find(identifier) != scopes.top().end())
+            {
+                auto [uniqueName, index] = scopes.top()[identifier];
+                std::string instruction = "    mov [ebp - " + std::to_string(index * 4) + "], eax";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store result in local variable " << uniqueName << std::endl;
+            }
+            else
+            {
+                // The variable is global (in the .data section)
+                std::string instruction = "    mov [" + identifier + "], eax";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store result in global variable " << identifier << std::endl;
+            }
         }
     }
 };
@@ -1230,6 +1318,25 @@ class Parser
             return std::make_unique<NumberNode>(std::stoi(token.value));
         }
 
+        else if (token.type == TOKEN_MULTIPLY) // Dereference
+        {
+            eat(TOKEN_MULTIPLY);
+            auto operand = factor(currentFunction); // Recursively parse the operand
+            return std::make_unique<DereferenceNode>(std::move(operand), currentFunction);
+        }
+
+        else if (token.type == TOKEN_ADDRESS_OF)
+        {
+            eat(TOKEN_ADDRESS_OF);
+            if (currentToken.type != TOKEN_IDENTIFIER)
+            {
+                throw std::runtime_error("Expected Identifier after &");
+            }
+            std::string Identifier = currentToken.value;
+            eat(TOKEN_IDENTIFIER);
+            return std::make_unique<AddressOfNode>(Identifier, currentFunction);
+        }
+
         else if (token.type == TOKEN_CHAR_LITERAL)
         {
             eat(TOKEN_CHAR_LITERAL);
@@ -1375,6 +1482,12 @@ class Parser
             // Handle variable declarations
             TokenType type = token.type;
             eat(type);  // Consume the token type
+            int pointerLevel = 0;
+            while (currentToken.type == TOKEN_MULTIPLY) // Count pointer levels
+            {
+                eat(TOKEN_MULTIPLY);
+                pointerLevel++;
+            }
             std::string identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
 
@@ -1387,7 +1500,34 @@ class Parser
             }
             eat(TOKEN_SEMICOLON);
 
-            return std::make_unique<DeclarationNode>(identifier, std::move(initializer), type);
+            return std::make_unique<DeclarationNode>(identifier, std::move(initializer), type, pointerLevel);
+        }
+
+        else if (token.type == TOKEN_MULTIPLY) // Dereference assignment (e.g., *ptr = ...)
+        {
+            int dereferenceLevel = 0;
+            while(currentToken.type == TOKEN_MULTIPLY)
+            {
+                eat(TOKEN_MULTIPLY);
+                dereferenceLevel++;
+            }
+
+            if (currentToken.type != TOKEN_IDENTIFIER)
+            {
+                throw std::runtime_error("Expected identifier after dereference operator(s)");
+            }
+            std::string identifier = currentToken.value;
+            eat(TOKEN_IDENTIFIER);
+
+            if (currentToken.type != TOKEN_ASSIGN)
+            {
+                throw std::runtime_error("Expected = after dereference identifier");
+            }
+            eat(TOKEN_ASSIGN);
+
+            auto expr = expression(currentFunction);
+            eat(TOKEN_SEMICOLON);
+            return std::make_unique<AssignmentNode>(identifier, std::move(expr), dereferenceLevel); // true for dereference
         }
 
         else if (token.type == TOKEN_IDENTIFIER)
@@ -1413,7 +1553,7 @@ class Parser
                 eat(TOKEN_ASSIGN);
                 auto expr = expression(currentFunction); // Parse the right-hand side
                 eat(TOKEN_SEMICOLON);
-                return std::make_unique<AssignmentNode>(identifier, std::move(expr));
+                return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0);
             }
 
             // Check if this is a postfix increment/decrement (e.g., x++; or x--;)
