@@ -41,7 +41,7 @@ enum TokenType
 {
     TOKEN_INT, TOKEN_CHAR, TOKEN_VOID, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_CHAR_LITERAL, TOKEN_SEMICOLON,
     TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE, TOKEN_ADDRESS_OF,
-    TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
+    TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE, TOKEN_LBRACKET, TOKEN_RBRACKET,
     TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
     TOKEN_LOGICAL_AND, TOKEN_LOGICAL_OR, TOKEN_RETURN, TOKEN_COMMA, TOKEN_EOF
 };
@@ -228,6 +228,18 @@ public:
             return { TOKEN_RBRACE, "}" };
         }
 
+        else if (ch == '[')
+        {
+            advance();
+            return { TOKEN_LBRACKET, "[" };
+        }
+
+        else if (ch == ']')
+        {
+            advance();
+            return { TOKEN_RBRACKET, "]" };
+        }
+
         else if (ch == '<')
 	    {
             advance();
@@ -307,6 +319,10 @@ struct ASTNode
     virtual ~ASTNode() = default;
     virtual void emitData(std::ofstream& f) const = 0;
     virtual void emitCode(std::ofstream& f) const = 0;
+
+    // Methods for constant checking
+    virtual bool isConstant() const { return false; }
+    virtual int getConstantValue() const { throw std::runtime_error("Not a constant node"); }
 };
 
 static size_t labelCounter = 0; // Global counter for generating unique labels
@@ -570,21 +586,17 @@ struct DeclarationNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        std::string uniqueName = generateUniqueName(identifier);    // Generate a unique name for the local variable
-        size_t index = scopes.top().size() + 1;                     // Calculate the index for the new variable
-        scopes.top()[identifier] = {uniqueName, index};             // Add the variable to the current scope
+        std::string uniqueName = generateUniqueName(identifier);
+        size_t index = scopes.top().size() + 1; // Next free slot
+        scopes.top()[identifier] = {uniqueName, index};
 
-        // Allocate space for the local variable on the stack (pointer or not, it's still 4 bytes on 32-bit)
         f << std::left << std::setw(COMMENT_COLUMN) << "    sub esp, 4" << "; Allocate space for " << uniqueName << std::endl;
 
-        // Initialize the variable (if an initializer is provided)
         if (initializer)
         {
             initializer->emitCode(f);
             std::string instruction = "    mov [ebp - " + std::to_string(index * 4) + "], eax";
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Initialize " << uniqueName;
-            if (pointerLevel > 0) f << " (pointer level " << pointerLevel << ")";
-            f << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Initialize " << uniqueName << std::endl;
         }
     }
 };
@@ -648,6 +660,154 @@ struct AddressOfNode : ASTNode
 };
 
 
+struct ArrayDeclarationNode : ASTNode
+{
+    std::string identifier;
+    TokenType type;                    // Base type (e.g., TOKEN_INT)
+    std::vector<size_t> dimensions;    // Array dimensions (e.g., {5} for arr[5], {2, 3} for arr[2][3])
+    std::vector<std::unique_ptr<ASTNode>> initializer; // Optional initializer list
+
+    ArrayDeclarationNode(const std::string& id, TokenType t, std::vector<size_t> dims,
+                         std::vector<std::unique_ptr<ASTNode>> init = {})
+        : identifier(id), type(t), dimensions(std::move(dims)), initializer(std::move(init)) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        // For now, we'll handle local arrays on the stack; globals could be added later
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        std::string uniqueName = generateUniqueName(identifier);
+        size_t totalElements = 1;
+        for (size_t dim : dimensions) totalElements *= dim; // Total number of elements
+        size_t totalSize = totalElements * 4; // Total size in bytes
+
+        size_t baseIndex = scopes.top().size() + 1; // Starting index
+        scopes.top()[identifier] = {uniqueName, baseIndex};
+
+        f << std::left << std::setw(COMMENT_COLUMN) << "    sub esp, " << totalSize << "; Allocate space for array " << uniqueName
+          << " (" << totalElements << " elements)" << std::endl;
+
+        if (!initializer.empty())
+        {
+            if (initializer.size() > totalElements)
+                throw std::runtime_error("Too many initializers for array " + identifier);
+
+            for (size_t i = 0; i < initializer.size(); ++i)
+            {
+                initializer[i]->emitCode(f);
+                std::string instruction = "    mov [ebp - " + std::to_string(baseIndex * 4 + i * 4) + "], eax";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Initialize " << uniqueName << "[" << i << "]" << std::endl;
+            }
+        }
+
+        // Reserve space in the scope for the entire array
+        for (size_t i = 1; i < totalElements; ++i)
+        {
+            scopes.top()["__reserved_" + uniqueName + "_" + std::to_string(i)] = {uniqueName, baseIndex + i};
+        }
+    }
+};
+
+
+struct ArrayAccessNode : ASTNode
+{
+    std::string identifier;
+    std::vector<std::unique_ptr<ASTNode>> indices;
+    const FunctionNode* currentFunction;
+
+    ArrayAccessNode(const std::string& id, std::vector<std::unique_ptr<ASTNode>> idx, const FunctionNode* func)
+        : identifier(id), indices(std::move(idx)), currentFunction(func) {}
+
+    void emitData(std::ofstream& f) const override {}
+
+    void emitCode(std::ofstream& f) const override
+    {
+        if (scopes.top().find(identifier) == scopes.top().end())
+            throw std::runtime_error("Array " + identifier + " not found in scope");
+
+        auto [uniqueName, baseIndex] = scopes.top()[identifier];
+        size_t baseOffset = baseIndex * 4; // Base offset from ebp in bytes
+
+        // Check if all indices are constants
+        bool allConstant = true;
+        std::vector<size_t> constantIndices;
+        for (const auto& index : indices)
+        {
+            if (index->isConstant())
+            {
+                constantIndices.push_back(index->getConstantValue());
+            }
+            else
+            {
+                allConstant = false;
+                break;
+            }
+        }
+
+        if (allConstant && !constantIndices.empty())
+        {
+            // Precompute the offset for constant indices
+            size_t totalOffset = baseOffset;
+            for (size_t i = 0; i < constantIndices.size(); ++i)
+            {
+                size_t multiplier = 1;
+                for (size_t j = i + 1; j < constantIndices.size(); ++j)
+                {
+                    multiplier *= constantIndices[j]; // For multi-dimensional arrays
+                }
+                totalOffset += constantIndices[i] * multiplier * 4;
+            }
+
+            std::string instruction = "    mov eax, [ebp - " + std::to_string(totalOffset) + "]";
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load " << uniqueName << "[";
+            for (size_t i = 0; i < constantIndices.size(); ++i)
+                f << (i > 0 ? "," : "") << constantIndices[i];
+            f << "]" << std::endl;
+        }
+        else
+        {
+            // Dynamic indices: compute offset at runtime
+            for (size_t i = 0; i < indices.size(); ++i)
+            {
+                indices[i]->emitCode(f); // Evaluate index into eax
+                f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push index " << i << std::endl;
+
+                if (i > 0)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop current index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop accumulated offset" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    imul eax, ecx" << "; Multiply by previous dimension" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push updated offset" << std::endl;
+                }
+            }
+
+            if (indices.size() > 1)
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop final index" << std::endl;
+                for (size_t i = 1; i < indices.size(); ++i)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop next index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    add eax, ecx" << "; Add to offset" << std::endl;
+                }
+            }
+            else
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop single index" << std::endl;
+            }
+
+            f << std::left << std::setw(COMMENT_COLUMN) << "    shl eax, 2" << "; Scale offset by 4 (sizeof(int))" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov ecx, ebp" << "; Copy ebp to ecx" << std::endl;
+            std::string instruction = "    sub ecx, " + std::to_string(baseOffset);
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Adjust to array base" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    sub ecx, eax" << "; Subtract scaled index" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, [ecx]" << "; Load " << uniqueName << "[dynamic]" << std::endl;
+        }
+    }
+};
+
+
 /********************************************************************************************
  *                 _____   _____  _____   _____  _   _  __  __  ______  _   _  _______      *
  *         /\     / ____| / ____||_   _| / ____|| \ | ||  \/  ||  ____|| \ | ||__   __|     *
@@ -663,53 +823,130 @@ struct AssignmentNode : ASTNode
 {
     std::string identifier;
     std::unique_ptr<ASTNode> expression;
-    int dereferenceLevel; // Flag to indicate if this is a dereference assignment (e.g., *ptr = ...)
-
-    AssignmentNode(const std::string& id, std::unique_ptr<ASTNode> expr, int derefLevel = 0)
-        : identifier(id), expression(std::move(expr)), dereferenceLevel(derefLevel) {}
-
-    void emitData(std::ofstream& f) const override
-    {
-        // No data to emit for assignments
-    }
-
+    int dereferenceLevel;                       // For pointer dereferencing
+    std::vector<std::unique_ptr<ASTNode>> indices; // For array indexing (empty if not an array access)
+ 
+    AssignmentNode(const std::string& id, std::unique_ptr<ASTNode> expr, int derefLevel = 0,
+                std::vector<std::unique_ptr<ASTNode>> idx = {})
+        : identifier(id), expression(std::move(expr)), dereferenceLevel(derefLevel), indices(std::move(idx)) {}
+ 
+    void emitData(std::ofstream& f) const override {}
+ 
     void emitCode(std::ofstream& f) const override
     {
-        // Evaluate the expression
-        expression->emitCode(f);
+        expression->emitCode(f); // Evaluate the right-hand side
 
         if (dereferenceLevel > 0)
         {
-            // Handle multi-level dereference assignment
+            // Pointer dereference assignment (unchanged)
             if (scopes.top().find(identifier) != scopes.top().end())
             {
                 auto [uniqueName, index] = scopes.top()[identifier];
                 f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Save the value" << std::endl;
-
-                // Load the pointer
                 std::string instruction = "    mov eax, [ebp - " + std::to_string(index * 4) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load pointer " << uniqueName << std::endl;
-
-                // Dereference the pointer (dereferenceLevel - 1) times to get the final address
                 for (int i = 1; i < dereferenceLevel; i++)
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, [eax]" << "; Dereference level " << i << std::endl;
                 }
-
-                // Store the value at the final address
                 f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Restore the value" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [eax], ecx" << "; Store value at pointer address" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [eax], ecx" << "; Store value at final address" << std::endl;
             }
-
             else
             {
                 throw std::runtime_error("Dereference assignment to undefined variable " + identifier);
             }
         }
+        else if (!indices.empty())
+        {
+            // Array element assignment
+            if (scopes.top().find(identifier) == scopes.top().end())
+                throw std::runtime_error("Array " + identifier + " not found in scope");
 
+            auto [uniqueName, baseIndex] = scopes.top()[identifier];
+            size_t baseOffset = baseIndex * 4;
+
+            f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Save the value to assign" << std::endl;
+
+            // Check if all indices are constants
+            bool allConstant = true;
+            std::vector<size_t> constantIndices;
+            for (const auto& index : indices)
+            {
+                if (index->isConstant())
+                {
+                    constantIndices.push_back(index->getConstantValue());
+                }
+                else
+                {
+                    allConstant = false;
+                    break;
+                }
+            }
+
+            if (allConstant && !constantIndices.empty())
+            {
+                // Precompute the offset for constant indices
+                size_t totalOffset = baseOffset;
+                for (size_t i = 0; i < constantIndices.size(); ++i)
+                {
+                    size_t multiplier = 1;
+                    for (size_t j = i + 1; j < constantIndices.size(); ++j)
+                    {
+                        multiplier *= constantIndices[j];
+                    }
+                    totalOffset += constantIndices[i] * multiplier * 4;
+                }
+
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Restore the value" << std::endl;
+                std::string instruction = "    mov [ebp - " + std::to_string(totalOffset) + "], eax";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store in " << uniqueName << "[";
+                for (size_t i = 0; i < constantIndices.size(); ++i)
+                    f << (i > 0 ? "," : "") << constantIndices[i];
+                f << "]" << std::endl;
+            }
+            else
+            {
+                // Dynamic indices
+                for (size_t i = 0; i < indices.size(); ++i)
+                {
+                    indices[i]->emitCode(f);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push index " << i << std::endl;
+
+                    if (i > 0)
+                    {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop current index" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop accumulated offset" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    imul eax, ecx" << "; Multiply by previous dimension" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push updated offset" << std::endl;
+                    }
+                }
+
+                if (indices.size() > 1)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop final index" << std::endl;
+                    for (size_t i = 1; i < indices.size(); ++i)
+                    {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop next index" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    add eax, ecx" << "; Add to offset" << std::endl;
+                    }
+                }
+                else
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop single index" << std::endl;
+                }
+
+                f << std::left << std::setw(COMMENT_COLUMN) << "    shl eax, 2" << "; Scale offset by 4 (sizeof(int))" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov ecx, ebp" << "; Copy ebp to ecx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    sub ecx, " << baseOffset << "; Adjust to array base" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    sub ecx, eax" << "; Subtract scaled index" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Restore the value" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [ecx], eax" << "; Store in " << uniqueName << "[dynamic]" << std::endl;
+            }
+        }
         else
         {
-            // Regular assign,ent (no dereferencing)
+            // Regular variable assignment
             if (scopes.top().find(identifier) != scopes.top().end())
             {
                 auto [uniqueName, index] = scopes.top()[identifier];
@@ -718,7 +955,6 @@ struct AssignmentNode : ASTNode
             }
             else
             {
-                // The variable is global (in the .data section)
                 std::string instruction = "    mov [" + identifier + "], eax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store result in global variable " << identifier << std::endl;
             }
@@ -923,40 +1159,29 @@ struct ForLoopNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         size_t loopStartLabel = labelCounter++;
-        size_t loopEndLabel = labelCounter++;
+    size_t loopEndLabel = labelCounter++;
 
-        // Emit the initialization
-        if (initialization)
-        {
-            initialization->emitCode(f);
-        }
+    if (initialization)
+        initialization->emitCode(f); // int i = 0
 
-        f << std::endl << ".loop_start_" << loopStartLabel << ":" << std::endl;
+    f << std::endl << ".loop_start_" << loopStartLabel << ":" << std::endl;
+    if (condition)
+    {
+        condition->emitCode(f); // i < 3
+        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
+        std::string instruction = "    je .loop_end_" + std::to_string(loopEndLabel);
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end if condition is false" << std::endl;
+    }
 
-        // Emit the condition
-        if (condition)
-        {
-            condition->emitCode(f); // Evaluate the condition
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
-            std::string instruction = "    je .loop_end_" + std::to_string(loopEndLabel);
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end if condition is false" << std::endl;
-        }
+    for (const auto& stmt : body)
+        stmt->emitCode(f); // y = y + arr[i]
 
-        // Emit the loop body
-        for (const auto& stmt : body)
-        {
-            stmt->emitCode(f);
-        }
+    if (iteration)
+        iteration->emitCode(f); // i++
 
-        // Emit the iteration
-        if (iteration)
-        {
-            iteration->emitCode(f);
-        }
-
-        std::string instruction = "    jmp .loop_start_" + std::to_string(loopStartLabel);
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump back to start of loop" << std::endl;
-        f << std::endl << ".loop_end_" << loopEndLabel << ":" << std::endl;
+    std::string instruction = "    jmp .loop_start_" + std::to_string(loopStartLabel);
+    f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump back to start of loop" << std::endl;
+    f << std::endl << ".loop_end_" << loopEndLabel << ":" << std::endl;
     }
 };
 
@@ -1170,16 +1395,15 @@ struct NumberNode : ASTNode
 
     NumberNode(int value) : value(value) {}
 
-    void emitData(std::ofstream& f) const override
-    {
-        // No data to emit for numbers
-    }
-
+    void emitData(std::ofstream& f) const override {}
     void emitCode(std::ofstream& f) const override
     {
         std::string instruction = "    mov eax, " + std::to_string(value);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load constant " << value << " into eax" << std::endl;
     }
+
+    bool isConstant() const override { return true; }
+    int getConstantValue() const override { return value; }
 };
 
 
@@ -1283,7 +1507,7 @@ class Parser
 
         else
 	    {
-            throw std::runtime_error("Unexpected token " + currentToken.value);
+            throw std::runtime_error("Unexpected token " + currentToken.value + " " + std::to_string(type));
         }
     }
 
@@ -1349,6 +1573,19 @@ class Parser
             std::string identifier = token.value;
             eat(TOKEN_IDENTIFIER);
 
+            std::vector<std::unique_ptr<ASTNode>> indices;
+            while(currentToken.type == TOKEN_LBRACKET)
+            {
+                eat(TOKEN_LBRACKET);
+                indices.push_back(expression(currentFunction));
+                eat(TOKEN_RBRACKET);
+            }
+
+            if (!indices.empty())
+            {
+                return std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction);
+            }
+
             if (currentToken.type == TOKEN_INCREMENT || currentToken.type == TOKEN_DECREMENT)
             {
                 Token opToken = currentToken;
@@ -1406,7 +1643,6 @@ class Parser
             }
 
             node = std::make_unique<BinaryOpNode>(token.value, std::move(node), factor(currentFunction)); // Pass the current function context
-            //                                                                  term()
         }
         return node;
     }
@@ -1479,28 +1715,70 @@ class Parser
 
         if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID)
 	    {
-            // Handle variable declarations
             TokenType type = token.type;
-            eat(type);  // Consume the token type
+            eat(type);
             int pointerLevel = 0;
-            while (currentToken.type == TOKEN_MULTIPLY) // Count pointer levels
+
+            // Check for pointer or array declaration
+            while (currentToken.type == TOKEN_MULTIPLY)
             {
                 eat(TOKEN_MULTIPLY);
                 pointerLevel++;
             }
+
+            if (currentToken.type != TOKEN_IDENTIFIER)
+            {
+                throw std::runtime_error("Expected identifier after type specification");
+            }
+
             std::string identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
 
-            // Check for an initializer
-            std::unique_ptr<ASTNode> initializer = nullptr;
-            if (currentToken.type == TOKEN_ASSIGN)
+            // Handle array dimensions (e.g., int array[5])
+            std::vector<size_t> dimensions;
+            while (currentToken.type == TOKEN_LBRACKET)
             {
-                eat(TOKEN_ASSIGN);
-                initializer = expression(currentFunction); // Parse the initializer expression
+                eat(TOKEN_LBRACKET);
+                if (currentToken.type != TOKEN_NUMBER)
+                {
+                    throw std::runtime_error("Expected array size after [");
+                }
+                dimensions.push_back(std::stoul(currentToken.value));
+                eat(TOKEN_NUMBER);
+                eat(TOKEN_RBRACKET);
             }
-            eat(TOKEN_SEMICOLON);
 
-            return std::make_unique<DeclarationNode>(identifier, std::move(initializer), type, pointerLevel);
+            if (!dimensions.empty())
+            {
+                // Array declaration
+                std::vector<std::unique_ptr<ASTNode>> initializer;
+                if (currentToken.type == TOKEN_ASSIGN)
+                {
+                    eat(TOKEN_ASSIGN);
+                    eat(TOKEN_LBRACE);
+                    while (currentToken.type != TOKEN_RBRACE)
+                    {
+                        initializer.push_back(expression(currentFunction));
+                        if (currentToken.type == TOKEN_COMMA)
+                            eat(TOKEN_COMMA);
+                    }
+                    eat(TOKEN_RBRACE);
+                }
+                eat(TOKEN_SEMICOLON);
+                return std::make_unique<ArrayDeclarationNode>(identifier, type, std::move(dimensions), std::move(initializer));
+            }
+            else
+            {
+                // Pointer or variable declaration
+                std::unique_ptr<ASTNode> initializer = nullptr;
+                if (currentToken.type == TOKEN_ASSIGN)
+                {
+                    eat(TOKEN_ASSIGN);
+                    initializer = expression(currentFunction);
+                }
+                eat(TOKEN_SEMICOLON);
+                return std::make_unique<DeclarationNode>(identifier, std::move(initializer), type, pointerLevel);
+            }
         }
 
         else if (token.type == TOKEN_MULTIPLY) // Dereference assignment (e.g., *ptr = ...)
@@ -1535,8 +1813,34 @@ class Parser
             std::string identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
 
+            // Check for array indexing
+            std::vector<std::unique_ptr<ASTNode>> indices;
+            while (currentToken.type == TOKEN_LBRACKET)
+            {
+                eat(TOKEN_LBRACKET);
+                indices.push_back(expression(currentFunction));
+                eat(TOKEN_RBRACKET);
+            }
+
+            if (!indices.empty())
+            {
+                if (currentToken.type == TOKEN_ASSIGN)
+                {
+                    eat(TOKEN_ASSIGN);
+                    auto expr = expression(currentFunction);
+                    eat(TOKEN_SEMICOLON);
+                    return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::move(indices));
+                }
+
+                else
+                {
+                    eat(TOKEN_SEMICOLON); // Standalone array access (e.g., arr[0];)
+                    return std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction);
+                }
+            }
+
             // Check if this is a function call
-            if (currentToken.type == TOKEN_LPAREN)
+            else if (currentToken.type == TOKEN_LPAREN)
             {
                 // Parse the function call
                 auto funcCall = functionCall(identifier);
@@ -2201,20 +2505,17 @@ int main(int argc, char** argv)
     std::string asmFileName = argv[2];
     asmFileName += ".asm";
     std::ofstream file(asmFileName);
+    if (!file.is_open())
+    {
+        std::cerr << "Error creating output assembly file!" << std::endl;
+        return -1;
+    }
     generateCode(ast, file);
     file.close();
-
-    std::string assembleCommand = "nasm -f elf32 ";
-    assembleCommand += asmFileName;
-    system(assembleCommand.data());
-
-    std::string oFileName = argv[2];
-    oFileName += ".o";
-    std::string exeFileCreation = "ld -m elf_i386 ";
-    exeFileCreation += oFileName;
-    exeFileCreation += " -o ";
-    exeFileCreation += argv[2];
-    system(exeFileCreation.data());
+    
+    // The Makefile will handle assembling and linking
+    std::cout << "Assembly file generated: " << asmFileName << std::endl;
+    std::cout << "Use 'make' to assemble and link the output." << std::endl;
 
     return 0;
 }

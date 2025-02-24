@@ -1,10 +1,9 @@
 int main() {
-    int x = 5;
-    int* px = &x;
-    int** pptr = &px;
-    int*** ppptr = &pptr;
-    int**** pppptr = &ppptr;
-    int***** ppppptr = &pppptr;
-    *****ppppptr = 10;
-    return x;
+    int arr[3] = {10, 20, 30};
+    int y = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        y = y + arr[i];
+    }
+    return y;
 }
