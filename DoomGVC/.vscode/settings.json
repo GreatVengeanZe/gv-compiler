@@ -50,7 +50,9 @@
         "map": "cpp",
         "numbers": "cpp",
         "iomanip": "cpp",
-        "ctime": "cpp"
+        "ctime": "cpp",
+        "bitset": "cpp",
+        "regex": "cpp"
     },
     "C_Cpp.default.cppStandard": "c++17"
 }

@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
@@ -10,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <stack>
+#include <regex>
 #include <set>
 #include <map>
 
@@ -297,7 +299,6 @@ public:
 	    {
             return { TOKEN_EOF, "" };
         }
-        std::cout << ch << std::endl;
         throw std::runtime_error("Unexpected character");
     }
 };
@@ -2226,199 +2227,89 @@ public:
 class Preprocessor
 {
 private:
-    std::map<std::string, std::string> macros;  // Map to store macros
-    std::vector<std::string> includedFiles;      // Track included files to avoid circular includes
 
-    // Helper function to trim whitespaces from a string
-    std::string trim(const std::string& str)
+    std::string readFile(const std::string& fileName)
     {
-        size_t first = str.find_first_not_of(" \t");
-        if (first == std::string::npos) return "";
-        size_t last = str.find_last_not_of(" \t");
-        return str.substr(first, last - first + 1);
-    }
-
-    // Helper function to split a string into tokens
-    std::vector<std::string> split(const std::string& str)
-    {
-        std::vector<std::string> tokens;
-        std::stringstream ss(str);
-        std::string token;
-        while (ss >> token)
-        {
-            tokens.push_back(token);
+        std::ifstream file(fileName);
+        if (!file.is_open()) {
+            throw std::runtime_error("Can't open file: " + fileName);
         }
-        return tokens;
+
+        std::ostringstream content;
+        content << file.rdbuf();
+        return content.str();
     }
 
-    // Replace all the occurences of macros in a string
-    std::string replaceMacros(const std::string& line)
+    void parseDefine(const std::string& line, std::unordered_map<std::string, std::string>& defines)
     {
-        std::string result = line;
-        for (const auto& [macro, value] : macros)
+        std::regex defineRegex("#define\\s+(\\w+)\\s+(.+)");
+        std::smatch match;
+
+        if (std::regex_match(line, match, defineRegex))
         {
-            size_t pos = result.find(macro);
-            while (pos != std::string::npos)
-            {
-                // Replace the macro with its value
-                result.replace(pos, macro.length(), value);
-                pos = result.find(macro, pos + value.length());
-            }
+            std::string name = match[1].str();
+            std::string value = match[2].str();
+            defines[name] = value;
+        }
+    }
+
+    std::string replaceDefines(const std::string& text, const std::unordered_map<std::string, std::string>& defines)
+    {
+        std::string result = text;
+        for (const auto& define : defines)
+        {
+            std::regex defineRegex("\\b" + define.first + "\\b");
+            result = std::regex_replace(result, defineRegex, define.second);
         }
         return result;
     }
 
-    // Process a single line of input
-    std::string processLine(const std::string& line)
+public:
+    std::string processCode(const std::string& code, std::unordered_map<std::string, std::string>& defines)
     {
-        std::string trimmedLine = trim(line);
-        if (trimmedLine.empty() || trimmedLine[0] != '#')
-        {
-            // Not a preprocessor directive, return as-is
-            return line;
-        }
+        std::istringstream stream(code);
+        std::ostringstream processedCode;
+        std::string line;
 
-        // Remove the '#' and split into tokens
-        std::vector<std::string> tokens = split(trimmedLine.substr(1));
-        if (tokens.empty()) return line;
-
-        std::string directive = tokens[0];
-        if (directive == "include")
+        while (std::getline(stream, line))
         {
-            // Handle #include directive
-            if (tokens.size() < 2)
+            if (line.find("#define") == 0)
+                parseDefine(line, defines);
+
+            else if (line.find("#include") == 0)
             {
-                throw std::runtime_error("Error: Missing filename in #include directive");
-            }
-            std::string filename = tokens[1];
-            if (filename.front() == '<' && filename.back() == '>')
-            {
-                filename = filename.substr(1, filename.size() - 2); // Remove < and >
+                std::regex includeRegex("#include\\s+\"(.+?)\"");
+                std::smatch match;
+
+                if (std::regex_match(line, match, includeRegex))
+                {
+                    std::string fileName = match[1].str();
+                    std::string includedContent = readFile(fileName);
+                    processedCode << processCode(includedContent, defines) << '\n';
+                }
+                else
+                    throw std::runtime_error("Incorrect directory #include: " + line);
             }
             else
-            {
-                throw std::runtime_error("Error: Invalid filename format in #include directive");
-            }
-            
-            // Avoid circular includes
-            if (std::find(includedFiles.begin(), includedFiles.end(), filename) != includedFiles.end())
-            {
-                return "";
-            }
-
-            includedFiles.push_back(filename);
-
-            // Read the included file
-            std::ifstream file(filename);
-            if (!file.is_open())
-            {
-                throw std::runtime_error("Error: Could not open file " + filename);
-            }
-
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            return process(buffer.str());
+                processedCode << replaceDefines(line, defines) << '\n';
         }
 
-        else if (directive == "define")
-        {
-            // Handle #define directive
-            if (tokens.size() < 2)
-            {
-                throw std::runtime_error("Error: Missing macro name in #define directive");
-            }
 
-            std::string macroName = tokens[1];
-            std::string macroValue = (tokens.size() > 2) ? tokens[2] : ""; // Optional value
-
-            macros[macroName] = macroValue;
-            return ""; // Remove the #define line from the output
-        }
-
-        else if (directive == "ifdef")
-        {
-            // Handle #define directive
-            if (tokens.size() < 2)
-            {
-                throw std::runtime_error("Error: Missing macro name in #ifdef directive");
-            }
-
-            std::string macroName = tokens[1];
-            if (macros.find(macroName) == macros.end())
-            {
-                // Macro is not defined, skip until #denif
-                return skipUntilEndif();
-            }
-            return ""; // Remove the #ifdef line from the output
-        }
-
-        else if (directive == "endif")
-        {
-            // Handle #endif directive
-            return ""; // Remove the #endif from the output
-        }
-
-        else
-        {
-            throw std::runtime_error("Error: Unknown preprocessor directive #" + directive);
-        }
-    }
-
-    // Skip lines until #endif is found
-    std::string skipUntilEndif()
-    {
-        std::string line;
-        while (std::getline(input, line))
-        {
-            std::string trimmedLine = trim(line);
-            if (trimmedLine.empty()) continue;
-
-            if (trimmedLine[0] == '#')
-            {
-                std::vector<std::string> tokens = split(trimmedLine.substr(1));
-                if (!tokens.empty() && tokens[0] == "endif")
-                {
-                    return ""; // top skipping at #endif
-                }
-            }
-        }
-        return "";
-    }
-
-public:
-    std::stringstream input; // Input source code
-
-    // Process the entire input
-    std::string process(const std::string& source)
-    {
-        std::stringstream sourceCode(source);
-        input << sourceCode.rdbuf(); // Load the source code into the input stream
-        std::stringstream output;
-        std::string line;
-
-        // First pass: Process preprocessor directives
-        while (std::getline(input, line))
-        {
-            std::string processedLine = processLine(line);
-            if (!processedLine.empty())
-            {
-                output << processedLine << std::endl;
-            }
-        }
-
-        // Second pass: Replace macros in the preprocessed source
-        std::string preprocessedSource = output.str();
-        std::stringstream finalOutput;
-        std::stringstream preprocessedStream(preprocessedSource);
-
-        while (std::getline(preprocessedStream, line))
-        {
-            finalOutput << replaceMacros(line) << std::endl;
-        }
-
-        return finalOutput.str();
+        return processedCode.str();
     }
 };
+
+
+std::string cleanString(const std::string& input)
+{
+    std::string cleaned;
+    for (char ch : input) {
+        if (ch != '\0') {
+            cleaned += ch;
+        }
+    }
+    return cleaned;
+}
 
 
 /**********************************************************************************
@@ -2496,9 +2387,17 @@ int main(int argc, char** argv)
 
     // Run the preprocessor
     Preprocessor preprocessor;
-    std::string processedSource = preprocessor.process(source);
+    // std::string processedSource = preprocessor.process(source);
+    // std::cout << processedSource << std::endl;
 
-    Lexer lexer(processedSource); // Pass the preprocessed source to the lexer
+    std::unordered_map<std::string, std::string> defines;
+
+    source = preprocessor.processCode(source, defines);
+    source = cleanString(source);
+
+    std::cout << source << std::endl;
+
+    Lexer lexer(source); // Pass the preprocessed source to the lexer
     Parser parser(lexer);
     auto ast = parser.parse();
 

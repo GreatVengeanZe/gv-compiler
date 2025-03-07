@@ -1,9 +1,10 @@
+#include "libtest.h"
+
 int main() {
-    int arr[3] = {10, 20, 30};
     int y = 0;
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i <= sum(VALUE, 1); i++)
     {
-        y = y + arr[i];
+        y = y + i;
     }
     return y;
 }
