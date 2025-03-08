@@ -687,7 +687,8 @@ struct ArrayDeclarationNode : ASTNode
         size_t baseIndex = scopes.top().size() + 1; // Starting index
         scopes.top()[identifier] = {uniqueName, baseIndex};
 
-        f << std::left << std::setw(COMMENT_COLUMN) << "    sub esp, " << totalSize << "; Allocate space for array " << uniqueName
+        std::string instruction = "    sub esp, " + std::to_string(totalSize);
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Allocate space for array " << uniqueName
           << " (" << totalElements << " elements)" << std::endl;
 
         if (!initializer.empty())
@@ -698,7 +699,7 @@ struct ArrayDeclarationNode : ASTNode
             for (size_t i = 0; i < initializer.size(); ++i)
             {
                 initializer[i]->emitCode(f);
-                std::string instruction = "    mov [ebp - " + std::to_string(baseIndex * 4 + i * 4) + "], eax";
+                instruction = "    mov [ebp - " + std::to_string(baseIndex * 4 + i * 4) + "], eax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Initialize " << uniqueName << "[" << i << "]" << std::endl;
             }
         }
@@ -787,12 +788,12 @@ struct ArrayAccessNode : ASTNode
             if (indices.size() > 1)
             {
                 f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop final index" << std::endl;
-                for (size_t i = 1; i < indices.size(); ++i)
-                {
+                for (size_t i = 1; i < indices.size(); ++i) {
                     f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop next index" << std::endl;
                     f << std::left << std::setw(COMMENT_COLUMN) << "    add eax, ecx" << "; Add to offset" << std::endl;
                 }
             }
+            
             else
             {
                 f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop single index" << std::endl;
@@ -1574,6 +1575,7 @@ class Parser
             std::string identifier = token.value;
             eat(TOKEN_IDENTIFIER);
 
+            // Handle array indexing
             std::vector<std::unique_ptr<ASTNode>> indices;
             while(currentToken.type == TOKEN_LBRACKET)
             {
@@ -1735,7 +1737,7 @@ class Parser
             std::string identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
 
-            // Handle array dimensions (e.g., int array[5])
+            // Handle array dimensions (e.g., int array[5][10])
             std::vector<size_t> dimensions;
             while (currentToken.type == TOKEN_LBRACKET)
             {
@@ -1756,14 +1758,7 @@ class Parser
                 if (currentToken.type == TOKEN_ASSIGN)
                 {
                     eat(TOKEN_ASSIGN);
-                    eat(TOKEN_LBRACE);
-                    while (currentToken.type != TOKEN_RBRACE)
-                    {
-                        initializer.push_back(expression(currentFunction));
-                        if (currentToken.type == TOKEN_COMMA)
-                            eat(TOKEN_COMMA);
-                    }
-                    eat(TOKEN_RBRACE);
+                    initializer = parseInitializerList(); // Parse the initializer list
                 }
                 eat(TOKEN_SEMICOLON);
                 return std::make_unique<ArrayDeclarationNode>(identifier, type, std::move(dimensions), std::move(initializer));
@@ -1844,12 +1839,7 @@ class Parser
             else if (currentToken.type == TOKEN_LPAREN)
             {
                 // Parse the function call
-                auto funcCall = functionCall(identifier);
-                
-                // Consume the semicolumn
-                eat(TOKEN_SEMICOLON);
-            
-                return funcCall;
+                return functionCall(identifier);
             }
     
             // Check if this is an assignment (e.g., x = ...)
@@ -2047,6 +2037,30 @@ class Parser
         }
 
         throw std::runtime_error("Unexpected token in statement " + token.value);
+    }
+
+
+    std::vector<std::unique_ptr<ASTNode>> parseInitializerList() {
+        std::vector<std::unique_ptr<ASTNode>> initializer;
+        eat(TOKEN_LBRACE); // Consume the opening '{'
+    
+        while (currentToken.type != TOKEN_RBRACE) {
+            if (currentToken.type == TOKEN_LBRACE) {
+                // Nested initializer list (e.g., {{1, 2}, {3, 4}})
+                auto nestedList = parseInitializerList();
+                initializer.insert(initializer.end(), std::make_move_iterator(nestedList.begin()), std::make_move_iterator(nestedList.end()));
+            } else {
+                // Single value (e.g., 1, 2, 3, 4)
+                initializer.push_back(expression());
+            }
+    
+            if (currentToken.type == TOKEN_COMMA) {
+                eat(TOKEN_COMMA); // Consume the comma
+            }
+        }
+    
+        eat(TOKEN_RBRACE); // Consume the closing '}'
+        return initializer;
     }
 
 
@@ -2264,6 +2278,15 @@ private:
         return result;
     }
 
+    std::string cleanString(const std::string& input)
+    {
+        std::string cleaned;
+        for (char ch : input)
+            if (ch != '\0')
+                cleaned += ch;
+        return cleaned;
+    }
+
 public:
     std::string processCode(const std::string& code, std::unordered_map<std::string, std::string>& defines)
     {
@@ -2294,22 +2317,9 @@ public:
                 processedCode << replaceDefines(line, defines) << '\n';
         }
 
-
-        return processedCode.str();
+        return cleanString(processedCode.str());
     }
 };
-
-
-std::string cleanString(const std::string& input)
-{
-    std::string cleaned;
-    for (char ch : input) {
-        if (ch != '\0') {
-            cleaned += ch;
-        }
-    }
-    return cleaned;
-}
 
 
 /**********************************************************************************
@@ -2387,13 +2397,8 @@ int main(int argc, char** argv)
 
     // Run the preprocessor
     Preprocessor preprocessor;
-    // std::string processedSource = preprocessor.process(source);
-    // std::cout << processedSource << std::endl;
-
     std::unordered_map<std::string, std::string> defines;
-
     source = preprocessor.processCode(source, defines);
-    source = cleanString(source);
 
     std::cout << source << std::endl;
 
