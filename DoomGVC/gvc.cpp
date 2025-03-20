@@ -41,7 +41,7 @@ std::string generateUniqueName(const std::string& name)
 
 enum TokenType
 {
-    TOKEN_INT, TOKEN_CHAR, TOKEN_VOID, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_CHAR_LITERAL, TOKEN_SEMICOLON,
+    TOKEN_INT, TOKEN_CHAR, TOKEN_VOID, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_CHAR_LITERAL, TOKEN_STRING_LITERAL, TOKEN_SEMICOLON,
     TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE, TOKEN_ADDRESS_OF,
     TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE, TOKEN_LBRACKET, TOKEN_RBRACKET,
     TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
@@ -114,6 +114,22 @@ public:
     {
         skipWhitespace();
         char ch = peek();
+
+        if (ch == '"')
+        {
+            advance();
+            std::string str;
+            while (peek() != '"' && peek() != '\0')
+            {
+                str += advance();
+            }
+            if (peek() != '"')
+            {
+                throw std::runtime_error("Expected closing quote for string literal");
+            }
+            advance();
+            return { TOKEN_STRING_LITERAL, str };
+        }
 
         if (ch == '\'')                 // Handle char literals
         {
@@ -419,7 +435,10 @@ struct FunctionCallNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        // No data to emit for function calls
+        for (const auto& arg : arguments)
+        {
+            arg->emitData(f); // Emit data for string literal
+        }
     }
 
     void emitCode(std::ofstream& f) const override
@@ -468,7 +487,10 @@ struct FunctionNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        // Functions don't declare variables in the .data section
+        for (const auto& stmt : body)
+        {
+            stmt->emitData(f);
+        }
     }
 
     void emitCode(std::ofstream& f) const override
@@ -1428,6 +1450,235 @@ struct CharLiteralNode : ASTNode
 };
 
 
+struct StringLiteralNode : ASTNode
+{
+    std::string value;
+    std::string label;
+
+    StringLiteralNode(const std::string& v)
+        : value(v), label("str_" + std::to_string(labelCounter++)) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        f << "    " << label << " db '" << value << "', 0" << std::endl;
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        std::string instruction = "    mov eax, " + label;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load address of string '" << value << "' into eax" << std::endl; 
+    }
+};
+
+
+struct PrintNode : ASTNode
+{
+    std::unique_ptr<StringLiteralNode> formatString; // The format string (e.g., "x = %d, s = %s")
+    std::vector<std::unique_ptr<ASTNode>> arguments; // Arguments for the placeholders
+    std::vector<std::pair<std::string, std::string>> literalLabels; // Label and string pairs for literals
+    std::vector<std::string> intBufferLabels; // Labels for integer buffers
+    std::vector<std::string> charBufferLabels; // Labels for character buffers
+
+    PrintNode(std::unique_ptr<StringLiteralNode> fmt, std::vector<std::unique_ptr<ASTNode>> args)
+        : formatString(std::move(fmt)), arguments(std::move(args))
+    {
+        std::string format = formatString->value;
+        size_t pos = 0;
+        size_t argIndex = 0;
+
+        while (pos < format.length())
+        {
+            if (format[pos] == '%' && pos + 1 < format.length())
+            {
+                char specifier = format[pos + 1];
+                pos += 2;
+                if (argIndex >= arguments.size())
+                {
+                    throw std::runtime_error("Not enough arguments for format string");
+                }
+                switch (specifier)
+                {
+                    case 'd':
+                        intBufferLabels.push_back("print_int_buf_" + std::to_string(labelCounter++));
+                        argIndex++;
+                        break;
+                    case 's':
+                        argIndex++;
+                        break;
+                    case 'c':
+                        charBufferLabels.push_back("print_char_buf_" + std::to_string(labelCounter++));
+                        argIndex++;
+                        break;
+                    default:
+                        throw std::runtime_error("Unsupported format specifier: %" + std::string(1, specifier));
+                }
+            }
+            else
+            {
+                size_t start = pos;
+                while (pos < format.length() && format[pos] != '%')
+                {
+                    pos++;
+                }
+                if (pos > start)
+                {
+                    std::string literal = format.substr(start, pos - start);
+                    std::string label = "print_lit_" + std::to_string(labelCounter++);
+                    literalLabels.emplace_back(label, literal);
+                }
+            }
+        }
+
+        if (argIndex < arguments.size())
+        {
+            throw std::runtime_error("Too many arguments for format string");
+        }
+    }
+
+    void emitData(std::ofstream& f) const override
+    {
+        formatString->emitData(f);
+        for (const auto& arg : arguments)
+        {
+            arg->emitData(f);
+        }
+        for (const auto& [label, literal] : literalLabels)
+        {
+            f << "    " << label << " db '" << literal << "', 0" << std::endl;
+        }
+        for (const auto& label : intBufferLabels)
+        {
+            f << "    " << label << " times 12 db 0" << std::endl;
+        }
+        for (const auto& label : charBufferLabels)
+        {
+            f << "    " << label << " db 0" << std::endl;
+        }
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        std::string format = formatString->value;
+        size_t pos = 0;
+        size_t argIndex = 0;
+        size_t litIndex = 0;
+        size_t intBufIndex = 0;
+        size_t charBufIndex = 0;
+
+        while (pos < format.length())
+        {
+            if (format[pos] == '%' && pos + 1 < format.length())
+            {
+                char specifier = format[pos + 1];
+                pos += 2;
+                switch (specifier)
+                {
+                    case 'd':
+                        emitInteger(f, argIndex, intBufferLabels[intBufIndex++]);
+                        argIndex++;
+                        break;
+                    case 's':
+                        emitString(f, argIndex);
+                        argIndex++;
+                        break;
+                    case 'c':
+                        emitCharacter(f, argIndex, charBufferLabels[charBufIndex++]);
+                        argIndex++;
+                        break;
+                }
+            }
+            else
+            {
+                size_t start = pos;
+                while (pos < format.length() && format[pos] != '%')
+                {
+                    pos++;
+                }
+                if (pos > start)
+                {
+                    emitLiteralString(f, literalLabels[litIndex].first, literalLabels[litIndex].second);
+                    litIndex++;
+                }
+            }
+        }
+    }
+
+private:
+    void emitLiteralString(std::ofstream& f, const std::string& label, const std::string& literal) const
+    {
+        std::string instruction = "    mov ecx, " + label;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Address of literal string" << std::endl;
+        instruction = "    mov edx, " + std::to_string(literal.length());
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Length of literal string" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, 4" << "; sys_write" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov ebx, 1" << "; stdout" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    int 0x80" << "; Invoke syscall" << std::endl;
+    }
+
+    void emitInteger(std::ofstream& f, size_t argIndex, const std::string& bufferLabel) const
+    {
+        arguments[argIndex]->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Save the integer" << std::endl;
+        std::string instruction = "    mov esi, " + bufferLabel;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Buffer address" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    add esi, 11" << "; Point to end of buffer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov byte [esi], 0" << "; Null terminator" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Restore integer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov ebx, 10" << "; Divisor" << std::endl;
+
+        std::string loopLabel = "int_to_str_" + std::to_string(labelCounter++);
+        std::string endLabel = "int_to_str_end_" + std::to_string(labelCounter++);
+        f << loopLabel << ":" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    xor edx, edx" << "; Clear edx" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    div ebx" << "; Divide eax by 10" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    add dl, '0'" << "; Convert remainder to ASCII" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    dec esi" << "; Move buffer pointer left" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov [esi], dl" << "; Store digit" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    test eax, eax" << "; Check if quotient is 0" << std::endl;
+        instruction = "    jnz " + loopLabel;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Loop if not zero" << std::endl;
+        f << endLabel << ":" << std::endl;
+
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov ecx, esi" << "; Start of string" << std::endl;
+        instruction = "    mov edx, " + bufferLabel;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    add edx, 11" << "; End of buffer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    sub edx, esi" << "; Calculate length" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, 4" << "; sys_write" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov ebx, 1" << "; stdout" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    int 0x80" << "; Invoke syscall" << std::endl;
+    }
+
+    void emitString(std::ofstream& f, size_t argIndex) const
+    {
+        arguments[argIndex]->emitCode(f); // Load string address into eax
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov ecx, eax" << "; Address of the string" << std::endl;
+
+        // Since parser ensures this is a StringLiteralNode, we can safely access its members
+        const StringLiteralNode* strNode = static_cast<const StringLiteralNode*>(arguments[argIndex].get());
+        std::string instruction = "    mov edx, " + std::to_string(strNode->value.length());
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Length of the string" << std::endl;
+
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, 4" << "; sys_write" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov ebx, 1" << "; stdout" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    int 0x80" << "; Invoke syscall" << std::endl;
+    }
+
+    void emitCharacter(std::ofstream& f, size_t argIndex, const std::string& bufferLabel) const
+    {
+        arguments[argIndex]->emitCode(f);
+        std::string instruction = "    mov [" + bufferLabel + "], al";
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store character" << std::endl;
+        instruction = "    mov ecx, " + bufferLabel;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Address of character" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov edx, 1" << "; Length of 1" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, 4" << "; sys_write" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov ebx, 1" << "; stdout" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    int 0x80" << "; Invoke syscall" << std::endl;
+    }
+};
+
+
 /*****************************************************************************************
  *      _____  _____   ______  _   _  _______  _____  ______  _____  ______  _____       *
  *     |_   _||  __ \ |  ____|| \ | ||__   __||_   _||  ____||_   _||  ____||  __ \      *
@@ -1567,6 +1818,12 @@ class Parser
         {
             eat(TOKEN_CHAR_LITERAL);
             return std::make_unique<CharLiteralNode>(token.value.data()[0]);
+        }
+
+        else if (token.type == TOKEN_STRING_LITERAL)
+        {
+            eat(TOKEN_STRING_LITERAL);
+            return std::make_unique<StringLiteralNode>(token.value);
         }
 
         else if (token.type == TOKEN_IDENTIFIER)
@@ -1775,6 +2032,61 @@ class Parser
                 eat(TOKEN_SEMICOLON);
                 return std::make_unique<DeclarationNode>(identifier, std::move(initializer), type, pointerLevel);
             }
+        }
+
+        else if (token.type == TOKEN_IDENTIFIER && token.value == "print")
+        {
+            eat(TOKEN_IDENTIFIER);
+            eat(TOKEN_LPAREN);
+
+            if (currentToken.type != TOKEN_STRING_LITERAL)
+            {
+                throw std::runtime_error("print statement requires a format string as the first argument");
+            }
+
+            std::string formatString = currentToken.value;
+            eat(TOKEN_STRING_LITERAL); // Consume the string literal
+            
+            std::vector<std::unique_ptr<ASTNode>> arguments;
+            size_t specifierCount = std::count(formatString.begin(), formatString.end(), '%');
+            size_t argIndex = 0;
+    
+            while (currentToken.type == TOKEN_COMMA)
+            {
+                eat(TOKEN_COMMA);
+    
+                // Check format specifiers against argument types
+                size_t pos = 0;
+                while (pos < formatString.length() && argIndex >= arguments.size())
+                {
+                    if (formatString[pos] == '%' && pos + 1 < formatString.length())
+                    {
+                        char specifier = formatString[pos + 1];
+                        if (specifier == 's' && currentToken.type != TOKEN_STRING_LITERAL)
+                        {
+                            throw std::runtime_error("Format specifier %s requires a string literal");
+                        }
+                        break;
+                    }
+                    pos++;
+                }
+    
+                if (currentToken.type == TOKEN_STRING_LITERAL)
+                {
+                    arguments.push_back(std::make_unique<StringLiteralNode>(currentToken.value));
+                    eat(TOKEN_STRING_LITERAL);
+                }
+                else
+                {
+                    arguments.push_back(expression(currentFunction)); // For %d, %c, etc.
+                }
+                argIndex++;
+            }
+    
+            eat(TOKEN_RPAREN);
+            eat(TOKEN_SEMICOLON); // Require semicolon after print
+    
+            return std::make_unique<PrintNode>(std::make_unique<StringLiteralNode>(formatString), std::move(arguments));
         }
 
         else if (token.type == TOKEN_MULTIPLY) // Dereference assignment (e.g., *ptr = ...)
@@ -2162,7 +2474,6 @@ class Parser
             }
         }
         eat(TOKEN_RPAREN);
-
         return std::make_unique<FunctionCallNode>(functionName, std::move(arguments));
     }
 
