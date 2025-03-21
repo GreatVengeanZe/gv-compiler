@@ -613,7 +613,7 @@ struct DeclarationNode : ASTNode
         size_t index = scopes.top().size() + 1; // Next free slot
         scopes.top()[identifier] = {uniqueName, index};
 
-        f << std::left << std::setw(COMMENT_COLUMN) << "    sub esp, 4" << "; Allocate space for " << uniqueName << std::endl;
+        // f << std::left << std::setw(COMMENT_COLUMN) << "    sub esp, 4" << "; Allocate space for " << uniqueName << std::endl;
 
         if (initializer)
         {
@@ -1164,9 +1164,9 @@ struct ForLoopNode : ASTNode
     std::vector<std::unique_ptr<ASTNode>> body;
 
     ForLoopNode(std::unique_ptr<ASTNode> init, std::unique_ptr<ASTNode> cond,
-                std::unique_ptr<ASTNode> iter, std::vector<std::unique_ptr<ASTNode>> body)
+                std::unique_ptr<ASTNode> iter, std::vector<std::unique_ptr<ASTNode>> b)
         : initialization(std::move(init)), condition(std::move(cond)),
-        iteration(std::move(iter)), body(std::move(body)) {}
+        iteration(std::move(iter)), body(std::move(b)) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1183,29 +1183,37 @@ struct ForLoopNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         size_t loopStartLabel = labelCounter++;
-    size_t loopEndLabel = labelCounter++;
+        size_t loopEndLabel = labelCounter++;
 
-    if (initialization)
-        initialization->emitCode(f); // int i = 0
+        // Fully qualified label names
+        std::string fullStartLabel = "main.loop_start_" + std::to_string(loopStartLabel);
+        std::string fullEndLabel = "main.loop_end_" + std::to_string(loopEndLabel);
 
-    f << std::endl << ".loop_start_" << loopStartLabel << ":" << std::endl;
-    if (condition)
-    {
-        condition->emitCode(f); // i < 3
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
-        std::string instruction = "    je .loop_end_" + std::to_string(loopEndLabel);
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end if condition is false" << std::endl;
-    }
+        if (initialization)
+        {
+            initialization->emitCode(f); // e.g., int i = 0
+        }
 
-    for (const auto& stmt : body)
-        stmt->emitCode(f); // y = y + arr[i]
+        f << std::endl << fullStartLabel << ":" << std::endl;
+        if (condition)
+        {
+            condition->emitCode(f); // e.g., i < 5
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    je " << fullEndLabel << "; Jump to end if condition is false" << std::endl;
+        }
 
-    if (iteration)
-        iteration->emitCode(f); // i++
+        for (const auto& stmt : body)
+        {
+            stmt->emitCode(f); // e.g., print("%d, ", i)
+        }
 
-    std::string instruction = "    jmp .loop_start_" + std::to_string(loopStartLabel);
-    f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump back to start of loop" << std::endl;
-    f << std::endl << ".loop_end_" << loopEndLabel << ":" << std::endl;
+        if (iteration)
+        {
+            iteration->emitCode(f); // e.g., i++
+        }
+
+        f << std::left << std::setw(COMMENT_COLUMN) << "    jmp " << fullStartLabel << "; Jump back to start of loop" << std::endl;
+        f << std::endl << fullEndLabel << ":" << std::endl;
     }
 };
 
@@ -1870,7 +1878,7 @@ class Parser
             eat(TOKEN_RPAREN);
             return node;
         }
-        throw std::runtime_error("Unexpected token in factor");
+        throw std::runtime_error("Unexpected token in factor " + token.value + " " + lexer.peekToken().value + " " + lexer.peekToken().value);
     }
 
 
@@ -2348,7 +2356,7 @@ class Parser
             return std::make_unique<ReturnNode>(std::move(expr), currentFunction);
         }
 
-        throw std::runtime_error("Unexpected token in statement " + token.value);
+        throw std::runtime_error("Unexpected token in statement " + token.value + " " + lexer.peekToken().value);
     }
 
 

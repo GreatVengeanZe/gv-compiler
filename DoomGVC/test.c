@@ -1,7 +1,8 @@
 int main()
 {
-    int x = 42;
-    char c = 'A';
-    print("x = %d, c = %c, hello = %s", x, c, "world");
+    for (int i = 0; i < 5; i++)
+    {
+        print("%d ", i);
+    }
     return 0;
 }
