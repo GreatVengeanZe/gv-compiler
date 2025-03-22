@@ -1505,19 +1505,7 @@ struct StringLiteralNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        f << "    " << label << " db ";
-        bool first = true;
-        for (char c : value)
-        {
-            if (!first) f << ", ";
-            if (c == '\n') f << "0x0A";           // Newline
-            else if (c == '\t') f << "0x09";      // Tab
-            else if (c == '\r') f << "0x0D";      // Carriage return
-            else if (c < 32 || c > 126) f << std::to_string((unsigned char)c); // Other non-printable characters as bytes
-            else f << "'" << c << "'";            // Printable characters
-            first = false;
-        }
-        f << ", 0" << std::endl; // Null terminator
+        f << "    " << label << " db '" << value << "', 0" << std::endl;
     }
 
     void emitCode(std::ofstream& f) const override
@@ -1526,6 +1514,7 @@ struct StringLiteralNode : ASTNode
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load address of string '" << value << "' into eax" << std::endl; 
     }
 };
+
 
 
 struct PrintNode : ASTNode
@@ -1555,103 +1544,107 @@ struct PrintNode : ASTNode
                 }
                 switch (specifier)
                 {
-                    case 'd': intBufferLabels.push_back("print_int_buf_" + std::to_string(labelCounter++)); break;
-                    case 's': break;
-                    case 'c': charBufferLabels.push_back("print_char_buf_" + std::to_string(labelCounter++)); break;
-                    default: throw std::runtime_error("Unsupported format specifier: %" + std::string(1, specifier));
+                    case 'd':
+                        intBufferLabels.push_back("print_int_buf_" + std::to_string(labelCounter++));
+                        argIndex++;
+                        break;
+                    case 's':
+                        argIndex++;
+                        break;
+                    case 'c':
+                        charBufferLabels.push_back("print_char_buf_" + std::to_string(labelCounter++));
+                        argIndex++;
+                        break;
+                    default:
+                        throw std::runtime_error("Unsupported format specifier: %" + std::string(1, specifier));
                 }
-                // Emit the substring before the specifier as a literal
-                if (pos - 2 > 0)
-                {
-                    std::string literal = format.substr(0, pos - 2);
-                    std::string label = "print_lit_" + std::to_string(labelCounter++);
-                    literalLabels.emplace_back(label, literal);
-                    format = format.substr(pos); // Update format to remaining part
-                    pos = 0; // Reset position
-                }
-                else
-                {
-                    format = format.substr(pos); // Remove the specifier
-                    pos = 0; // Reset position
-                }
-                argIndex++;
             }
             else
             {
-                pos++;
+                size_t start = pos;
+                while (pos < format.length() && format[pos] != '%')
+                {
+                    pos++;
+                }
+                if (pos > start)
+                {
+                    std::string literal = format.substr(start, pos - start);
+                    std::string label = "print_lit_" + std::to_string(labelCounter++);
+                    literalLabels.emplace_back(label, literal);
+                }
             }
         }
-        // Any remaining string after last specifier
-        if (!format.empty())
+
+        if (argIndex < arguments.size())
         {
-            std::string label = "print_lit_" + std::to_string(labelCounter++);
-            literalLabels.emplace_back(label, format);
-        }
-        if (argIndex != arguments.size())
-        {
-            throw std::runtime_error("Argument count mismatch for format string");
+            throw std::runtime_error("Too many arguments for format string");
         }
     }
 
     void emitData(std::ofstream& f) const override
     {
-        for (const auto& arg : arguments) arg->emitData(f);
+        formatString->emitData(f);
+        for (const auto& arg : arguments)
+        {
+            arg->emitData(f);
+        }
         for (const auto& [label, literal] : literalLabels)
         {
-            f << "    " << label << " db ";
-            bool first = true;
-            for (char c : literal)
-            {
-                if (!first) f << ", ";
-                if (c == '\n') f << "0x0A";
-                else if (c == '\t') f << "0x09";
-                else if (c == '\r') f << "0x0D";
-                else if (c < 32 || c > 126) f << std::to_string((unsigned char)c);
-                else f << "'" << c << "'";
-                first = false;
-            }
-            f << ", 0" << std::endl;
+            f << "    " << label << " db '" << literal << "', 0" << std::endl;
         }
         for (const auto& label : intBufferLabels)
+        {
             f << "    " << label << " times 12 db 0" << std::endl;
+        }
         for (const auto& label : charBufferLabels)
+        {
             f << "    " << label << " db 0" << std::endl;
+        }
     }
 
     void emitCode(std::ofstream& f) const override
     {
+        std::string format = formatString->value;
+        size_t pos = 0;
         size_t argIndex = 0;
         size_t litIndex = 0;
         size_t intBufIndex = 0;
         size_t charBufIndex = 0;
 
-        for (const auto& [label, literal] : literalLabels)
+        while (pos < format.length())
         {
-            if (litIndex > 0) // After first literal, print an argument
+            if (format[pos] == '%' && pos + 1 < format.length())
             {
-                if (argIndex < arguments.size())
+                char specifier = format[pos + 1];
+                pos += 2;
+                switch (specifier)
                 {
-                    char specifier = formatString->value[formatString->value.find('%', literalLabels[litIndex-1].second.length()) + 1];
-                    switch (specifier)
-                    {
-                        case 'd': emitInteger(f, argIndex, intBufferLabels[intBufIndex++]); argIndex++; break;
-                        case 's': emitString(f, argIndex); argIndex++; break;
-                        case 'c': emitCharacter(f, argIndex, charBufferLabels[charBufIndex++]); argIndex++; break;
-                    }
+                    case 'd':
+                        emitInteger(f, argIndex, intBufferLabels[intBufIndex++]);
+                        argIndex++;
+                        break;
+                    case 's':
+                        emitString(f, argIndex);
+                        argIndex++;
+                        break;
+                    case 'c':
+                        emitCharacter(f, argIndex, charBufferLabels[charBufIndex++]);
+                        argIndex++;
+                        break;
                 }
             }
-            emitLiteralString(f, label, literal);
-            litIndex++;
-        }
-        // Print any remaining argument if the last part was a specifier
-        if (litIndex == literalLabels.size() && argIndex < arguments.size())
-        {
-            char specifier = formatString->value[formatString->value.find_last_of('%') + 1];
-            switch (specifier)
+            else
             {
-                case 'd': emitInteger(f, argIndex, intBufferLabels[intBufIndex++]); argIndex++; break;
-                case 's': emitString(f, argIndex); argIndex++; break;
-                case 'c': emitCharacter(f, argIndex, charBufferLabels[charBufIndex++]); argIndex++; break;
+                size_t start = pos;
+                while (pos < format.length() && format[pos] != '%')
+                {
+                    pos++;
+                }
+                if (pos > start)
+                {
+                    emitLiteralString(f, literalLabels[litIndex].first, literalLabels[litIndex].second);
+                    litIndex++;
+                }
             }
         }
     }
@@ -1730,8 +1723,6 @@ private:
         f << std::left << std::setw(COMMENT_COLUMN) << "    int 0x80" << "; Invoke syscall" << std::endl;
     }
 };
-
-
 
 
 /*****************************************************************************************
