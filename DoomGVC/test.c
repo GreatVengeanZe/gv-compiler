@@ -1,10 +1,10 @@
 void printFib(int n)
 {
-    if (n < 1)
-    {
+    if (n < 1) {
         print("Invalid Number of terms\n");
+        return;
     }
-  
+
     int prev1 = 1;
     int prev2 = 0;
 
@@ -29,7 +29,7 @@ void printFib(int n)
 }
 
 int main() {
-    int n = 10;
+    int n = 9;
     printFib(n);
     print("\n");
     return 0;

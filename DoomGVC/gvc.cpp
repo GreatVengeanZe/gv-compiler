@@ -518,8 +518,8 @@ struct FunctionNode : ASTNode
 
         // Emit function prologue
         f << std::endl << name << ":" << std::endl;
-        f << "    push ebp" << std::endl;
-        f << "    mov ebp, esp\n" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    push ebp" << "; Save base pointer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov ebp, esp" << "; Save stack pointer\n" << std::endl;
 
         // Allocate space for local variables
         size_t localVarCount = body.size();
@@ -545,10 +545,15 @@ struct FunctionNode : ASTNode
             stmt->emitCode(f);
         }
 
-        // Emit function epilogue
-        f << "\n    mov esp, ebp" << std::endl;
-        f << "    pop ebp" << std::endl;
-        f << "    ret" << std::endl;
+        // No epilogue here anymore; handled by ReturnNode
+        // If no return statement, we'll add an implicit one for void functions later
+        if (returnType == TOKEN_VOID)
+        {
+            f << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov esp, ebp " << "; Restore stack pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    pop ebp " << "; Restore base pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    ret " << "; Return to caller" << std::endl;
+        }
 
         // Pop the scope from the stack
         scopes.pop();
@@ -569,14 +574,18 @@ struct FunctionNode : ASTNode
 
 struct ReturnNode : ASTNode
 {
-    std::unique_ptr<ASTNode> expression;
+    std::unique_ptr<ASTNode> expression; // Can be nullptr for void returns
     const FunctionNode* currentFunction; // Track the current function context
 
-    ReturnNode(std::unique_ptr<ASTNode> expr, const FunctionNode* currentFunction) : expression(std::move(expr)), currentFunction(currentFunction) {}
+    ReturnNode(std::unique_ptr<ASTNode> expr, const FunctionNode* currentFunction)
+        : expression(std::move(expr)), currentFunction(currentFunction) {}
 
     void emitData(std::ofstream& f) const override
     {
-        // No data to emit for return statements
+        if (expression)
+        {
+            expression->emitData(f);
+        }
     }
 
     void emitCode(std::ofstream& f) const override
@@ -584,7 +593,16 @@ struct ReturnNode : ASTNode
         if (currentFunction->returnType != TOKEN_VOID)
         {
             // Non-void function: evaluate the expression and return its value
-            expression->emitCode(f); 
+            if (!expression)
+            {
+                throw std::runtime_error("Non-void function '" + currentFunction->name + "' must return a value");
+            }
+            expression->emitCode(f);
+            // Emit function epilogue for all returns
+            f << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov esp, ebp " << "; Restore stack pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    pop ebp " << "; Restore base pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    ret " << "; Return to caller" << std::endl;
         }
 
         else
@@ -2382,7 +2400,11 @@ class Parser
         else if (token.type == TOKEN_RETURN)
 	    {
             eat(TOKEN_RETURN);
-            auto expr = expression(currentFunction); // Pass the current function context
+            std::unique_ptr<ASTNode> expr = nullptr;
+            if (currentToken.type != TOKEN_SEMICOLON)
+            {
+                expr = expression(currentFunction); // Parse the expression if present
+            }
             eat(TOKEN_SEMICOLON);
             return std::make_unique<ReturnNode>(std::move(expr), currentFunction);
         }
