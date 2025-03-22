@@ -1,8 +1,36 @@
-int main()
+void printFib(int n)
 {
-    for (int i = 0; i < 5; i++)
+    if (n < 1)
     {
-        print("%d ", i);
+        print("Invalid Number of terms\n");
     }
+  
+    int prev1 = 1;
+    int prev2 = 0;
+
+    for (int i = 1; i <= n; i++)
+    {
+        if (i > 2)
+        {
+            int curr = prev1 + prev2;
+            prev2 = prev1;
+            prev1 = curr;
+            print("%d ", curr);
+        }
+        else if (i == 1)
+        {
+            print("%d ", prev2);
+        }
+        else if (i == 2)
+        {
+            print("%d ", prev1);
+        }
+    }
+}
+
+int main() {
+    int n = 10;
+    printFib(n);
+    print("\n");
     return 0;
 }

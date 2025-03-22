@@ -117,17 +117,35 @@ public:
 
         if (ch == '"')
         {
-            advance();
+            advance(); // Consume the opening quote
             std::string str;
             while (peek() != '"' && peek() != '\0')
             {
-                str += advance();
+                if (peek() == '\\') // Check for escape sequence
+                {
+                    advance(); // Consume the '\'
+                    char next = peek();
+                    switch (next)
+                    {
+                        case 'n': str += '\n'; advance(); break; // Newline (0x0A)
+                        case 't': str += '\t'; advance(); break; // Tab (0x09)
+                        case 'r': str += '\r'; advance(); break; // Carriage return (0x0D)
+                        case '\\': str += '\\'; advance(); break; // Literal backslash
+                        case '"': str += '"'; advance(); break; // Literal quote
+                        default:
+                            throw std::runtime_error("Unknown escape sequence \\" + std::string(1, next));
+                    }
+                }
+                else
+                {
+                    str += advance();
+                }
             }
             if (peek() != '"')
             {
                 throw std::runtime_error("Expected closing quote for string literal");
             }
-            advance();
+            advance(); // Consume the closing quote
             return { TOKEN_STRING_LITERAL, str };
         }
 
@@ -998,98 +1016,95 @@ struct AssignmentNode : ASTNode
  **************************************************************************************************/
 
 
-struct IfStatementNode : ASTNode
-{
-    std::unique_ptr<ASTNode> condition;
-    std::vector<std::unique_ptr<ASTNode>> body;
-    std::vector<std::pair<std::unique_ptr<ASTNode>, std::vector<std::unique_ptr<ASTNode>>>> elseIfBlocks; // (condition, body) pairs
-    std::vector<std::unique_ptr<ASTNode>> elseBody;
-
-    IfStatementNode(std::unique_ptr<ASTNode> cond, std::vector<std::unique_ptr<ASTNode>> b,
-                    std::vector<std::pair<std::unique_ptr<ASTNode>, std::vector<std::unique_ptr<ASTNode>>>> eib = {},
-                    std::vector<std::unique_ptr<ASTNode>> eb = {})
-        : condition(std::move(cond)), body(std::move(b)), elseIfBlocks(std::move(eib)), elseBody(std::move(eb)) {}
-
-    void emitData(std::ofstream& f) const override
-    {
-        for (const auto& stmt : body)
-	    {
-            stmt->emitData(f);
-        }
-
-        for (const auto& [cond, body] : elseIfBlocks)
-        {
-            for (const auto& stmt : body)
-            {
-                stmt->emitData(f);
-            }
-        }
-
-        for (const auto& stmt : elseBody)
-        {
-            stmt->emitData(f);
-        }
-    }
-
-    void emitCode(std::ofstream& f) const override
-    {
+ struct IfStatementNode : ASTNode
+ {
+     std::unique_ptr<ASTNode> condition;
+     std::vector<std::unique_ptr<ASTNode>> body;
+     std::vector<std::pair<std::unique_ptr<ASTNode>, std::vector<std::unique_ptr<ASTNode>>>> elseIfBlocks;
+     std::vector<std::unique_ptr<ASTNode>> elseBody;
+     std::string functionName; // Added to store the current function's name
+ 
+     IfStatementNode(std::unique_ptr<ASTNode> cond, std::vector<std::unique_ptr<ASTNode>> b,
+                     std::vector<std::pair<std::unique_ptr<ASTNode>, std::vector<std::unique_ptr<ASTNode>>>> eib,
+                     std::vector<std::unique_ptr<ASTNode>> eb, const std::string& funcName)
+         : condition(std::move(cond)), body(std::move(b)), elseIfBlocks(std::move(eib)),
+           elseBody(std::move(eb)), functionName(funcName) {}
+ 
+     void emitData(std::ofstream& f) const override
+     {
+         for (const auto& stmt : body)
+         {
+             stmt->emitData(f);
+         }
+         for (const auto& [cond, body] : elseIfBlocks)
+         {
+             for (const auto& stmt : body)
+             {
+                 stmt->emitData(f);
+             }
+         }
+         for (const auto& stmt : elseBody)
+         {
+             stmt->emitData(f);
+         }
+     }
+ 
+     void emitCode(std::ofstream& f) const override
+     {
         size_t labelID = labelCounter++;
+
+        // Use the function name as the label prefix
+        std::string endLabel = functionName + ".endif_" + std::to_string(labelID);
+
         condition->emitCode(f);
         f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
 
         std::string instruction;
-        // Jump to the appropriate block bassed on whether there are 'else if' blocks
         if (!elseIfBlocks.empty())
         {
-            instruction = "    je .else_if_0_" + std::to_string(labelID);
+            instruction = "    je " + functionName + ".else_if_0_" + std::to_string(labelID);
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to first else_if block if condition is false" << std::endl;
         }
-
         else if (!elseBody.empty())
         {
-            instruction = "    je .else_" + std::to_string(labelID);
+            instruction = "    je " + functionName + ".else_" + std::to_string(labelID);
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to else block if condition is false" << std::endl;
         }
-
         else
         {
-            instruction = "    je .endif_" + std::to_string(labelID);
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to .endif if condition is false" << std::endl;
+            instruction = "    je " + endLabel;
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end if condition is false" << std::endl;
         }
-        
 
-        // Emit code for the 'if' body
+        // Emit 'if' body
         for (const auto& stmt : body)
-	    {
+        {
             stmt->emitCode(f);
         }
+        instruction = "    jmp " + endLabel;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end to skip all else-if and else blocks" << std::endl;
 
-        instruction = "    jmp .endif_" + std::to_string(labelID);
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to .endif to skip all else-if and else block" << std::endl;
-        
-        // Emit code for 'else if' blocks (if they exist)
+        // Emit 'else if' blocks
         for (size_t i = 0; i < elseIfBlocks.size(); ++i)
         {
-            f << std::endl << ".else_if_" << i << "_" << labelID << ":" << std::endl;
+            f << std::endl << functionName << ".else_if_" << i << "_" << labelID << ":" << std::endl;
             elseIfBlocks[i].first->emitCode(f);
             f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
 
             if (i + 1 < elseIfBlocks.size())
             {
-                instruction = "    je .else_if_" + std::to_string(i + 1) + "_" + std::to_string(labelID);
+                instruction = "    je " + functionName + ".else_if_" + std::to_string(i + 1) + "_" + std::to_string(labelID);
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to next else-if block if condition is false" << std::endl;
             }
-
             else if (!elseBody.empty())
             {
-                instruction = "    je .else_" + std::to_string(labelID);
+                instruction = "    je " + functionName + ".else_" + std::to_string(labelID);
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to else block if condition is false" << std::endl;
             }
-
             else
             {
-                instruction = "    je .endif_" + std::to_string(labelID);
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to .endif if condition is false" << std::endl;
+                instruction = "    je " + endLabel;
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end if condition is false" << std::endl;
             }
 
             for (const auto& stmt : elseIfBlocks[i].second)
@@ -1097,32 +1112,33 @@ struct IfStatementNode : ASTNode
                 stmt->emitCode(f);
             }
 
-            instruction = "    jmp .endif_" + std::to_string(labelID);
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to .endif to skip remaining else-if and else blocks" << std::endl;
+            instruction = "    jmp " + endLabel;
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end to skip remaining blocks" << std::endl;
         }
-        
-        // Emit code for the 'else' block (if it exist)
+
+        // Emit 'else' block
         if (!elseBody.empty())
         {
-            f << std::endl << ".else_" << labelID << ":" << std::endl;
+            f << std::endl << functionName << ".else_" << labelID << ":" << std::endl;
             for (const auto& stmt : elseBody)
             {
                 stmt->emitCode(f);
             }
         }
 
-        f << std::endl << ".endif_" << labelID << ":" << std::endl;
+        f << std::endl << endLabel << ":" << std::endl;
     }
-};
+ };
 
 
 struct WhileLoopNode : ASTNode
 {
     std::unique_ptr<ASTNode> condition;
     std::vector<std::unique_ptr<ASTNode>> body;
+    std::string functionName;
 
-    WhileLoopNode(std::unique_ptr<ASTNode> cond, std::vector<std::unique_ptr<ASTNode>> body)
-        : condition(std::move(cond)), body(std::move(body)) {}
+    WhileLoopNode(std::unique_ptr<ASTNode> cond, std::vector<std::unique_ptr<ASTNode>> body, std::string funcName)
+        : condition(std::move(cond)), body(std::move(body)), functionName(funcName) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1136,10 +1152,10 @@ struct WhileLoopNode : ASTNode
     {
         size_t loopStartLabel = labelCounter++;
         size_t loopEndLabel = labelCounter++;
-        f << std::endl << ".loop_start_" << loopStartLabel << ":" << std::endl;
+        f << std::endl << functionName << ".loop_start_" << loopStartLabel << ":" << std::endl;
         condition->emitCode(f); // Evaluate the condition
         
-        std::string instruction = "    je .loop_end_" + std::to_string(loopEndLabel);
+        std::string instruction = "    je " + functionName + ".loop_end_" + std::to_string(loopEndLabel);
         f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end if condition is false" << std::endl;
 
@@ -1149,9 +1165,9 @@ struct WhileLoopNode : ASTNode
             stmt->emitCode(f);
         }
         
-        instruction = "    jmp .loop_start_" + std::to_string(loopStartLabel);
+        instruction = "    jmp " + functionName + ".loop_start_" + std::to_string(loopStartLabel);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump back to start of loop" << std::endl;
-        f << std::endl << ".loop_end_" << loopEndLabel << ":" << std::endl;
+        f << std::endl << functionName << ".loop_end_" << loopEndLabel << ":" << std::endl;
     }
 };
 
@@ -1162,11 +1178,13 @@ struct ForLoopNode : ASTNode
     std::unique_ptr<ASTNode> condition;
     std::unique_ptr<ASTNode> iteration;
     std::vector<std::unique_ptr<ASTNode>> body;
+    std::string functionName; // Added to store the current function's name
 
     ForLoopNode(std::unique_ptr<ASTNode> init, std::unique_ptr<ASTNode> cond,
-                std::unique_ptr<ASTNode> iter, std::vector<std::unique_ptr<ASTNode>> b)
+                std::unique_ptr<ASTNode> iter, std::vector<std::unique_ptr<ASTNode>> b,
+                const std::string& funcName)
         : initialization(std::move(init)), condition(std::move(cond)),
-        iteration(std::move(iter)), body(std::move(b)) {}
+        iteration(std::move(iter)), body(std::move(b)), functionName(funcName) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1186,8 +1204,8 @@ struct ForLoopNode : ASTNode
         size_t loopEndLabel = labelCounter++;
 
         // Fully qualified label names
-        std::string fullStartLabel = "main.loop_start_" + std::to_string(loopStartLabel);
-        std::string fullEndLabel = "main.loop_end_" + std::to_string(loopEndLabel);
+        std::string fullStartLabel = functionName + ".loop_start_" + std::to_string(loopStartLabel);
+        std::string fullEndLabel = functionName + ".loop_end_" + std::to_string(loopEndLabel);
 
         if (initialization)
         {
@@ -1199,7 +1217,8 @@ struct ForLoopNode : ASTNode
         {
             condition->emitCode(f); // e.g., i < 5
             f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    je " << fullEndLabel << "; Jump to end if condition is false" << std::endl;
+            std::string instruction = "    je " + fullEndLabel;
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end if condition is false" << std::endl;
         }
 
         for (const auto& stmt : body)
@@ -1211,8 +1230,8 @@ struct ForLoopNode : ASTNode
         {
             iteration->emitCode(f); // e.g., i++
         }
-
-        f << std::left << std::setw(COMMENT_COLUMN) << "    jmp " << fullStartLabel << "; Jump back to start of loop" << std::endl;
+        std::string instruction = "    jmp " + fullStartLabel;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump back to start of loop" << std::endl;
         f << std::endl << fullEndLabel << ":" << std::endl;
     }
 };
@@ -1468,7 +1487,19 @@ struct StringLiteralNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        f << "    " << label << " db '" << value << "', 0" << std::endl;
+        f << "    " << label << " db ";
+        bool first = true;
+        for (char c : value)
+        {
+            if (!first) f << ", ";
+            if (c == '\n') f << "0x0A";           // Newline
+            else if (c == '\t') f << "0x09";      // Tab
+            else if (c == '\r') f << "0x0D";      // Carriage return
+            else if (c < 32 || c > 126) f << std::to_string((unsigned char)c); // Other non-printable characters as bytes
+            else f << "'" << c << "'";            // Printable characters
+            first = false;
+        }
+        f << ", 0" << std::endl; // Null terminator
     }
 
     void emitCode(std::ofstream& f) const override
@@ -1506,107 +1537,103 @@ struct PrintNode : ASTNode
                 }
                 switch (specifier)
                 {
-                    case 'd':
-                        intBufferLabels.push_back("print_int_buf_" + std::to_string(labelCounter++));
-                        argIndex++;
-                        break;
-                    case 's':
-                        argIndex++;
-                        break;
-                    case 'c':
-                        charBufferLabels.push_back("print_char_buf_" + std::to_string(labelCounter++));
-                        argIndex++;
-                        break;
-                    default:
-                        throw std::runtime_error("Unsupported format specifier: %" + std::string(1, specifier));
+                    case 'd': intBufferLabels.push_back("print_int_buf_" + std::to_string(labelCounter++)); break;
+                    case 's': break;
+                    case 'c': charBufferLabels.push_back("print_char_buf_" + std::to_string(labelCounter++)); break;
+                    default: throw std::runtime_error("Unsupported format specifier: %" + std::string(1, specifier));
                 }
+                // Emit the substring before the specifier as a literal
+                if (pos - 2 > 0)
+                {
+                    std::string literal = format.substr(0, pos - 2);
+                    std::string label = "print_lit_" + std::to_string(labelCounter++);
+                    literalLabels.emplace_back(label, literal);
+                    format = format.substr(pos); // Update format to remaining part
+                    pos = 0; // Reset position
+                }
+                else
+                {
+                    format = format.substr(pos); // Remove the specifier
+                    pos = 0; // Reset position
+                }
+                argIndex++;
             }
             else
             {
-                size_t start = pos;
-                while (pos < format.length() && format[pos] != '%')
-                {
-                    pos++;
-                }
-                if (pos > start)
-                {
-                    std::string literal = format.substr(start, pos - start);
-                    std::string label = "print_lit_" + std::to_string(labelCounter++);
-                    literalLabels.emplace_back(label, literal);
-                }
+                pos++;
             }
         }
-
-        if (argIndex < arguments.size())
+        // Any remaining string after last specifier
+        if (!format.empty())
         {
-            throw std::runtime_error("Too many arguments for format string");
+            std::string label = "print_lit_" + std::to_string(labelCounter++);
+            literalLabels.emplace_back(label, format);
+        }
+        if (argIndex != arguments.size())
+        {
+            throw std::runtime_error("Argument count mismatch for format string");
         }
     }
 
     void emitData(std::ofstream& f) const override
     {
-        formatString->emitData(f);
-        for (const auto& arg : arguments)
-        {
-            arg->emitData(f);
-        }
+        for (const auto& arg : arguments) arg->emitData(f);
         for (const auto& [label, literal] : literalLabels)
         {
-            f << "    " << label << " db '" << literal << "', 0" << std::endl;
+            f << "    " << label << " db ";
+            bool first = true;
+            for (char c : literal)
+            {
+                if (!first) f << ", ";
+                if (c == '\n') f << "0x0A";
+                else if (c == '\t') f << "0x09";
+                else if (c == '\r') f << "0x0D";
+                else if (c < 32 || c > 126) f << std::to_string((unsigned char)c);
+                else f << "'" << c << "'";
+                first = false;
+            }
+            f << ", 0" << std::endl;
         }
         for (const auto& label : intBufferLabels)
-        {
             f << "    " << label << " times 12 db 0" << std::endl;
-        }
         for (const auto& label : charBufferLabels)
-        {
             f << "    " << label << " db 0" << std::endl;
-        }
     }
 
     void emitCode(std::ofstream& f) const override
     {
-        std::string format = formatString->value;
-        size_t pos = 0;
         size_t argIndex = 0;
         size_t litIndex = 0;
         size_t intBufIndex = 0;
         size_t charBufIndex = 0;
 
-        while (pos < format.length())
+        for (const auto& [label, literal] : literalLabels)
         {
-            if (format[pos] == '%' && pos + 1 < format.length())
+            if (litIndex > 0) // After first literal, print an argument
             {
-                char specifier = format[pos + 1];
-                pos += 2;
-                switch (specifier)
+                if (argIndex < arguments.size())
                 {
-                    case 'd':
-                        emitInteger(f, argIndex, intBufferLabels[intBufIndex++]);
-                        argIndex++;
-                        break;
-                    case 's':
-                        emitString(f, argIndex);
-                        argIndex++;
-                        break;
-                    case 'c':
-                        emitCharacter(f, argIndex, charBufferLabels[charBufIndex++]);
-                        argIndex++;
-                        break;
+                    char specifier = formatString->value[formatString->value.find('%', literalLabels[litIndex-1].second.length()) + 1];
+                    switch (specifier)
+                    {
+                        case 'd': emitInteger(f, argIndex, intBufferLabels[intBufIndex++]); argIndex++; break;
+                        case 's': emitString(f, argIndex); argIndex++; break;
+                        case 'c': emitCharacter(f, argIndex, charBufferLabels[charBufIndex++]); argIndex++; break;
+                    }
                 }
             }
-            else
+            emitLiteralString(f, label, literal);
+            litIndex++;
+        }
+        // Print any remaining argument if the last part was a specifier
+        if (litIndex == literalLabels.size() && argIndex < arguments.size())
+        {
+            char specifier = formatString->value[formatString->value.find_last_of('%') + 1];
+            switch (specifier)
             {
-                size_t start = pos;
-                while (pos < format.length() && format[pos] != '%')
-                {
-                    pos++;
-                }
-                if (pos > start)
-                {
-                    emitLiteralString(f, literalLabels[litIndex].first, literalLabels[litIndex].second);
-                    litIndex++;
-                }
+                case 'd': emitInteger(f, argIndex, intBufferLabels[intBufIndex++]); argIndex++; break;
+                case 's': emitString(f, argIndex); argIndex++; break;
+                case 'c': emitCharacter(f, argIndex, charBufferLabels[charBufIndex++]); argIndex++; break;
             }
         }
     }
@@ -1685,6 +1712,8 @@ private:
         f << std::left << std::setw(COMMENT_COLUMN) << "    int 0x80" << "; Invoke syscall" << std::endl;
     }
 };
+
+
 
 
 /*****************************************************************************************
@@ -2159,7 +2188,9 @@ class Parser
             else if (currentToken.type == TOKEN_LPAREN)
             {
                 // Parse the function call
-                return functionCall(identifier);
+                auto stmt = functionCall(identifier);
+                eat(TOKEN_SEMICOLON);
+                return stmt;
             }
     
             // Check if this is an assignment (e.g., x = ...)
@@ -2280,7 +2311,7 @@ class Parser
                 eat(TOKEN_RBRACE);
             }
 
-            return std::make_unique<IfStatementNode>(std::move(cond), std::move(body), std::move(elseIfBlocks), std::move(elseBody));
+            return std::make_unique<IfStatementNode>(std::move(cond), std::move(body), std::move(elseIfBlocks), std::move(elseBody), currentFunction->name);
         }
 
         else if (token.type == TOKEN_WHILE)
@@ -2299,7 +2330,7 @@ class Parser
             }
             eat(TOKEN_RBRACE);
     
-            return std::make_unique<WhileLoopNode>(std::move(cond), std::move(body));
+            return std::make_unique<WhileLoopNode>(std::move(cond), std::move(body), currentFunction->name);
         }
 
         else if (token.type == TOKEN_FOR)
@@ -2345,7 +2376,7 @@ class Parser
             }
             eat(TOKEN_RBRACE);
 
-            return std::make_unique<ForLoopNode>(std::move(initialization), std::move(cond), std::move(iteration), std::move(body));
+            return std::make_unique<ForLoopNode>(std::move(initialization), std::move(cond), std::move(iteration), std::move(body), currentFunction->name);
         }
 
         else if (token.type == TOKEN_RETURN)
