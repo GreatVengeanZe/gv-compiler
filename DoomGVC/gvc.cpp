@@ -127,13 +127,14 @@ public:
                     char next = peek();
                     switch (next)
                     {
-                        case 'n': str += '\n'; advance(); break; // Newline (0x0A)
-                        case 't': str += '\t'; advance(); break; // Tab (0x09)
-                        case 'r': str += '\r'; advance(); break; // Carriage return (0x0D)
+                        case 'n':  str += '\n'; advance(); break; // Newline (0x0A)
+                        case 't':  str += '\t'; advance(); break; // Horizontal Tab (0x09)
+                        case 'r':  str += '\r'; advance(); break; // Carriage return (0x0D)
+                        case 'v':  str += '\v'; advance(); break; // Vertical Tabulation (0x0B)
+                        case '0':  str += '\0'; advance(); break; // NULL character (0x00)
                         case '\\': str += '\\'; advance(); break; // Literal backslash
-                        case '"': str += '"'; advance(); break; // Literal quote
-                        default:
-                            throw std::runtime_error("Unknown escape sequence \\" + std::string(1, next));
+                        case '"':  str += '"';  advance(); break; // Literal quote
+                        default: throw std::runtime_error("Unknown escape sequence \\" + std::string(1, next));
                     }
                 }
                 else
@@ -153,6 +154,22 @@ public:
         {
             advance();                  // Consume the opening quote
             char charValue = advance(); // Get the character
+            if (charValue == '\\')
+            {
+                // advance(); // Consume the backslash
+                charValue = advance(); // Get the character of the escape sequesnce
+                switch (charValue)
+                {
+                    case 'n':  charValue = '\n'; break; // Newline (0x0A)
+                    case 't':  charValue = '\t'; break; // Horizontal Tab (0x09)
+                    case 'r':  charValue = '\r'; break; // Carriage return (0x0D)
+                    case 'v':  charValue = '\v'; break; // Vertical Tabulation (0x0B)
+                    case '0':  charValue = '\0'; break; // NULL character (0x00)
+                    case '\\': charValue = '\\'; break; // Literal backslash
+                    case '\'': charValue = '\''; break; // Literal quote
+                    default: throw std::runtime_error("Unknown escape sequence \\" + std::string(1, charValue));
+                }
+            }
             if (peek() != '\'')
             {
                 throw std::runtime_error("Expected closing quote for char literal");
@@ -1496,8 +1513,19 @@ struct CharLiteralNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        std::string instruction = "    mov eax, " + std::to_string(static_cast<int>(value));
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load char literal '" << value << "' into eax" << std::endl;
+        int ascii_value = 0;
+        std::string the_value = "";
+        switch (value)
+        {
+            case '\n':  ascii_value = 10; the_value = "\\n"; break;
+            case '\t':  ascii_value = 9;  the_value = "\\t";  break;
+            case '\r':  ascii_value = 13; the_value = "\\r";  break;
+            case '\v':  ascii_value = 11; the_value = "\\v";  break;
+            case '\0':  ascii_value = 0;  the_value = "\\0";  break;
+            default:    ascii_value = (static_cast<int>(value));
+        }
+        std::string instruction = "    mov eax, " + std::to_string(ascii_value);
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load char literal '" << the_value << "' into eax" << std::endl;
     }
 };
 
@@ -1512,13 +1540,40 @@ struct StringLiteralNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        f << "    " << label << " db '" << value << "', 0" << std::endl;
+        f << "    " << label << " db ";
+        for (char c : value)
+        {
+            switch (c)
+            {
+                case '\n':  f << std::to_string(10); break;
+                case '\t':  f << std::to_string(9); break;
+                case '\r':  f << std::to_string(13); break;
+                case '\v':  f << std::to_string(11); break;
+                case '\0':  f << std::to_string(0); break;
+                default:    f << std::to_string(static_cast<int>(c));
+            }
+            f << ", ";
+        }
+        f << "0" << std::endl;
     }
 
     void emitCode(std::ofstream& f) const override
     {
         std::string instruction = "    mov eax, " + label;
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load address of string '" << value << "' into eax" << std::endl; 
+        std::string the_string = "";
+        for (char c : value)
+        {
+            switch (c)
+            {
+                case '\n':  the_string += "\\n"; 
+                case '\t':  the_string += "\\t"; break;
+                case '\r':  the_string += "\\r"; break;
+                case '\v':  the_string += "\\v"; break;
+                case '\0':  the_string += "\\0"; break;
+                default:    the_string += c;
+            }
+        }
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load address of string '" << the_string << "' into eax" << std::endl; 
     }
 };
 
@@ -2387,7 +2442,7 @@ private:
         std::regex defineRegex("#define\\s+(\\w+)\\s+(.+)");
         std::smatch match;
 
-        if (std::regex_match(line, match, defineRegex))
+        if (std::regex_search(line, match, defineRegex))
         {
             std::string name = match[1].str();
             std::string value = match[2].str();
@@ -2432,7 +2487,7 @@ public:
                 std::regex includeRegex("#include\\s+\"(.+?)\"");
                 std::smatch match;
 
-                if (std::regex_match(line, match, includeRegex))
+                if (std::regex_search(line, match, includeRegex))
                 {
                     std::string fileName = match[1].str();
                     std::string includedContent = readFile(fileName);

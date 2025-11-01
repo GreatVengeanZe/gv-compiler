@@ -1,23 +1,7 @@
-extern int printf();
-extern int putchar(int c);
+#include "lib/std.h"
 
-void printFib(int n)
+int main()
 {
-    int a = 0;
-    int b = 1;
-
-    for (int i = 1; i <= 9; i++)
-    {
-            printf("%d ", a);
-            int curr = a + b;
-            a = b;
-            b = curr;
-    }
-    putchar(10);
-}
-
-int main() {
-    int n = 9;
-    printFib(n);
+    fprintf(stdout, "Hello, World!\n");
     return 0;
 }
