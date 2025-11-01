@@ -1,31 +1,19 @@
+extern int printf();
+extern int putchar(int c);
+
 void printFib(int n)
 {
-    if (n < 1) {
-        print("Invalid Number of terms");
-        return;
-    }
+    int a = 0;
+    int b = 1;
 
-    int prev1 = 1;
-    int prev2 = 0;
-
-    for (int i = 1; i <= n; i++)
+    for (int i = 1; i <= 9; i++)
     {
-        if (i > 2)
-        {
-            int curr = prev1 + prev2;
-            prev2 = prev1;
-            prev1 = curr;
-            print("%d ", curr);
-        }
-        else if (i == 1)
-        {
-            print("%d ", prev2);
-        }
-        else if (i == 2)
-        {
-            print("%d ", prev1);
-        }
+            printf("%d ", a);
+            int curr = a + b;
+            a = b;
+            b = curr;
     }
+    putchar(10);
 }
 
 int main() {

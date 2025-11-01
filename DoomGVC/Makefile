@@ -7,8 +7,8 @@ CFLAGS = -std=c++17 -Wall -g
 # Assembler and linker for the generated assembly
 ASM = nasm
 ASMFLAGS = -f elf32
-LD = ld
-LDFLAGS = -m elf_i386
+LINK = gcc
+LINK_FLAGS = -no-pie -m32
 
 # Source file for the compiler
 COMPILER_SRC = gvc.cpp
@@ -42,11 +42,11 @@ $(OUTPUT_OBJ): $(OUTPUT_ASM)
 
 # Link the object file into an executable
 $(OUTPUT_EXEC): $(OUTPUT_OBJ)
-	$(LD) $(LDFLAGS) $(OUTPUT_OBJ) -o $(OUTPUT_EXEC)
+	$(LINK) $(LINK_FLAGS) $(OUTPUT_OBJ) -o $(OUTPUT_EXEC)
 
 # Clean up generated files
 clean:
-	rm -f $(COMPILER_OBJ) $(COMPILER_EXEC) $(OUTPUT_ASM) $(OUTPUT_OBJ) $(OUTPUT_EXEC)
+	rm -f $(COMPILER_OBJ) $(COMPILER_EXEC) $(OUTPUT_ASM) $(OUTPUT_OBJ) $(OUTPUT_EXEC) && clear
 
 # Phony targets
 .PHONY: all clean
