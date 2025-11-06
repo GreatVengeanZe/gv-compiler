@@ -1,7 +1,7 @@
-#include "lib/std.h"
+extern printf;
 
 int main()
 {
-    fprintf(stdout, "Hello, World!\n");
+    printf("Hello, World!\n");
     return 0;
 }

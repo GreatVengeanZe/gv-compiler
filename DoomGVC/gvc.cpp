@@ -1534,22 +1534,38 @@ struct StringLiteralNode : ASTNode
 {
     std::string value;
     std::string label;
+    std::string updatedValue;
 
-    StringLiteralNode(const std::string& v)
-        : value(v), label("str_" + std::to_string(labelCounter++)) {}
+    StringLiteralNode(const std::string& v) : value(v), label("str_" + std::to_string(labelCounter++))
+    {
+        updatedValue = "";
+        for (char c : value)
+        {
+            switch (c)
+            {
+                case '\n': updatedValue += "\\n"; break;
+                case '\t': updatedValue += "\\t"; break;
+                case '\r': updatedValue += "\\r"; break;
+                case '\v': updatedValue += "\\v"; break;
+                case '\0': updatedValue += "\\0"; break;
+                default:   updatedValue += c;
+            }
+        }
+    }
 
     void emitData(std::ofstream& f) const override
     {
+        f << "    ; \"" << updatedValue << "\"" << std::endl;
         f << "    " << label << " db ";
         for (char c : value)
         {
             switch (c)
             {
                 case '\n':  f << std::to_string(10); break;
-                case '\t':  f << std::to_string(9); break;
+                case '\t':  f << std::to_string(9);  break;
                 case '\r':  f << std::to_string(13); break;
                 case '\v':  f << std::to_string(11); break;
-                case '\0':  f << std::to_string(0); break;
+                case '\0':  f << std::to_string(0);  break;
                 default:    f << std::to_string(static_cast<int>(c));
             }
             f << ", ";
@@ -1560,20 +1576,7 @@ struct StringLiteralNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         std::string instruction = "    mov eax, " + label;
-        std::string the_string = "";
-        for (char c : value)
-        {
-            switch (c)
-            {
-                case '\n':  the_string += "\\n"; 
-                case '\t':  the_string += "\\t"; break;
-                case '\r':  the_string += "\\r"; break;
-                case '\v':  the_string += "\\v"; break;
-                case '\0':  the_string += "\\0"; break;
-                default:    the_string += c;
-            }
-        }
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load address of string '" << the_string << "' into eax" << std::endl; 
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load address of string '" << updatedValue << "' into eax" << std::endl; 
     }
 };
 
@@ -2592,10 +2595,6 @@ int main(int argc, char** argv)
     }
     generateCode(ast, file);
     file.close();
-    
-    // The Makefile will handle assembling and linking
-    std::cout << "Assembly file generated: " << asmFileName << std::endl;
-    std::cout << "Use 'make' to assemble and link the output." << std::endl;
 
     return 0;
 }
