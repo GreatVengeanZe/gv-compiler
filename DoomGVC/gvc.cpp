@@ -664,7 +664,7 @@ struct DeclarationNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        // Local variables are alocated on the stack, so no need to emit them in the .data section
+        initializer.get()->emitData(f);
     }
 
     void emitCode(std::ofstream& f) const override
