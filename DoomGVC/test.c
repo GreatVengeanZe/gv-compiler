@@ -1,7 +1,9 @@
 extern printf;
-
 int main()
 {
-    printf("Hello, World!\n");
+    int x = 1;
+    x = x >> 5;
+
+    printf("%d\n", x);
     return 0;
 }

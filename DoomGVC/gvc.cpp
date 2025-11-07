@@ -41,11 +41,47 @@ std::string generateUniqueName(const std::string& name)
 
 enum TokenType
 {
-    TOKEN_INT, TOKEN_CHAR, TOKEN_VOID, TOKEN_EXTERN, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_CHAR_LITERAL, TOKEN_STRING_LITERAL, TOKEN_SEMICOLON,
-    TOKEN_ASSIGN, TOKEN_PLUS, TOKEN_INCREMENT, TOKEN_MINUS, TOKEN_DECREMENT,TOKEN_MULTIPLY, TOKEN_DIVIDE, TOKEN_ADDRESS_OF,
-    TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE, TOKEN_LBRACKET, TOKEN_RBRACKET,
-    TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE, TOKEN_FOR, TOKEN_EQ, TOKEN_NE, TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE,
-    TOKEN_LOGICAL_AND, TOKEN_LOGICAL_OR, TOKEN_RETURN, TOKEN_COMMA, TOKEN_EOF
+    TOKEN_INT,
+    TOKEN_CHAR,
+    TOKEN_VOID,
+    TOKEN_EXTERN,
+    TOKEN_IDENTIFIER,
+    TOKEN_NUMBER,
+    TOKEN_CHAR_LITERAL,
+    TOKEN_STRING_LITERAL,
+    TOKEN_SEMICOLON,
+    TOKEN_ASSIGN,
+    TOKEN_ADD,
+    TOKEN_INCREMENT,
+    TOKEN_SUB,
+    TOKEN_DECREMENT,TOKEN_MUL,
+    TOKEN_DIV,
+    TOKEN_AND,
+    TOKEN_LPAREN,
+    TOKEN_RPAREN,
+    TOKEN_LBRACE,
+    TOKEN_RBRACE,
+    TOKEN_LBRACKET,
+    TOKEN_RBRACKET,
+    TOKEN_IF,
+    TOKEN_ELSE,
+    TOKEN_WHILE,
+    TOKEN_FOR,
+    TOKEN_EQ,
+    TOKEN_NE,
+    TOKEN_LT,
+    TOKEN_GT,
+    TOKEN_LE,
+    TOKEN_GE,
+    TOKEN_LOGICAL_AND,
+    TOKEN_LOGICAL_OR,
+    TOKEN_OR,
+    TOKEN_XOR,
+    TOKEN_SHL,
+    TOKEN_SHR,
+    TOKEN_RETURN,
+    TOKEN_COMMA,
+    TOKEN_EOF
 };
 
 // Token structure
@@ -226,7 +262,7 @@ public:
                 advance();
                 return { TOKEN_INCREMENT, "++" };
             }
-            return { TOKEN_PLUS, "+" };
+            return { TOKEN_ADD, "+" };
         }
 
         else if (ch == '-')
@@ -237,19 +273,25 @@ public:
                 advance();
                 return { TOKEN_DECREMENT, "--" };
             }
-            return { TOKEN_MINUS, "-" };
+            return { TOKEN_SUB, "-" };
         }
 
         else if (ch == '*')
 	    {
             advance();
-            return { TOKEN_MULTIPLY, "*" };
+            return { TOKEN_MUL, "*" };
         }
 
         else if (ch == '/')
 	    {
             advance();
-            return { TOKEN_DIVIDE, "/" };
+            return { TOKEN_DIV, "/" };
+        }
+        
+        else if (ch == '^')
+        {
+            advance();
+            return { TOKEN_XOR, "^" };
         }
 
         else if (ch == '(')
@@ -302,6 +344,11 @@ public:
                 advance();
                 return { TOKEN_LE, "<=" };
             }
+            else if (peek() == '<')
+            {
+                advance();
+                return { TOKEN_SHL, "<<"};
+            }
             return { TOKEN_LT, "<" };
         }
 
@@ -312,6 +359,11 @@ public:
 	        {
                 advance();
                 return { TOKEN_GE, ">=" };
+            }
+            else if (peek() == '>')
+            {
+                advance();
+                return { TOKEN_SHR, ">>"};
             }
             return { TOKEN_GT, ">" };
         }
@@ -334,7 +386,7 @@ public:
                 advance();
                 return { TOKEN_LOGICAL_AND, "&&"};
             }
-            return { TOKEN_ADDRESS_OF, "&" };
+            return { TOKEN_AND, "&" };
         }
 
         else if (ch == '|')
@@ -345,6 +397,7 @@ public:
                 advance();
                 return { TOKEN_LOGICAL_OR, "||" };
             }
+            return { TOKEN_OR, "|" };
         }
 
         else if (ch == '\0')
@@ -914,7 +967,16 @@ struct AssignmentNode : ASTNode
                 std::vector<std::unique_ptr<ASTNode>> idx = {})
         : identifier(id), expression(std::move(expr)), dereferenceLevel(derefLevel), indices(std::move(idx)) {}
  
-    void emitData(std::ofstream& f) const override {}
+    void emitData(std::ofstream& f) const override
+    {
+        // ADDED, BUT I DON'T IF IT WILL NOT BREAK EVERYTHING
+        expression.get()->emitData(f);
+        for (const auto& stmt : indices)
+        {
+            stmt->emitData(f);
+        }
+        // REMEMBER! THIS SHIT IS DANGEROUS!!!!!!!!!!!!!!!!!!
+    }
  
     void emitCode(std::ofstream& f) const override
     {
@@ -1322,6 +1384,37 @@ struct BinaryOpNode : ASTNode
             f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, ecx" << "; Put in eax value of ecx" << std::endl;
         }
 
+        else if (op == "&")
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "    and eax, ecx" << "; Perform AND on eax by ecx" << std::endl;
+        }
+
+        else if (op == "|")
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "    or eax, ecx" << "; Perform OR on eax by ecx" << std::endl;
+        }
+
+        else if (op == "^")
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "    xor eax, ecx" << "; Perform XOR on eax by ecx" << std::endl;
+        }
+
+        else if (op == "<<")
+        {
+            f << "    ; SWAPPING THE VALUES OF EAX AND ECX" << std::endl;
+            f << "\t\t\t\tpush eax\n\t\t\t\tmov eax, ecx\n\t\t\t\tpop ecx" << std::endl;
+            f << "    ; SWAPPING THE VALUES OF EAX AND ECX" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    shl eax, ecx" << "; Perform SHL on ecx by eax" << std::endl;
+        }
+
+        else if (op == ">>")
+        {
+            f << "    ; SWAPPING THE VALUES OF EAX AND ECX" << std::endl;
+            f << "\t\t\t\tpush eax\n\t\t\t\tmov eax, ecx\n\t\t\t\tpop ecx" << std::endl;
+            f << "    ; SWAPPING THE VALUES OF EAX AND ECX" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    shr eax, ecx" << "; Perform SHR on eax by ecx" << std::endl;
+        }
+
         else if (op == "*")
     	{
             f << std::left << std::setw(COMMENT_COLUMN) << "    imul eax, ecx" << "; Multiply eax by ecx" << std::endl;
@@ -1697,16 +1790,16 @@ class Parser
             return std::make_unique<NumberNode>(std::stoi(token.value));
         }
 
-        else if (token.type == TOKEN_MULTIPLY) // Dereference
+        else if (token.type == TOKEN_MUL) // Dereference
         {
-            eat(TOKEN_MULTIPLY);
+            eat(TOKEN_MUL);
             auto operand = factor(currentFunction); // Recursively parse the operand
             return std::make_unique<DereferenceNode>(std::move(operand), currentFunction);
         }
 
-        else if (token.type == TOKEN_ADDRESS_OF)
+        else if (token.type == TOKEN_AND)
         {
-            eat(TOKEN_ADDRESS_OF);
+            eat(TOKEN_AND);
             if (currentToken.type != TOKEN_IDENTIFIER)
             {
                 throw std::runtime_error("Expected Identifier after &");
@@ -1790,18 +1883,14 @@ class Parser
     std::unique_ptr<ASTNode> term(const FunctionNode* currentFunction = nullptr)
     {
         auto node = factor(currentFunction); // Pass the currentFunction context
-        while (currentToken.type == TOKEN_MULTIPLY || currentToken.type == TOKEN_DIVIDE)
+        while (currentToken.type == TOKEN_MUL || currentToken.type == TOKEN_DIV)
 	    {
             Token token = currentToken;
-
-            if (token.type == TOKEN_MULTIPLY)
-	        {
-                eat(TOKEN_MULTIPLY);
-            }
-
-            else if (token.type == TOKEN_DIVIDE)
-	        {
-                eat(TOKEN_DIVIDE);
+            switch (token.type)
+            {
+                case TOKEN_MUL: eat(TOKEN_MUL); break;
+                case TOKEN_DIV: eat(TOKEN_DIV); break;
+                default: ;
             }
 
             node = std::make_unique<BinaryOpNode>(token.value, std::move(node), factor(currentFunction)); // Pass the current function context
@@ -1824,17 +1913,22 @@ class Parser
     std::unique_ptr<ASTNode> expression(const FunctionNode* currentFunction = nullptr)
     {
         auto node = term(currentFunction); // Pass the current function context
-        while (currentToken.type == TOKEN_PLUS || currentToken.type == TOKEN_MINUS)
+        while (currentToken.type == TOKEN_ADD || currentToken.type == TOKEN_SUB ||
+                currentToken.type == TOKEN_OR || currentToken.type == TOKEN_XOR ||
+                currentToken.type == TOKEN_AND || currentToken.type == TOKEN_SHL ||
+                currentToken.type == TOKEN_SHR)
 	    {
             Token token = currentToken;
-            if (token.type == TOKEN_PLUS)
-	        {
-                eat(TOKEN_PLUS);
-            }
-
-            else if (token.type == TOKEN_MINUS)
-	        {
-                eat(TOKEN_MINUS);
+            switch (token.type)
+            {
+                case TOKEN_ADD: eat(TOKEN_ADD); break;
+                case TOKEN_SUB: eat(TOKEN_SUB); break;
+                case TOKEN_XOR: eat(TOKEN_XOR); break;
+                case TOKEN_AND: eat(TOKEN_AND); break;
+                case TOKEN_SHL: eat(TOKEN_SHL); break;
+                case TOKEN_SHR: eat(TOKEN_SHR); break;
+                case TOKEN_OR:  eat(TOKEN_OR);  break;
+                default: ;
             }
 
             node = std::make_unique<BinaryOpNode>(token.value, std::move(node), term(currentFunction)); // Pass the current function context
@@ -1882,9 +1976,9 @@ class Parser
             int pointerLevel = 0;
 
             // Check for pointer or array declaration
-            while (currentToken.type == TOKEN_MULTIPLY)
+            while (currentToken.type == TOKEN_MUL)
             {
-                eat(TOKEN_MULTIPLY);
+                eat(TOKEN_MUL);
                 pointerLevel++;
             }
 
@@ -1936,12 +2030,12 @@ class Parser
             }
         }
 
-        else if (token.type == TOKEN_MULTIPLY) // Dereference assignment (e.g., *ptr = ...)
+        else if (token.type == TOKEN_MUL) // Dereference assignment (e.g., *ptr = ...)
         {
             int dereferenceLevel = 0;
-            while(currentToken.type == TOKEN_MULTIPLY)
+            while(currentToken.type == TOKEN_MUL)
             {
-                eat(TOKEN_MULTIPLY);
+                eat(TOKEN_MUL);
                 dereferenceLevel++;
             }
 
