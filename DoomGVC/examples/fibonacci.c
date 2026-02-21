@@ -7,7 +7,7 @@ void printFib(int n)
     int a = 0;
     int b = 1;
 
-    for (int i = 1; i <= 9; i++)
+    for (int i = 1; i <= n; i++)
     {
             printf("%d ", a);
             int curr = a + b;

@@ -452,17 +452,17 @@ struct LogicalOrNode : ASTNode
         size_t labelID = labelCounter++;
         left->emitCode(f);
         std::string instruction = "    jne .logical_or_true_" + std::to_string(labelID);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare left operand with 0" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << "; Compare left operand with 0" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump if left operand is true" << std::endl;
         right->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; compare right operand with 0" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << "; compare right operand with 0" << std::endl;
         instruction = "    jne .logical_or_true_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump if right operand is true" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, 0" << "; Set result to false" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << "; Set result to false" << std::endl;
         instruction = "    jmp .logical_or_end_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end" << std::endl;
         f << std::endl << ".logical_or_true_" << labelID << ":" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, 1" << "; Set result to true" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 1" << "; Set result to true" << std::endl;
         f << std::endl << ".logical_or_end_" << labelID << ":" << std::endl;
     }
 };
@@ -486,18 +486,18 @@ struct LogicalAndNode : ASTNode
     {
         size_t labelID = labelCounter++;
         left->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare left operand with 0" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << "; Compare left operand with 0" << std::endl;
         std::string instruction = "    je .logical_and_false_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) <<  instruction << "; Jump if left operand is false" << std::endl;
         right->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare Right operand with 0" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << "; Compare Right operand with 0" << std::endl;
         instruction = "    je .logical_and_false_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump if right operand is false" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, 1" << "; Set result to true" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 1" << "; Set result to true" << std::endl;
         instruction = "    jmp .logical_and_end_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end" << std::endl;
         f << std::endl << ".logical_and_false_" << labelID << ":" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, 0" << "; Set result to false" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << "; Set result to false" << std::endl;
         f << std::endl << ".logical_and_end_" << labelID << ":" << std::endl;
     }
 };
@@ -532,21 +532,59 @@ struct FunctionCallNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        // Push arguments onto the stack in reverse order
-        for (auto it = arguments.rbegin(); it != arguments.rend(); ++it)
+        // System V AMD64 ABI calling convention
+        // First 6 arguments in: rdi, rsi, rdx, rcx, r8, r9
+        // Remaining on stack (in reverse order)
+        std::vector<std::string> argRegisters = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        
+        // Calculate how many arguments go on the stack (those beyond the first 6)
+        int stackArgs = (arguments.size() > 6) ? (arguments.size() - 6) : 0;
+        
+        // IMPORTANT: We need 16-byte alignment BEFORE the call instruction
+        // At this point, rsp is 16-byte aligned (or was after prologue)
+        // Pushing stackArgs values will change alignment by stackArgs * 8 bytes
+        // We might need to add padding to ensure alignment at call time
+        
+        // Amount we'll push on stack
+        int bytesToPush = stackArgs * 8;
+        
+        // Calculate padding needed: (bytesToPush + 0) % 16 == 0 means aligned after push ret
+        // But we need rsp % 16 == 0 just before call
+        // After "call" there's an implicit push of rip, so we need rsp % 16 == 8 before call
+        // (so after push rip, it becomes 0)
+        int alignmentNeeded = (16 - (bytesToPush % 16)) % 16;
+        
+        // If we need padding, adjust rsp before pushing arguments
+        if (alignmentNeeded > 0)
         {
-            (*it)->emitCode(f);
-            f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push argument onto stack" << std::endl;
+            std::string instruction = "    sub rsp, " + std::to_string(alignmentNeeded);
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Align stack for function call" << std::endl;
+        }
+        
+        // Push arguments onto stack in reverse order (for args beyond the first 6)
+        for (size_t i = arguments.size(); i > 6; --i)
+        {
+            arguments[i-1]->emitCode(f);
+            f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << "; Push argument " << i-1 << " onto stack" << std::endl;
+        }
+
+        // Load first 6 arguments into registers
+        for (size_t i = 0; i < arguments.size() && i < 6; ++i)
+        {
+            arguments[i]->emitCode(f);
+            std::string instruction = "    mov " + argRegisters[i] + ", rax";
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Pass argument " << i << " in " << argRegisters[i] << std::endl;
         }
 
         // Call the function
         std::string instruction = "    call " + functionName;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Call function " << functionName << std::endl;
 
-        // Clean up the stack (remove arguments)
-        if (!arguments.empty())
+        // Clean up the stack (remove arguments beyond first 6 + any alignment padding)
+        int totalCleanup = bytesToPush + alignmentNeeded;
+        if (totalCleanup > 0)
         {
-            instruction = "    add esp, " + std::to_string(arguments.size() * 4);
+            instruction = "    add rsp, " + std::to_string(totalCleanup);
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Clean up stack" << std::endl;
         }
     }
@@ -587,7 +625,8 @@ struct FunctionNode : ASTNode
     {
         if (isExternal)
         {
-            f << "\textern " << name << std::endl;
+            f << "extrn '" << name << "' as _" << name << std::endl;
+            f << name << " = PLT _" << name << std::endl;
             return;
         }
         // Push a new scope onto the stack
@@ -595,13 +634,37 @@ struct FunctionNode : ASTNode
 
         // Emit function prologue
         f << std::endl << name << ":" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    push ebp" << "; Save base pointer" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov ebp, esp" << "; Save stack pointer\n" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    push rbp" << "; Save base pointer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rbp, rsp" << "; Set stack frame\n" << std::endl;
 
-        // Allocate space for local variables
-        size_t localVarCount = body.size();
-        std::string instruction = "    sub esp, " + std::to_string(localVarCount * 4);
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Allocate space for local variables" << std::endl;
+        // Calculate space needed:
+        // - parameters (up to 6 are in registers, rest on stack)
+        // - local variables
+        // Stack must be 16-byte aligned BEFORE call instructions
+        // After push rbp, rsp is 16-byte aligned
+        // We need sub rsp amount to be a multiple of 16
+        size_t totalParams = std::min(parameters.size(), (size_t)6);
+        
+        // Conservative estimate: count each body statement as potentially needing 8 bytes
+        // This ensures we always have enough space
+        size_t estimatedLocalVars = body.size();
+        size_t totalLocalSpace = (totalParams + estimatedLocalVars) * 8;
+        
+        // Align to multiple of 16: round up to next 16-byte boundary
+        size_t alignedSpace = ((totalLocalSpace + 15) / 16) * 16;
+        
+        std::string instruction = "    sub rsp, " + std::to_string(alignedSpace);
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Allocate space for parameters and local variables (16-byte aligned)" << std::endl;
+
+        // Save parameter registers to stack AFTER allocation
+        // System V AMD64 ABI: first 6 args in rdi, rsi, rdx, rcx, r8, r9
+        // Parameters 7+ come on the stack (passed by caller) at [rbp+16], [rbp+24], etc.
+        std::vector<std::string> paramRegisters = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        for (size_t i = 0; i < parameters.size() && i < 6; ++i)
+        {
+            std::string instr = "    mov [rbp - " + std::to_string((i + 1) * 8) + "], " + paramRegisters[i];
+            f << std::left << std::setw(COMMENT_COLUMN) << instr << "; Save parameter " << i << " from " << paramRegisters[i] << std::endl;
+        }
 
         // Store function parameters in the current scope
         for (size_t i = 0; i < parameters.size(); i++)
@@ -609,8 +672,19 @@ struct FunctionNode : ASTNode
             std::string paramName = parameters[i].second;
             std::string uniqueName = generateUniqueName(paramName);
 
-            // Parameters are stored at [ebp + 8 + i * 4]
-            size_t index = i + 1; // Parameters start at index 1
+            size_t index;
+            if (i < 6)
+            {
+                // Parameters 0-5: stored at [rbp - (i + 1) * 8] (negative offset)
+                index = i + 1;
+            }
+            else
+            {
+                // Parameters 6+: passed on stack at [rbp + (i - 5) * 8]
+                // Store as a negative index for IdentifierNode to handle specially
+                // Use 1000 + offset to distinguish from regular parameters
+                index = 1000 + (i - 6) * 8;
+            }
 
             // Add the parameter to the current scope
             scopes.top()[paramName] = {uniqueName, index};
@@ -627,8 +701,8 @@ struct FunctionNode : ASTNode
         if (returnType == TOKEN_VOID)
         {
             f << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov esp, ebp " << "; Restore stack pointer" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    pop ebp " << "; Restore base pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rsp, rbp " << "; Restore stack pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    pop rbp " << "; Restore base pointer" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "    ret " << "; Return to caller" << std::endl;
         }
 
@@ -677,8 +751,8 @@ struct ReturnNode : ASTNode
             expression->emitCode(f);
             // Emit function epilogue for all returns
             f << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov esp, ebp " << "; Restore stack pointer" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    pop ebp " << "; Restore base pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rsp, rbp " << "; Restore stack pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    pop rbp " << "; Restore base pointer" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "    ret " << "; Return to caller" << std::endl;
         }
 
@@ -726,12 +800,12 @@ struct DeclarationNode : ASTNode
         size_t index = scopes.top().size() + 1; // Next free slot
         scopes.top()[identifier] = {uniqueName, index};
 
-        // f << std::left << std::setw(COMMENT_COLUMN) << "    sub esp, 4" << "; Allocate space for " << uniqueName << std::endl;
+        // f << std::left << std::setw(COMMENT_COLUMN) << "    sub rsp, 8" << "; Allocate space for " << uniqueName << std::endl;
 
         if (initializer)
         {
             initializer->emitCode(f);
-            std::string instruction = "    mov [ebp - " + std::to_string(index * 4) + "], eax";
+            std::string instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Initialize " << uniqueName << std::endl;
         }
     }
@@ -750,8 +824,8 @@ struct DereferenceNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        operand->emitCode(f); // Get the pointer calue into eax
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, [eax]" << "; Dereference pointer" << std::endl;
+        operand->emitCode(f); // Get the pointer value into rax
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rax]" << "; Dereference pointer" << std::endl;
     }
 };
 
@@ -771,25 +845,15 @@ struct AddressOfNode : ASTNode
         if (scopes.top().find(Identifier) != scopes.top().end())
         {
             auto [uniqueName, index] = scopes.top()[Identifier];
-            if (currentFunction && index <= currentFunction->parameters.size())
-            {
-                // Parameter
-                std::string instruction = "    lea eax, [ebp + " + std::to_string(8 + (index -1) * 4) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Address of parameter " << uniqueName << std::endl;
-            }
-
-            else
-            {
-                // Local variable
-                std::string instruction = "    lea eax, [ebp - " + std::to_string(index * 4) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Address of local variable " << uniqueName << std::endl;
-            }
+            // All variables (parameters and locals) are now on the stack relative to rbp
+            std::string instruction = "    lea rax, [rbp - " + std::to_string(index * 8) + "]";
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Address of variable " << uniqueName << std::endl;
         }
 
         else
         {
             // Global variable
-            std::string instruction = "    mov eax, " + Identifier;
+            std::string instruction = "    mov rax, " + Identifier;
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Address of global variable " << Identifier << std::endl; 
         }
     }
@@ -817,12 +881,12 @@ struct ArrayDeclarationNode : ASTNode
         std::string uniqueName = generateUniqueName(identifier);
         size_t totalElements = 1;
         for (size_t dim : dimensions) totalElements *= dim; // Total number of elements
-        size_t totalSize = totalElements * 4; // Total size in bytes
+        size_t totalSize = totalElements * 8; // Total size in bytes (64-bit)
 
         size_t baseIndex = scopes.top().size() + 1; // Starting index
         scopes.top()[identifier] = {uniqueName, baseIndex};
 
-        std::string instruction = "    sub esp, " + std::to_string(totalSize);
+        std::string instruction = "    sub rsp, " + std::to_string(totalSize);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Allocate space for array " << uniqueName
           << " (" << totalElements << " elements)" << std::endl;
 
@@ -834,7 +898,7 @@ struct ArrayDeclarationNode : ASTNode
             for (size_t i = 0; i < initializer.size(); ++i)
             {
                 initializer[i]->emitCode(f);
-                instruction = "    mov [ebp - " + std::to_string(baseIndex * 4 + i * 4) + "], eax";
+                instruction = "    mov [rbp - " + std::to_string(baseIndex * 8 + i * 8) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Initialize " << uniqueName << "[" << i << "]" << std::endl;
             }
         }
@@ -865,7 +929,7 @@ struct ArrayAccessNode : ASTNode
             throw std::runtime_error("Array " + identifier + " not found in scope");
 
         auto [uniqueName, baseIndex] = scopes.top()[identifier];
-        size_t baseOffset = baseIndex * 4; // Base offset from ebp in bytes
+        size_t baseOffset = baseIndex * 8; // Base offset from rbp in bytes
 
         // Check if all indices are constants
         bool allConstant = true;
@@ -894,10 +958,10 @@ struct ArrayAccessNode : ASTNode
                 {
                     multiplier *= constantIndices[j]; // For multi-dimensional arrays
                 }
-                totalOffset += constantIndices[i] * multiplier * 4;
+                totalOffset += constantIndices[i] * multiplier * 8;
             }
 
-            std::string instruction = "    mov eax, [ebp - " + std::to_string(totalOffset) + "]";
+            std::string instruction = "    mov rax, [rbp - " + std::to_string(totalOffset) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load " << uniqueName << "[";
             for (size_t i = 0; i < constantIndices.size(); ++i)
                 f << (i > 0 ? "," : "") << constantIndices[i];
@@ -908,38 +972,38 @@ struct ArrayAccessNode : ASTNode
             // Dynamic indices: compute offset at runtime
             for (size_t i = 0; i < indices.size(); ++i)
             {
-                indices[i]->emitCode(f); // Evaluate index into eax
-                f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push index " << i << std::endl;
+                indices[i]->emitCode(f); // Evaluate index into rax
+                f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << "; Push index " << i << std::endl;
 
                 if (i > 0)
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop current index" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop accumulated offset" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    imul eax, ecx" << "; Multiply by previous dimension" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push updated offset" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << "; Pop current index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << "; Pop accumulated offset" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    imul rax, rcx" << "; Multiply by previous dimension" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << "; Push updated offset" << std::endl;
                 }
             }
 
             if (indices.size() > 1)
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop final index" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << "; Pop final index" << std::endl;
                 for (size_t i = 1; i < indices.size(); ++i) {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop next index" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    add eax, ecx" << "; Add to offset" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << "; Pop next index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, rcx" << "; Add to offset" << std::endl;
                 }
             }
             
             else
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop single index" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << "; Pop single index" << std::endl;
             }
 
-            f << std::left << std::setw(COMMENT_COLUMN) << "    shl eax, 2" << "; Scale offset by 4 (sizeof(int))" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov ecx, ebp" << "; Copy ebp to ecx" << std::endl;
-            std::string instruction = "    sub ecx, " + std::to_string(baseOffset);
+            f << std::left << std::setw(COMMENT_COLUMN) << "    shl rax, 3" << "; Scale offset by 8 (sizeof(int64))" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rbp" << "; Copy rbp to rcx" << std::endl;
+            std::string instruction = "    sub rcx, " + std::to_string(baseOffset);
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Adjust to array base" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    sub ecx, eax" << "; Subtract scaled index" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, [ecx]" << "; Load " << uniqueName << "[dynamic]" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << "; Subtract scaled index" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rcx]" << "; Load " << uniqueName << "[dynamic]" << std::endl;
         }
     }
 };
@@ -984,19 +1048,19 @@ struct AssignmentNode : ASTNode
 
         if (dereferenceLevel > 0)
         {
-            // Pointer dereference assignment (unchanged)
+            // Pointer dereference assignment
             if (scopes.top().find(identifier) != scopes.top().end())
             {
                 auto [uniqueName, index] = scopes.top()[identifier];
-                f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Save the value" << std::endl;
-                std::string instruction = "    mov eax, [ebp - " + std::to_string(index * 4) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << "; Save the value" << std::endl;
+                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load pointer " << uniqueName << std::endl;
                 for (int i = 1; i < dereferenceLevel; i++)
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, [eax]" << "; Dereference level " << i << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rax]" << "; Dereference level " << i << std::endl;
                 }
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Restore the value" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [eax], ecx" << "; Store value at final address" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << "; Restore the value" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [rax], rcx" << "; Store value at final address" << std::endl;
             }
             else
             {
@@ -1010,9 +1074,9 @@ struct AssignmentNode : ASTNode
                 throw std::runtime_error("Array " + identifier + " not found in scope");
 
             auto [uniqueName, baseIndex] = scopes.top()[identifier];
-            size_t baseOffset = baseIndex * 4;
+            size_t baseOffset = baseIndex * 8;
 
-            f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Save the value to assign" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << "; Save the value to assign" << std::endl;
 
             // Check if all indices are constants
             bool allConstant = true;
@@ -1041,11 +1105,11 @@ struct AssignmentNode : ASTNode
                     {
                         multiplier *= constantIndices[j];
                     }
-                    totalOffset += constantIndices[i] * multiplier * 4;
+                    totalOffset += constantIndices[i] * multiplier * 8;
                 }
 
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Restore the value" << std::endl;
-                std::string instruction = "    mov [ebp - " + std::to_string(totalOffset) + "], eax";
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << "; Restore the value" << std::endl;
+                std::string instruction = "    mov [rbp - " + std::to_string(totalOffset) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store in " << uniqueName << "[";
                 for (size_t i = 0; i < constantIndices.size(); ++i)
                     f << (i > 0 ? "," : "") << constantIndices[i];
@@ -1057,37 +1121,37 @@ struct AssignmentNode : ASTNode
                 for (size_t i = 0; i < indices.size(); ++i)
                 {
                     indices[i]->emitCode(f);
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push index " << i << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << "; Push index " << i << std::endl;
 
                     if (i > 0)
                     {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop current index" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop accumulated offset" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    imul eax, ecx" << "; Multiply by previous dimension" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push updated offset" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << "; Pop current index" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << "; Pop accumulated offset" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    imul rax, rcx" << "; Multiply by previous dimension" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << "; Push updated offset" << std::endl;
                     }
                 }
 
                 if (indices.size() > 1)
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop final index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << "; Pop final index" << std::endl;
                     for (size_t i = 1; i < indices.size(); ++i)
                     {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop next index" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    add eax, ecx" << "; Add to offset" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << "; Pop next index" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, rcx" << "; Add to offset" << std::endl;
                     }
                 }
                 else
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Pop single index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << "; Pop single index" << std::endl;
                 }
 
-                f << std::left << std::setw(COMMENT_COLUMN) << "    shl eax, 2" << "; Scale offset by 4 (sizeof(int))" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov ecx, ebp" << "; Copy ebp to ecx" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    sub ecx, " << baseOffset << "; Adjust to array base" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    sub ecx, eax" << "; Subtract scaled index" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop eax" << "; Restore the value" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [ecx], eax" << "; Store in " << uniqueName << "[dynamic]" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    shl rax, 3" << "; Scale offset by 8 (sizeof(int64))" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rbp" << "; Copy rbp to rcx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, " << baseOffset << "; Adjust to array base" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << "; Subtract scaled index" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << "; Restore the value" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [rcx], rax" << "; Store in " << uniqueName << "[dynamic]" << std::endl;
             }
         }
         else
@@ -1096,12 +1160,12 @@ struct AssignmentNode : ASTNode
             if (scopes.top().find(identifier) != scopes.top().end())
             {
                 auto [uniqueName, index] = scopes.top()[identifier];
-                std::string instruction = "    mov [ebp - " + std::to_string(index * 4) + "], eax";
+                std::string instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store result in local variable " << uniqueName << std::endl;
             }
             else
             {
-                std::string instruction = "    mov [" + identifier + "], eax";
+                std::string instruction = "    mov [" + identifier + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store result in global variable " << identifier << std::endl;
             }
         }
@@ -1161,7 +1225,7 @@ struct AssignmentNode : ASTNode
         std::string endLabel = functionName + ".endif_" + std::to_string(labelID);
 
         condition->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << "; Compare condition result with 0" << std::endl;
 
         std::string instruction;
         if (!elseIfBlocks.empty())
@@ -1193,7 +1257,7 @@ struct AssignmentNode : ASTNode
         {
             f << std::endl << functionName << ".else_if_" << i << "_" << labelID << ":" << std::endl;
             elseIfBlocks[i].first->emitCode(f);
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << "; Compare condition result with 0" << std::endl;
 
             if (i + 1 < elseIfBlocks.size())
             {
@@ -1260,7 +1324,7 @@ struct WhileLoopNode : ASTNode
         condition->emitCode(f); // Evaluate the condition
         
         std::string instruction = "    je " + functionName + ".loop_end_" + std::to_string(loopEndLabel);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << "; Compare condition result with 0" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end if condition is false" << std::endl;
 
         // Emit the loop body
@@ -1320,7 +1384,7 @@ struct ForLoopNode : ASTNode
         if (condition)
         {
             condition->emitCode(f); // e.g., i < 5
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp eax, 0" << "; Compare condition result with 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << "; Compare condition result with 0" << std::endl;
             std::string instruction = "    je " + fullEndLabel;
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Jump to end if condition is false" << std::endl;
         }
@@ -1369,103 +1433,103 @@ struct BinaryOpNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         left->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    push eax" << "; Push left operand onto stack" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << "; Push left operand onto stack" << std::endl;
         right->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    pop ecx" << "; Pop left operand into ecx" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << "; Pop left operand into rcx" << std::endl;
 
         if (op == "+")
 	    {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    add eax, ecx" << "; Add ecx to eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, rcx" << "; Add rcx to rax" << std::endl;
         }
 
         else if (op == "-")
 	    {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    sub ecx, eax" << "; Subtract eax from ecx" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, ecx" << "; Put in eax value of ecx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << "; Subtract rax from rcx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, rcx" << "; Put in rax value of rcx" << std::endl;
         }
 
         else if (op == "&")
         {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    and eax, ecx" << "; Perform AND on eax by ecx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    and rax, rcx" << "; Perform AND on rax by rcx" << std::endl;
         }
 
         else if (op == "|")
         {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    or eax, ecx" << "; Perform OR on eax by ecx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    or rax, rcx" << "; Perform OR on rax by rcx" << std::endl;
         }
 
         else if (op == "^")
         {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    xor eax, ecx" << "; Perform XOR on eax by ecx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    xor rax, rcx" << "; Perform XOR on rax by rcx" << std::endl;
         }
 
         else if (op == "<<")
         {
-            f << "    ; SWAPPING THE VALUES OF EAX AND ECX" << std::endl;
-            f << "\t\t\t\tpush eax\n\t\t\t\tmov eax, ecx\n\t\t\t\tpop ecx" << std::endl;
-            f << "    ; SWAPPING THE VALUES OF EAX AND ECX" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    shl eax, ecx" << "; Perform SHL on ecx by eax" << std::endl;
+            f << "    ; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
+            f << "\t\t\t\txor rax, rcx\n\t\t\t\txor rcx, rax\n\t\t\t\txor rax, rcx" << std::endl;
+            f << "    ; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    shl rax, cl" << "; Perform SHL on rax by cl" << std::endl;
         }
 
         else if (op == ">>")
         {
-            f << "    ; SWAPPING THE VALUES OF EAX AND ECX" << std::endl;
-            f << "\t\t\t\tpush eax\n\t\t\t\tmov eax, ecx\n\t\t\t\tpop ecx" << std::endl;
-            f << "    ; SWAPPING THE VALUES OF EAX AND ECX" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    shr eax, ecx" << "; Perform SHR on eax by ecx" << std::endl;
+            f << "    ; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
+            f << "\t\t\t\txor rax, rcx\n\t\t\t\txor rcx, rax\n\t\t\t\txor rax, rcx" << std::endl;
+            f << "    ; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    shr rax, cl" << "; Perform SHR on rax by cl" << std::endl;
         }
 
         else if (op == "*")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    imul eax, ecx" << "; Multiply eax by ecx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    imul rax, rcx" << "; Multiply rax by rcx" << std::endl;
         }
 
         else if (op == "/")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cdq" << "; Sign-extend eax into edx" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    idiv ecx" << "; Divide edx:eax by ecx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cqo" << "; Sign-extend rax into rdx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    idiv rcx" << "; Divide rdx:rax by rcx" << std::endl;
         }
 
         else if (op == "==")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp ecx, eax" << "; Compare ecx and eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << "; Compare rcx and rax" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "    sete al" << "; Set al to 1 if equal, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx eax, al" << "; Zero-extend al to eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << "; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == "!=") 
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp ecx, eax" << "; Compare ecx and eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << "; Compare rcx and rax" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "    setne al" << "; Set al to 1 if not equal, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx eax, al" << "; Zero-extend al to eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << "; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == "<")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp ecx, eax" << "; Compare ecx and eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << "; Compare rcx and rax" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "    setl al" << "; Set al to 1 if less, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx eax, al" << "; Zero-extend al to eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << "; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == ">")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp ecx, eax" << "; Compare ecx and eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << "; Compare rcx and rax" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "    setg al" << "; Set al to 1 if greater, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx eax, al" << "; Zero-extend al to eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << "; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == "<=")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp ecx, eax" << "; Compare ecx and eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << "; Compare rcx and rax" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "    setle al" << "; Set al to 1 if less or equal, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx eax, al" << "; Zero-extend al to eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << "; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == ">=")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp ecx, eax" << "; Compare ecx and eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << "; Compare rcx and rax" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "    setge al" << "; Set al to 1 if greater or equal, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx eax, al" << "; Zero-extend al to eax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << "; Zero-extend al to rax" << std::endl;
         }
     }
 };
@@ -1494,36 +1558,36 @@ struct UnaryOpNode : ASTNode
             if (isPrefix)
             {
                 // Prefix: increment/decrement before using the value
-                std::string instruction = "    mov eax, [ebp - " + std::to_string(index * 4) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) <<  instruction << "; Load " << uniqueName << " into eax" << std::endl;
+                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) <<  instruction << "; Load " << uniqueName << " into rax" << std::endl;
                 if (op == "++")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc eax" << "; Increment" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << "; Increment" << std::endl;
                 }
                 else if (op == "--")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec eax" << "; Decrement" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << "; Decrement" << std::endl;
                 }
-                instruction = "    mov [ebp - " + std::to_string(index * 4) + "], eax";
+                instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store result back in " << uniqueName << std::endl;
             }
             else
             {
                 // Postfix: use the value, then increment/decrement
-                std::string instruction = "    mov eax, [ebp - " + std::to_string(index * 4) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load " << uniqueName << " into eax" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov ecx, eax" << "; Save original value in ecx" << std::endl;
+                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load " << uniqueName << " into rax" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rax" << "; Save original value in rcx" << std::endl;
                 if (op == "++")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc eax" << "; Increment" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << "; Increment" << std::endl;
                 }
                 else if (op == "--")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec eax" << "; Decrement" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << "; Decrement" << std::endl;
                 }
-                instruction = "    mov [ebp - " + std::to_string(index * 4) + "], eax";
+                instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Store result back in " << uniqueName << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, ecx" << "; Restore original value for postfix" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, rcx" << "; Restore original value for postfix" << std::endl;
             }
         }
         else
@@ -1532,32 +1596,32 @@ struct UnaryOpNode : ASTNode
             if (isPrefix)
             {
                 // Prefix: increment/decrement before using the value
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, [" << name << "]" << "; Load " << name << " into eax" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << name << "]" << "; Load " << name << " into rax" << std::endl;
                 if (op == "++")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc eax" << "; Increment" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << "; Increment" << std::endl;
                 }
                 else if (op == "--")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec eax" << "; Decrement" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << "; Decrement" << std::endl;
                 }
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << name << "], eax" << "; Store result back in " << name << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << name << "], rax" << "; Store result back in " << name << std::endl;
             }
             else
             {
                 // Postfix: use the value, then increment/decrement
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, [" << name << "]" << "; Load " << name << " into eax" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov ecx, eax" << "; Save original value in ecx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << name << "]" << "; Load " << name << " into rax" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rax" << "; Save original value in rcx" << std::endl;
                 if (op == "++")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc eax" << "; Increment" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << "; Increment" << std::endl;
                 }
                 else if (op == "--")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec eax" << "; Decrement" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << "; Decrement" << std::endl;
                 }
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << name << "], eax" << "; Store result back in " << name << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov eax, ecx" << "; Restore original value for postfix" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << name << "], rax" << "; Store result back in " << name << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, rcx" << "; Restore original value for postfix" << std::endl;
             }
         }
     }
@@ -1584,8 +1648,8 @@ struct NumberNode : ASTNode
     void emitData(std::ofstream& f) const override {}
     void emitCode(std::ofstream& f) const override
     {
-        std::string instruction = "    mov eax, " + std::to_string(value);
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load constant " << value << " into eax" << std::endl;
+        std::string instruction = "    mov rax, " + std::to_string(value);
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load constant " << value << " into rax" << std::endl;
     }
 
     bool isConstant() const override { return true; }
@@ -1617,8 +1681,8 @@ struct CharLiteralNode : ASTNode
             case '\0':  ascii_value = 0;  the_value = "\\0";  break;
             default:    ascii_value = (static_cast<int>(value));
         }
-        std::string instruction = "    mov eax, " + std::to_string(ascii_value);
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load char literal '" << the_value << "' into eax" << std::endl;
+        std::string instruction = "    mov rax, " + std::to_string(ascii_value);
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load char literal '" << the_value << "' into rax" << std::endl;
     }
 };
 
@@ -1668,8 +1732,8 @@ struct StringLiteralNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        std::string instruction = "    mov eax, " + label;
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load address of string '" << updatedValue << "' into eax" << std::endl; 
+        std::string instruction = "    lea rax, [" + label + "]";
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load address of string '" << updatedValue << "' into rax" << std::endl; 
     }
 };
 
@@ -1705,25 +1769,25 @@ struct IdentifierNode : ASTNode
         {
             auto [uniqueName, index] = scopes.top()[name];
 
-            // Check if the variable is a parameter
-            if (currentFunction && index <= currentFunction->parameters.size())
+            // Check if this is a stack parameter (index >= 1000)
+            if (index >= 1000)
             {
-                // Parameter: access [ebp + 8 + (index - 1) * 4]
-                std::string instruction = "    mov eax, [ebp + " + std::to_string(8 + (index - 1) * 4) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load parameter " << uniqueName << std::endl;
+                // Stack parameters: accessed with positive offset from rbp
+                size_t offset = index - 1000;
+                std::string instruction = "    mov rax, [rbp + " + std::to_string(offset + 16) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load stack parameter " << uniqueName << std::endl;
             }
-
             else
             {
-                // Local variable: acess [ebp - index * 4]
-                std::string instruction = "    mov eax, [ebp - " + std::to_string(index * 4) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load local variable " << uniqueName << std::endl;
+                // Regular local variables and register parameters: accessed with negative offset from rbp
+                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load variable " << uniqueName << std::endl;
             }
         }
         else
         {
             // The variable is global (in the .data section)
-            std::string instruction = "    mov eax, [" + name + "]";
+            std::string instruction = "    mov rax, [" + name + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << "; Load global variable " << name << std::endl;
         }
     }
@@ -2622,15 +2686,16 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
     }
     
     // Emit data section (for global variables)
-    f << "section .data" << std::endl;
+    f << "format ELF64" << std::endl << std::endl;
+    f << "section '.data' writable" << std::endl << std::endl;
     for (const auto& node : ast)
     {
         node->emitData(f);
     }
 
     // Emit text section
-    f << "\nsection .text" << std::endl;
-    f << "\tglobal main" << std::endl;
+    f << "\nsection '.text' executable" << std::endl << std::endl;
+    f << "public main" << std::endl << std::endl;
     
     for (const auto& node : ast)
     {

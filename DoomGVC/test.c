@@ -1,9 +1,9 @@
 extern printf;
+
 int main()
 {
-    int x = 1;
-    x = x >> 5;
-
-    printf("%d\n", x);
+    int x = 5;
+    int* px = &x;
+    printf("px = %p\n", px);
     return 0;
 }

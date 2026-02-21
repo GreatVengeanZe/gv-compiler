@@ -1,5 +1,6 @@
 extern fopen;
 extern fprintf;
+extern fclose;
 
 int main()
 {
