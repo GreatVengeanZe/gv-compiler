@@ -264,6 +264,34 @@ public:
         return '\0';
     }
 
+    // parse a C-style escape sequence, assuming '\\' was just consumed
+    char parseEscapeSequence(int errLine, int errCol)
+    {
+        char c = advance();
+        switch (c)
+        {
+            case 'a': return '\a'; // Bell (0x07)
+            case 'b': return '\b'; // Backspace (0x08)
+            case 'f': return '\f'; // Formfeed (0x0C)
+            case 'n': return '\n'; // Newline (0x0A)
+            case 'r': return '\r'; // Carriage return (0x0D)
+            case 't': return '\t'; // Horizontal tab (0x09)
+            case 'v': return '\v'; // Vertical tab (0x0B)
+            case '0': return '\0'; // NULL char
+            case '\\': return '\\';
+            case '\'': return '\'';
+            case '"': return '"';
+            case '?': return '\?';
+            // TODO: add octal/hex parsing if desired
+            case '\0': // reached end of input
+                reportError(errLine, errCol, "Incomplete escape sequence");
+                return '\0';
+            default:
+                reportError(errLine, errCol, std::string("Unknown escape sequence \\") + c);
+                return c;
+        }
+    }
+
     void skipWhitespace()
     {
         while (isspace(peek())) advance();
@@ -304,25 +332,11 @@ public:
             std::string str;
             while (peek() != '"' && peek() != '\0')
             {
-                if (peek() == '\\') // Check for escape sequence
+                if (peek() == '\\') // escape sequence
                 {
-                    advance(); // Consume the '\'
-                    char next = peek();
-                    switch (next)
-                    {
-                        case 'n':  str += '\n'; advance(); break; // Newline (0x0A)
-                        case 't':  str += '\t'; advance(); break; // Horizontal Tab (0x09)
-                        case 'r':  str += '\r'; advance(); break; // Carriage return (0x0D)
-                        case 'v':  str += '\v'; advance(); break; // Vertical Tabulation (0x0B)
-                        case '0':  str += '\0'; advance(); break; // NULL character (0x00)
-                        case '\\': str += '\\'; advance(); break; // Literal backslash
-                        case '"':  str += '"';  advance(); break; // Literal quote
-                        default:
-                            reportError(tokenLine, tokenCol, std::string("Unknown escape sequence \\") + next);
-                            // skip the bad escape and continue
-                            advance();
-                            break;
-                    }
+                    advance(); // consume '\'
+                    char esc = parseEscapeSequence(tokenLine, tokenCol);
+                    str += esc;
                 }
                 else
                 {
@@ -345,22 +359,8 @@ public:
             char charValue = advance(); // Get the character
             if (charValue == '\\')
             {
-                // advance(); // Consume the backslash
-                charValue = advance(); // Get the character of the escape sequesnce
-                switch (charValue)
-                {
-                    case 'n':  charValue = '\n'; break; // Newline (0x0A)
-                    case 't':  charValue = '\t'; break; // Horizontal Tab (0x09)
-                    case 'r':  charValue = '\r'; break; // Carriage return (0x0D)
-                    case 'v':  charValue = '\v'; break; // Vertical Tabulation (0x0B)
-                    case '0':  charValue = '\0'; break; // NULL character (0x00)
-                    case '\\': charValue = '\\'; break; // Literal backslash
-                    case '\'': charValue = '\''; break; // Literal quote
-                    default:
-                        reportError(tokenLine, tokenCol, std::string("Unknown escape sequence \\") + charValue);
-                        // leave charValue as-is
-                        break;
-                }
+                // parse escape sequence
+                charValue = parseEscapeSequence(tokenLine, tokenCol);
             }
             if (peek() != '\'')
             {

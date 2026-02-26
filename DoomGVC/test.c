@@ -2,12 +2,17 @@ extern printf;
 
 int main()
 {
-    int x = 3;
-    x = ++x + x++;
-    printf("x = %d\n", x); // Should print 9
 
-    x = 9;
-    x = --x - x--;
-    printf("x = %d\n", x); // Should print -1
+    // Test escape sequences
+    printf("Escapes: newline='%c', tab='%c', bell='%c', backspace='%c', formfeed='%c', question='%c'\n",
+           '\n', '\t', '\a', '\b', '\f', '\?');
+
+    // implicit concatenation
+    printf("concatenated "
+           "string\n");
+
+    // show literal backslash and quotes
+    printf("\\\"\'\n");
+
     return 0;
 }
