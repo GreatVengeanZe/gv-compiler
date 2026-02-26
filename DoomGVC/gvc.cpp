@@ -285,6 +285,39 @@ public:
         else if (ch == '/')
 	    {
             advance();
+            // Check for single-line comment (//)
+            if (peek() == '/')
+            {
+                advance(); // Consume the second '/'
+                // Skip until end of line
+                while (peek() != '\n' && peek() != '\0') advance();
+                // Recursively call to get the next token
+                return nextToken();
+            }
+            // Check for multi-line comment (/* */)
+            else if (peek() == '*')
+            {
+                advance(); // Consume the '*'
+                // Skip until we find */
+                while (peek() != '\0')
+                {
+                    if (peek() == '*')
+                    {
+                        advance(); // Consume the '*'
+                        if (peek() == '/')
+                        {
+                            advance(); // Consume the '/'
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        advance();
+                    }
+                }
+                // Recursively call to get the next token
+                return nextToken();
+            }
             return { TOKEN_DIV, "/" };
         }
         
@@ -2687,19 +2720,20 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
     
     // Emit data section (for global variables)
     f << "format ELF64" << std::endl << std::endl;
-    f << "section '.data' writable" << std::endl << std::endl;
-    for (const auto& node : ast)
-    {
-        node->emitData(f);
-    }
 
     // Emit text section
-    f << "\nsection '.text' executable" << std::endl << std::endl;
+    f << "section '.text' executable" << std::endl << std::endl;
     f << "public main" << std::endl << std::endl;
     
     for (const auto& node : ast)
     {
         node->emitCode(f);
+    }
+
+    f << std::endl << "section '.data' writable" << std::endl;
+    for (const auto& node : ast)
+    {
+        node->emitData(f);
     }
 }
  
