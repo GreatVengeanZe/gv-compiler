@@ -21,11 +21,59 @@
 // Global stack to track scopes
 std::stack<std::map<std::string, std::pair<std::string, size_t>>> scopes;
 
+// Structure to hold deferred postfix operations
+struct DeferredPostfixOp {
+    std::string op;        // "++" or "--"
+    std::string varName;   // Variable to modify
+};
+
+// Global vector to track postfix operations that need to be deferred until end of statement
+std::vector<DeferredPostfixOp> deferredPostfixOps;
+
 // Function to generate a unique name for a variable
 std::string generateUniqueName(const std::string& name)
 {
     static size_t counter = 0;
     return name + "_" + std::to_string(counter++);
+}
+
+// Function to emit code for applying deferred postfix operations
+void emitDeferredPostfixOps(std::ofstream& f)
+{
+    for (const auto& deferredOp : deferredPostfixOps)
+    {
+        if (scopes.top().find(deferredOp.varName) != scopes.top().end())
+        {
+            auto [uniqueName, index] = scopes.top()[deferredOp.varName];
+            std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " for deferred postfix" << std::endl;
+            if (deferredOp.op == "++")
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Deferred increment" << std::endl;
+            }
+            else if (deferredOp.op == "--")
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << ";; Deferred decrement" << std::endl;
+            }
+            instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store deferred result in " << uniqueName << std::endl;
+        }
+        else
+        {
+            // Global variable
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
+            if (deferredOp.op == "++")
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Deferred increment" << std::endl;
+            }
+            else if (deferredOp.op == "--")
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << ";; Deferred decrement" << std::endl;
+            }
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << deferredOp.varName << "], rax" << ";; Store deferred result in " << deferredOp.varName << std::endl;
+        }
+    }
+    deferredPostfixOps.clear();
 }
 
 /*********************************************************
@@ -462,6 +510,26 @@ struct ASTNode
     // Methods for constant checking
     virtual bool isConstant() const { return false; }
     virtual int getConstantValue() const { throw std::runtime_error("Not a constant node"); }
+};
+
+// Wrapper node to defer postfix operations until end of statement
+struct StatementWithDeferredOpsNode : ASTNode
+{
+    std::unique_ptr<ASTNode> statement;
+
+    StatementWithDeferredOpsNode(std::unique_ptr<ASTNode> stmt)
+        : statement(std::move(stmt)) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        statement->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        statement->emitCode(f);
+        emitDeferredPostfixOps(f);
+    }
 };
 
 static size_t labelCounter = 0; // Global counter for generating unique labels
@@ -1202,6 +1270,8 @@ struct AssignmentNode : ASTNode
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in global variable " << identifier << std::endl;
             }
         }
+        // Apply all deferred postfix operations at the end of assignment
+        emitDeferredPostfixOps(f);
     }
 };
 
@@ -1584,15 +1654,14 @@ struct UnaryOpNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        // Look up the variable in the current scope
-        if (scopes.top().find(name) != scopes.top().end())
+        if (isPrefix)
         {
-            auto [uniqueName, index] = scopes.top()[name];
-            if (isPrefix)
+            // Prefix: execute immediately - increment/decrement, then return new value
+            if (scopes.top().find(name) != scopes.top().end())
             {
-                // Prefix: increment/decrement before using the value
+                auto [uniqueName, index] = scopes.top()[name];
                 std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) <<  instruction << ";; Load " << uniqueName << " into rax" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax" << std::endl;
                 if (op == "++")
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Increment" << std::endl;
@@ -1606,10 +1675,8 @@ struct UnaryOpNode : ASTNode
             }
             else
             {
-                // Postfix: use the value, then increment/decrement
-                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rax" << ";; Save original value in rcx" << std::endl;
+                // Global variable
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
                 if (op == "++")
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Increment" << std::endl;
@@ -1618,43 +1685,26 @@ struct UnaryOpNode : ASTNode
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << ";; Decrement" << std::endl;
                 }
-                instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result back in " << uniqueName << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, rcx" << ";; Restore original value for postfix" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << name << "], rax" << ";; Store result back in " << name << std::endl;
             }
         }
         else
         {
-            // The variable is global (in the .data section)
-            if (isPrefix)
+            // Postfix: return old value NOW, but defer the actual increment/decrement
+            if (scopes.top().find(name) != scopes.top().end())
             {
-                // Prefix: increment/decrement before using the value
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
-                if (op == "++")
-                {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Increment" << std::endl;
-                }
-                else if (op == "--")
-                {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << ";; Decrement" << std::endl;
-                }
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << name << "], rax" << ";; Store result back in " << name << std::endl;
+                auto [uniqueName, index] = scopes.top()[name];
+                // Load the current value and save it
+                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax (postfix value)" << std::endl;
+                // Don't apply the operation yet - defer it for later
+                deferredPostfixOps.push_back({op, name});
             }
             else
             {
-                // Postfix: use the value, then increment/decrement
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rax" << ";; Save original value in rcx" << std::endl;
-                if (op == "++")
-                {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Increment" << std::endl;
-                }
-                else if (op == "--")
-                {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << ";; Decrement" << std::endl;
-                }
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << name << "], rax" << ";; Store result back in " << name << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, rcx" << ";; Restore original value for postfix" << std::endl;
+                // Global variable
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
+                deferredPostfixOps.push_back({op, name});
             }
         }
     }
@@ -2225,7 +2275,10 @@ class Parser
                     {
                         eat(TOKEN_SEMICOLON); // Consume the semicolon
                     }
-                    return std::make_unique<UnaryOpNode>(opToken.value, identifier, false); // false for postfix
+                    // Wrap in StatementWithDeferredOpsNode to apply deferred postfix ops
+                    return std::make_unique<StatementWithDeferredOpsNode>(
+                        std::make_unique<UnaryOpNode>(opToken.value, identifier, false) // false for postfix
+                    );
                 }
                 else
                 {
@@ -2255,7 +2308,10 @@ class Parser
                 {
                     eat(TOKEN_SEMICOLON); // Consume the semicolon
                 }
-                return std::make_unique<UnaryOpNode>(opToken.value, identifier, true); // true for prefix
+                // Wrap in StatementWithDeferredOpsNode to apply deferred postfix ops if any
+                return std::make_unique<StatementWithDeferredOpsNode>(
+                    std::make_unique<UnaryOpNode>(opToken.value, identifier, true) // true for prefix
+                );
             }
             else
             {
