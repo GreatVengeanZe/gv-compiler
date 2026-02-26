@@ -2,11 +2,13 @@ extern printf;
 
 int main()
 {
-    int x = 5; // Variable
-    int* px = &x; // POinter to variable
-    printf("px = %p\n", px); // Print the pointer
+    // adjacent string literals should be concatenated by the compiler
+    char* str = "Hello, World!\n" "foo, bar\n";
 
-    /* A block of
-        comment */
+    // examples with comments and line breaks between literals
+    char* str2 = "first part " /* inline comment */ "second part\n";
+
+    printf("%s", str);
+    printf("%s", str2);
     return 0;
 }
