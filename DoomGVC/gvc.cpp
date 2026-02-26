@@ -30,6 +30,126 @@ struct DeferredPostfixOp {
 // Global vector to track postfix operations that need to be deferred until end of statement
 std::vector<DeferredPostfixOp> deferredPostfixOps;
 
+// Global name of source file for error messages
+static std::string sourceFileName = "";
+
+// Flag indicates whether any error has been reported (lexical or semantic)
+static bool hadError = false;
+
+// Structure that holds a single compile error
+struct CompileError {
+    std::string file;
+    int line;
+    int col;
+    std::string message;
+};
+
+// Collected errors during lexing/parsing
+static std::vector<CompileError> compileErrors;
+
+enum TokenType
+{
+    TOKEN_INT,
+    TOKEN_CHAR,
+    TOKEN_VOID,
+    TOKEN_EXTERN,
+    TOKEN_IDENTIFIER,
+    TOKEN_NUMBER,
+    TOKEN_CHAR_LITERAL,
+    TOKEN_STRING_LITERAL,
+    TOKEN_SEMICOLON,
+    TOKEN_ASSIGN,
+    TOKEN_ADD,
+    TOKEN_INCREMENT,
+    TOKEN_SUB,
+    TOKEN_DECREMENT,TOKEN_MUL,
+    TOKEN_DIV,
+    TOKEN_AND,
+    TOKEN_LPAREN,
+    TOKEN_RPAREN,
+    TOKEN_LBRACE,
+    TOKEN_RBRACE,
+    TOKEN_LBRACKET,
+    TOKEN_RBRACKET,
+    TOKEN_IF,
+    TOKEN_ELSE,
+    TOKEN_WHILE,
+    TOKEN_FOR,
+    TOKEN_EQ,
+    TOKEN_NE,
+    TOKEN_LT,
+    TOKEN_GT,
+    TOKEN_LE,
+    TOKEN_GE,
+    TOKEN_LOGICAL_AND,
+    TOKEN_LOGICAL_OR,
+    TOKEN_OR,
+    TOKEN_XOR,
+    TOKEN_SHL,
+    TOKEN_SHR,
+    TOKEN_RETURN,
+    TOKEN_COMMA,
+    TOKEN_EOF
+};
+
+// Convert a token type into a human-readable string (for error messages)
+std::string tokenTypeToString(TokenType t)
+{
+    switch (t)
+    {
+        case TOKEN_INT: return "int";
+        case TOKEN_CHAR: return "char";
+        case TOKEN_VOID: return "void";
+        case TOKEN_EXTERN: return "extern";
+        case TOKEN_IDENTIFIER: return "identifier";
+        case TOKEN_NUMBER: return "number";
+        case TOKEN_CHAR_LITERAL: return "character literal";
+        case TOKEN_STRING_LITERAL: return "string literal";
+        case TOKEN_SEMICOLON: return ";";
+        case TOKEN_ASSIGN: return "=";
+        case TOKEN_ADD: return "+";
+        case TOKEN_INCREMENT: return "++";
+        case TOKEN_SUB: return "-";
+        case TOKEN_DECREMENT: return "--";
+        case TOKEN_MUL: return "*";
+        case TOKEN_DIV: return "/";
+        case TOKEN_AND: return "&";
+        case TOKEN_LPAREN: return "(";
+        case TOKEN_RPAREN: return ")";
+        case TOKEN_LBRACE: return "{";
+        case TOKEN_RBRACE: return "}";
+        case TOKEN_LBRACKET: return "[";
+        case TOKEN_RBRACKET: return "]";
+        case TOKEN_IF: return "if";
+        case TOKEN_ELSE: return "else";
+        case TOKEN_WHILE: return "while";
+        case TOKEN_FOR: return "for";
+        case TOKEN_EQ: return "==";
+        case TOKEN_NE: return "!=";
+        case TOKEN_LT: return "<";
+        case TOKEN_GT: return ">";
+        case TOKEN_LE: return "<=";
+        case TOKEN_GE: return ">=";
+        case TOKEN_LOGICAL_AND: return "&&";
+        case TOKEN_LOGICAL_OR: return "||";
+        case TOKEN_OR: return "|";
+        case TOKEN_XOR: return "^";
+        case TOKEN_SHL: return "<<";
+        case TOKEN_SHR: return ">>";
+        case TOKEN_RETURN: return "return";
+        case TOKEN_COMMA: return ",";
+        case TOKEN_EOF: return "EOF";
+        default: return "<unknown>";
+    }
+}
+
+// Report an error (also prints it immediately)
+void reportError(int line, int col, const std::string& msg)
+{
+    compileErrors.push_back({sourceFileName, line, col, msg});
+    std::cerr << sourceFileName << ":" << line << ":" << col << ": " << msg << std::endl;
+}
+
 // Function to generate a unique name for a variable
 std::string generateUniqueName(const std::string& name)
 {
@@ -87,56 +207,17 @@ void emitDeferredPostfixOps(std::ofstream& f)
  *********************************************************/
 
 
-enum TokenType
-{
-    TOKEN_INT,
-    TOKEN_CHAR,
-    TOKEN_VOID,
-    TOKEN_EXTERN,
-    TOKEN_IDENTIFIER,
-    TOKEN_NUMBER,
-    TOKEN_CHAR_LITERAL,
-    TOKEN_STRING_LITERAL,
-    TOKEN_SEMICOLON,
-    TOKEN_ASSIGN,
-    TOKEN_ADD,
-    TOKEN_INCREMENT,
-    TOKEN_SUB,
-    TOKEN_DECREMENT,TOKEN_MUL,
-    TOKEN_DIV,
-    TOKEN_AND,
-    TOKEN_LPAREN,
-    TOKEN_RPAREN,
-    TOKEN_LBRACE,
-    TOKEN_RBRACE,
-    TOKEN_LBRACKET,
-    TOKEN_RBRACKET,
-    TOKEN_IF,
-    TOKEN_ELSE,
-    TOKEN_WHILE,
-    TOKEN_FOR,
-    TOKEN_EQ,
-    TOKEN_NE,
-    TOKEN_LT,
-    TOKEN_GT,
-    TOKEN_LE,
-    TOKEN_GE,
-    TOKEN_LOGICAL_AND,
-    TOKEN_LOGICAL_OR,
-    TOKEN_OR,
-    TOKEN_XOR,
-    TOKEN_SHL,
-    TOKEN_SHR,
-    TOKEN_RETURN,
-    TOKEN_COMMA,
-    TOKEN_EOF
-};
-
 // Token structure
 struct Token
 {
     TokenType type;
     std::string value;
+    int line;
+    int col;
+
+    Token() : type(TOKEN_EOF), value(""), line(0), col(0) {}
+    Token(TokenType t, const std::string& v, int l, int c)
+        : type(t), value(v), line(l), col(c) {}
 };
 
 
@@ -156,6 +237,8 @@ class Lexer
 public:
     std::string source;
     size_t pos = 0;
+    int line = 1;   // current line number (1-based)
+    int col = 1;    // current column number (1-based)
 
     char peek()
     {
@@ -164,7 +247,21 @@ public:
 
     char advance()
     {
-        return pos < source.size() ? source[pos++] : '\0';
+        if (pos < source.size())
+        {
+            char c = source[pos++];
+            if (c == '\n')
+            {
+                line++;
+                col = 1;
+            }
+            else
+            {
+                col++;
+            }
+            return c;
+        }
+        return '\0';
     }
 
     void skipWhitespace()
@@ -197,6 +294,8 @@ public:
     Token nextToken()
     {
         skipWhitespace();
+        int tokenLine = line;
+        int tokenCol = col;
         char ch = peek();
 
         if (ch == '"')
@@ -218,7 +317,11 @@ public:
                         case '0':  str += '\0'; advance(); break; // NULL character (0x00)
                         case '\\': str += '\\'; advance(); break; // Literal backslash
                         case '"':  str += '"';  advance(); break; // Literal quote
-                        default: throw std::runtime_error("Unknown escape sequence \\" + std::string(1, next));
+                        default:
+                            reportError(tokenLine, tokenCol, std::string("Unknown escape sequence \\") + next);
+                            // skip the bad escape and continue
+                            advance();
+                            break;
                     }
                 }
                 else
@@ -228,10 +331,12 @@ public:
             }
             if (peek() != '"')
             {
-                throw std::runtime_error("Expected closing quote for string literal");
+                reportError(tokenLine, tokenCol, "Expected closing quote for string literal");
+                // attempt to recover by returning what we have so far
+                return Token{ TOKEN_STRING_LITERAL, str, tokenLine, tokenCol };
             }
             advance(); // Consume the closing quote
-            return { TOKEN_STRING_LITERAL, str };
+            return Token{ TOKEN_STRING_LITERAL, str, tokenLine, tokenCol };
         }
 
         if (ch == '\'')                 // Handle char literals
@@ -251,44 +356,49 @@ public:
                     case '0':  charValue = '\0'; break; // NULL character (0x00)
                     case '\\': charValue = '\\'; break; // Literal backslash
                     case '\'': charValue = '\''; break; // Literal quote
-                    default: throw std::runtime_error("Unknown escape sequence \\" + std::string(1, charValue));
+                    default:
+                        reportError(tokenLine, tokenCol, std::string("Unknown escape sequence \\") + charValue);
+                        // leave charValue as-is
+                        break;
                 }
             }
             if (peek() != '\'')
             {
-                throw std::runtime_error("Expected closing quote for char literal");
+                reportError(tokenLine, tokenCol, "Expected closing quote for char literal");
+                // recover by returning char literal with whatever we got
+                return Token{ TOKEN_CHAR_LITERAL, std::string(1, charValue), tokenLine, tokenCol };
             }
             advance();                  // Consume the closing quote
-            return { TOKEN_CHAR_LITERAL, std::string(1, charValue) };
+            return Token{ TOKEN_CHAR_LITERAL, std::string(1, charValue), tokenLine, tokenCol };
         }
 
         if (isdigit(ch))
 	    {
             std::string num;
             while (isdigit(peek())) num += advance();
-            return { TOKEN_NUMBER, num };
+            return Token{ TOKEN_NUMBER, num, tokenLine, tokenCol };
         }
 
         else if (isalpha(ch) || ch == '_')
 	    {
             std::string ident;
             while (isalnum(peek()) || peek() == '_') ident += advance();
-            if (ident == "if")      return { TOKEN_IF    , ident };
-            if (ident == "int")     return { TOKEN_INT   , ident };
-            if (ident == "for")     return { TOKEN_FOR   , ident };
-            if (ident == "char")    return { TOKEN_CHAR  , ident };
-            if (ident == "void")    return { TOKEN_VOID  , ident };
-            if (ident == "else")    return { TOKEN_ELSE  , ident };
-            if (ident == "while")   return { TOKEN_WHILE , ident };
-            if (ident == "return")  return { TOKEN_RETURN, ident };
-            if (ident == "extern")  return { TOKEN_EXTERN, ident };
-            return { TOKEN_IDENTIFIER, ident };
+            if (ident == "if")      return Token{ TOKEN_IF    , ident, tokenLine, tokenCol };
+            if (ident == "int")     return Token{ TOKEN_INT   , ident, tokenLine, tokenCol };
+            if (ident == "for")     return Token{ TOKEN_FOR   , ident, tokenLine, tokenCol };
+            if (ident == "char")    return Token{ TOKEN_CHAR  , ident, tokenLine, tokenCol };
+            if (ident == "void")    return Token{ TOKEN_VOID  , ident, tokenLine, tokenCol };
+            if (ident == "else")    return Token{ TOKEN_ELSE  , ident, tokenLine, tokenCol };
+            if (ident == "while")   return Token{ TOKEN_WHILE , ident, tokenLine, tokenCol };
+            if (ident == "return")  return Token{ TOKEN_RETURN, ident, tokenLine, tokenCol };
+            if (ident == "extern")  return Token{ TOKEN_EXTERN, ident, tokenLine, tokenCol };
+            return Token{ TOKEN_IDENTIFIER, ident, tokenLine, tokenCol };
         }
 
         else if (ch == ';')
 	    {
             advance();
-            return { TOKEN_SEMICOLON, ";" };
+            return Token{ TOKEN_SEMICOLON, ";", tokenLine, tokenCol };
         }
 
         else if (ch == '=')
@@ -297,9 +407,9 @@ public:
             if (peek() == '=')
 	        {
                 advance();
-                return { TOKEN_EQ, "==" };
+                return Token{ TOKEN_EQ, "==", tokenLine, tokenCol };
             }
-            return { TOKEN_ASSIGN, "=" };
+            return Token{ TOKEN_ASSIGN, "=", tokenLine, tokenCol };
         }
 
         else if (ch == '+')
@@ -308,9 +418,9 @@ public:
             if (peek() == '+')
             {
                 advance();
-                return { TOKEN_INCREMENT, "++" };
+                return Token{ TOKEN_INCREMENT, "++", tokenLine, tokenCol };
             }
-            return { TOKEN_ADD, "+" };
+            return Token{ TOKEN_ADD, "+", tokenLine, tokenCol };
         }
 
         else if (ch == '-')
@@ -319,15 +429,15 @@ public:
             if (peek() == '-')
             {
                 advance();
-                return { TOKEN_DECREMENT, "--" };
+                return Token{ TOKEN_DECREMENT, "--", tokenLine, tokenCol };
             }
-            return { TOKEN_SUB, "-" };
+            return Token{ TOKEN_SUB, "-", tokenLine, tokenCol };
         }
 
         else if (ch == '*')
 	    {
             advance();
-            return { TOKEN_MUL, "*" };
+            return Token{ TOKEN_MUL, "*", tokenLine, tokenCol };
         }
 
         else if (ch == '/')
@@ -366,55 +476,55 @@ public:
                 // Recursively call to get the next token
                 return nextToken();
             }
-            return { TOKEN_DIV, "/" };
+            return Token{ TOKEN_DIV, "/", tokenLine, tokenCol };
         }
         
         else if (ch == '^')
         {
             advance();
-            return { TOKEN_XOR, "^" };
+            return Token{ TOKEN_XOR, "^", tokenLine, tokenCol };
         }
 
         else if (ch == '(')
 	    {
             advance();
-            return { TOKEN_LPAREN, "(" };
+            return Token{ TOKEN_LPAREN, "(", tokenLine, tokenCol };
         }
 
         else if (ch == ')')
 	    {
             advance();
-            return { TOKEN_RPAREN, ")" };
+            return Token{ TOKEN_RPAREN, ")", tokenLine, tokenCol };
         }
 
         else if (ch == ',')
         {
             advance();
-            return {TOKEN_COMMA, ","};
+            return Token{TOKEN_COMMA, ",", tokenLine, tokenCol};
         }
 
         else if (ch == '{')
 	    {
             advance();
-            return { TOKEN_LBRACE, "{" };
+            return Token{ TOKEN_LBRACE, "{", tokenLine, tokenCol };
         }
 
         else if (ch == '}')
 	    {
             advance();
-            return { TOKEN_RBRACE, "}" };
+            return Token{ TOKEN_RBRACE, "}", tokenLine, tokenCol };
         }
 
         else if (ch == '[')
         {
             advance();
-            return { TOKEN_LBRACKET, "[" };
+            return Token{ TOKEN_LBRACKET, "[", tokenLine, tokenCol };
         }
 
         else if (ch == ']')
         {
             advance();
-            return { TOKEN_RBRACKET, "]" };
+            return Token{ TOKEN_RBRACKET, "]", tokenLine, tokenCol };
         }
 
         else if (ch == '<')
@@ -423,14 +533,14 @@ public:
             if (peek() == '=')
 	        {
                 advance();
-                return { TOKEN_LE, "<=" };
+                return Token{ TOKEN_LE, "<=", tokenLine, tokenCol };
             }
             else if (peek() == '<')
             {
                 advance();
-                return { TOKEN_SHL, "<<"};
+                return Token{ TOKEN_SHL, "<<", tokenLine, tokenCol };
             }
-            return { TOKEN_LT, "<" };
+            return Token{ TOKEN_LT, "<", tokenLine, tokenCol };
         }
 
         else if (ch == '>')
@@ -439,14 +549,14 @@ public:
             if (peek() == '=')
 	        {
                 advance();
-                return { TOKEN_GE, ">=" };
+                return Token{ TOKEN_GE, ">=", tokenLine, tokenCol };
             }
             else if (peek() == '>')
             {
                 advance();
-                return { TOKEN_SHR, ">>"};
+                return Token{ TOKEN_SHR, ">>", tokenLine, tokenCol };
             }
-            return { TOKEN_GT, ">" };
+            return Token{ TOKEN_GT, ">", tokenLine, tokenCol };
         }
 
         else if (ch == '!')
@@ -455,7 +565,7 @@ public:
             if (peek() == '=')
 	        {
                 advance();
-                return { TOKEN_NE, "!=" };
+                return Token{ TOKEN_NE, "!=", tokenLine, tokenCol };
             }
         }
 
@@ -465,9 +575,9 @@ public:
             if (peek() == '&')
             {
                 advance();
-                return { TOKEN_LOGICAL_AND, "&&"};
+                return Token{ TOKEN_LOGICAL_AND, "&&", tokenLine, tokenCol };
             }
-            return { TOKEN_AND, "&" };
+            return Token{ TOKEN_AND, "&", tokenLine, tokenCol };
         }
 
         else if (ch == '|')
@@ -476,16 +586,18 @@ public:
             if (peek() == '|')
             {
                 advance();
-                return { TOKEN_LOGICAL_OR, "||" };
+                return Token{ TOKEN_LOGICAL_OR, "||", tokenLine, tokenCol };
             }
-            return { TOKEN_OR, "|" };
+            return Token{ TOKEN_OR, "|", tokenLine, tokenCol };
         }
 
         else if (ch == '\0')
 	    {
-            return { TOKEN_EOF, "" };
+            return Token{ TOKEN_EOF, "", tokenLine, tokenCol };
         }
-        throw std::runtime_error("Unexpected character");
+        reportError(tokenLine, tokenCol, "Unexpected character");
+        advance(); // skip it
+        return nextToken();
     }
 };
 
@@ -509,7 +621,7 @@ struct ASTNode
 
     // Methods for constant checking
     virtual bool isConstant() const { return false; }
-    virtual int getConstantValue() const { throw std::runtime_error("Not a constant node"); }
+    virtual int getConstantValue() const { reportError(0, 0, "Not a constant node"); return 0; }
 };
 
 // Wrapper node to defer postfix operations until end of statement
@@ -842,29 +954,15 @@ struct ReturnNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        if (currentFunction->returnType != TOKEN_VOID)
+        if (expression)
         {
-            // Non-void function: evaluate the expression and return its value
-            if (!expression)
-            {
-                throw std::runtime_error("Non-void function '" + currentFunction->name + "' must return a value");
-            }
             expression->emitCode(f);
-            // Emit function epilogue for all returns
-            f << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rsp, rbp " << ";; Restore stack pointer" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    pop rbp " << ";; Restore base pointer" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    ret " << ";; Return to caller" << std::endl;
         }
-
-        else
-        {
-            // Void function: no return value
-            if (expression)
-            {
-                throw std::runtime_error("void function cannot return a value");
-            }
-        }
+        // Emit function epilogue for all returns
+        f << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rsp, rbp " << ";; Restore stack pointer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rbp " << ";; Restore base pointer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "    ret " << ";; Return to caller" << std::endl;
     }
 };
 
@@ -994,7 +1092,10 @@ struct ArrayDeclarationNode : ASTNode
         if (!initializer.empty())
         {
             if (initializer.size() > totalElements)
-                throw std::runtime_error("Too many initializers for array " + identifier);
+            {
+                reportError(0, 0, "Too many initializers for array " + identifier);
+                hadError = true;
+            }
 
             for (size_t i = 0; i < initializer.size(); ++i)
             {
@@ -1027,7 +1128,10 @@ struct ArrayAccessNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         if (scopes.top().find(identifier) == scopes.top().end())
-            throw std::runtime_error("Array " + identifier + " not found in scope");
+        {
+            reportError(0, 0, "Array " + identifier + " not found in scope");
+            hadError = true;
+        }
 
         auto [uniqueName, baseIndex] = scopes.top()[identifier];
         size_t baseOffset = baseIndex * 8; // Base offset from rbp in bytes
@@ -1165,15 +1269,18 @@ struct AssignmentNode : ASTNode
             }
             else
             {
-                throw std::runtime_error("Dereference assignment to undefined variable " + identifier);
+                reportError(0, 0, "Dereference assignment to undefined variable " + identifier);
+                hadError = true;
             }
         }
         else if (!indices.empty())
         {
             // Array element assignment
             if (scopes.top().find(identifier) == scopes.top().end())
-                throw std::runtime_error("Array " + identifier + " not found in scope");
-
+            {
+                reportError(0, 0, "Array " + identifier + " not found in scope");
+                hadError = true;
+            }
             auto [uniqueName, baseIndex] = scopes.top()[identifier];
             size_t baseOffset = baseIndex * 8;
 
@@ -1896,16 +2003,18 @@ class Parser
     void eat(TokenType type)
     {
         if (currentToken.type == type)
-	    {
+        {
             currentToken = lexer.nextToken();
         }
-
         else
-	    {
-            throw std::runtime_error("Unexpected token " + currentToken.value + " " + std::to_string(type));
+        {
+            reportError(currentToken.line, currentToken.col,
+                        std::string("Expected '") + tokenTypeToString(type) + "' but found '" + currentToken.value + "'");
+            hadError = true;
+            // simple recovery: skip offending token
+            currentToken = lexer.nextToken();
         }
     }
-
 
     /********************************************************************
      *      ______        _____  _______  ____   _____     __  __       *
@@ -1949,7 +2058,8 @@ class Parser
             eat(TOKEN_AND);
             if (currentToken.type != TOKEN_IDENTIFIER)
             {
-                throw std::runtime_error("Expected Identifier after &");
+                reportError(currentToken.line, currentToken.col, "Expected Identifier after &");
+                std::exit(1);
             }
             std::string Identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
@@ -2020,7 +2130,10 @@ class Parser
             eat(TOKEN_RPAREN);
             return node;
         }
-        throw std::runtime_error("Unexpected token in factor " + token.value + " " + lexer.peekToken().value + " " + lexer.peekToken().value);
+        reportError(token.line, token.col, "Unexpected token in factor " + token.value);
+        // try to recover by advancing one token
+        currentToken = lexer.nextToken();
+        return std::make_unique<NumberNode>(0);
     }
 
 
@@ -2139,7 +2252,8 @@ class Parser
 
             if (currentToken.type != TOKEN_IDENTIFIER)
             {
-                throw std::runtime_error("Expected identifier after type specification");
+                reportError(currentToken.line, currentToken.col, "Expected identifier after type specification");
+                hadError = true;
             }
 
             std::string identifier = currentToken.value;
@@ -2152,7 +2266,8 @@ class Parser
                 eat(TOKEN_LBRACKET);
                 if (currentToken.type != TOKEN_NUMBER)
                 {
-                    throw std::runtime_error("Expected array size after [");
+                    reportError(currentToken.line, currentToken.col, "Expected array size after [");
+                    hadError = true;
                 }
                 dimensions.push_back(std::stoul(currentToken.value));
                 eat(TOKEN_NUMBER);
@@ -2196,14 +2311,16 @@ class Parser
 
             if (currentToken.type != TOKEN_IDENTIFIER)
             {
-                throw std::runtime_error("Expected identifier after dereference operator(s)");
+                reportError(currentToken.line, currentToken.col, "Expected identifier after dereference operator(s)");
+                hadError = true;
             }
             std::string identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
 
             if (currentToken.type != TOKEN_ASSIGN)
             {
-                throw std::runtime_error("Expected = after dereference identifier");
+                reportError(currentToken.line, currentToken.col, "Expected = after dereference identifier");
+                hadError = true;
             }
             eat(TOKEN_ASSIGN);
 
@@ -2288,7 +2405,8 @@ class Parser
             }
             else
             {
-                throw std::runtime_error("Unexpected token after identifier");
+                reportError(currentToken.line, currentToken.col, "Unexpected token after identifier");
+                hadError = true;
             }
         }
 
@@ -2456,7 +2574,10 @@ class Parser
             return std::make_unique<ReturnNode>(std::move(expr), currentFunction);
         }
 
-        throw std::runtime_error("Unexpected token in statement " + token.value + " " + lexer.peekToken().value);
+        reportError(token.line, token.col, "Unexpected token in statement " + token.value);
+        // try to synchronize
+        currentToken = lexer.nextToken();
+        return nullptr;
     }
 
 
@@ -2518,7 +2639,8 @@ class Parser
         TokenType returnType = currentToken.type;
         if (returnType != TOKEN_INT && returnType != TOKEN_CHAR && returnType != TOKEN_VOID)
         {
-            throw std::runtime_error("Expected return type (int, char of void)");
+            reportError(currentToken.line, currentToken.col, "Expected return type (int, char of void)");
+            hadError = true;
         }
         eat(returnType);
         
@@ -2535,7 +2657,8 @@ class Parser
             TokenType paramType = currentToken.type;
             if (paramType != TOKEN_INT && paramType != TOKEN_CHAR && paramType != TOKEN_VOID)
             {
-                throw std::runtime_error("Expected parameter type (int, char or void)");
+                reportError(currentToken.line, currentToken.col, "Expected parameter type (int, char or void)");
+                hadError = true;
             }
             
             eat(TOKEN_INT);
@@ -2670,7 +2793,8 @@ public:
             }
             else
             {
-                throw std::runtime_error("Unexpected token at global scope");
+                reportError(currentToken.line, currentToken.col, "Unexpected token at global scope");
+                hadError = true;
             }
         }
 
@@ -2687,7 +2811,8 @@ private:
     {
         std::ifstream file(fileName);
         if (!file.is_open()) {
-            throw std::runtime_error("Can't open file: " + fileName);
+            reportError(0, 0, "Can't open file: " + fileName);
+            hadError = true;
         }
 
         std::ostringstream content;
@@ -2752,7 +2877,10 @@ public:
                     processedCode << processCode(includedContent, defines) << '\n';
                 }
                 else
-                    throw std::runtime_error("Incorrect directory #include: " + line);
+                {
+                    reportError(0, 0, "Incorrect directory #include: " + line);
+                    hadError = true;
+                }
             }
             else
                 processedCode << replaceDefines(line, defines) << '\n';
@@ -2821,6 +2949,7 @@ int main(int argc, char** argv)
         return -1;
     }
 
+    sourceFileName = argv[1];
     std::ifstream inFile(argv[1]);
     if(!inFile.is_open())
     {
@@ -2841,6 +2970,12 @@ int main(int argc, char** argv)
     Lexer lexer(source); // Pass the preprocessed source to the lexer
     Parser parser(lexer);
     auto ast = parser.parse();
+
+    if (!compileErrors.empty())
+    {
+        std::cerr << "Compilation failed with " << compileErrors.size() << " error(s)\n";
+        return 1;
+    }
 
     std::string asmFileName = argv[2];
     asmFileName += ".asm";
