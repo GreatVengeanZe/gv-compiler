@@ -21,6 +21,14 @@
 // Global stack to track scopes
 std::stack<std::map<std::string, std::pair<std::string, size_t>>> scopes;
 
+// Registry for variables declared at global scope.  This is used by the
+// semantic checker so that identifiers referring to globals are considered
+// defined, and by the code generator when deciding whether to emit data or
+// access a symbol in the .data section.
+static std::set<std::string> globalVariables;
+// Track which globals were declared with "extern" so we avoid emitting storage
+static std::set<std::string> externGlobals;
+
 // Global index counter for function local variables (incremented per declaration)
 static size_t functionVariableIndex = 0;
 
@@ -1009,14 +1017,17 @@ struct DeclarationNode : ASTNode
     std::string identifier;
     std::unique_ptr<ASTNode> initializer;
     TokenType type;
-    int pointerLevel;   // 0 fon non-pointer, 1 for *, 2 for **, etc.
+    int pointerLevel;   // 0 for non-pointer, 1 for *, 2 for **, etc.
 
     DeclarationNode(const std::string& id, std::unique_ptr<ASTNode> init = nullptr, TokenType t = TOKEN_INT, int pLevel = 0)
         : identifier(id), initializer(std::move(init)), type(t), pointerLevel(pLevel) {}
 
     void emitData(std::ofstream& f) const override
     {
-        initializer.get()->emitData(f);
+        // Local declarations don't allocate global data, but their initializer may
+        // contain literals (e.g. strings) that need to be emitted.
+        if (initializer)
+            initializer->emitData(f);
     }
 
     void emitCode(std::ofstream& f) const override
@@ -1037,6 +1048,44 @@ struct DeclarationNode : ASTNode
     }
 };
 
+
+// Global variable declaration node (added for global support)
+struct GlobalDeclarationNode : ASTNode
+{
+    std::string identifier;
+    std::unique_ptr<ASTNode> initializer;
+    TokenType type;
+    int pointerLevel;
+    bool isExternal;
+
+    GlobalDeclarationNode(const std::string& id,
+                          std::unique_ptr<ASTNode> init = nullptr,
+                          TokenType t = TOKEN_INT,
+                          int pLevel = 0,
+                          bool isExtern = false)
+        : identifier(id), initializer(std::move(init)), type(t),
+          pointerLevel(pLevel), isExternal(isExtern) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        if (isExternal) return;
+        // ensure any literals used in initializer are emitted
+        if (initializer)
+            initializer->emitData(f);
+
+        long value = 0;
+        if (initializer && initializer->isConstant())
+            value = initializer->getConstantValue();
+        
+        std::string string = "\t" + identifier + ": dq " + std::to_string(value); 
+        f << std::left << std::setw(COMMENT_COLUMN) << string << ";; Declaring global variable" << std::endl;
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        // no text output for globals
+    }
+};
 
 struct DereferenceNode : ASTNode
 {
@@ -1069,7 +1118,20 @@ struct AddressOfNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         auto lookupResult = lookupVariable(Identifier);
-        if (lookupResult.first)
+        bool found = lookupResult.first;
+        bool isGlobal = false;
+        if (!found)
+        {
+            isGlobal = (globalVariables.find(Identifier) != globalVariables.end());
+            if (!isGlobal)
+            {
+                // not declared anywhere
+                reportError(0, 0, "Use of undefined variable '" + Identifier + "'");
+                hadError = true;
+            }
+        }
+
+        if (found)
         {
             auto pair = lookupResult.second;
             std::string uniqueName = pair.first;
@@ -1078,11 +1140,14 @@ struct AddressOfNode : ASTNode
             std::string instruction = "    lea rax, [rbp - " + std::to_string(index * 8) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of variable " << uniqueName << std::endl;
         }
-        else
+        else if (isGlobal)
         {
-            // Global variable
             std::string instruction = "    mov rax, " + Identifier;
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of global variable " << Identifier << std::endl; 
+        }
+        else
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << ";; undefined address fallback" << std::endl;
         }
     }
 };
@@ -1161,16 +1226,28 @@ struct ArrayAccessNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         auto lookupResult = lookupVariable(identifier);
-        if (!lookupResult.first)
+        bool found = lookupResult.first;
+        bool isGlobal = false;
+        if (!found)
         {
-            reportError(line, col, "Array " + identifier + " not found in scope");
-            hadError = true;
+            isGlobal = (globalVariables.find(identifier) != globalVariables.end());
+            if (!isGlobal)
+            {
+                reportError(line, col, "Array " + identifier + " not found in scope");
+                hadError = true;
+            }
         }
 
-        auto pairAA = lookupResult.second;
-        std::string uniqueName = pairAA.first;
-        size_t baseIndex = pairAA.second;
-        size_t baseOffset = baseIndex * 8; // Base offset from rbp in bytes
+        std::string uniqueName;
+        size_t baseIndex = 0;
+        size_t baseOffset = 0;
+        if (found)
+        {
+            auto pairAA = lookupResult.second;
+            uniqueName = pairAA.first;
+            baseIndex = pairAA.second;
+            baseOffset = baseIndex * 8; // Base offset from rbp in bytes
+        }
 
         // Check if all indices are constants
         bool allConstant = true;
@@ -1202,8 +1279,19 @@ struct ArrayAccessNode : ASTNode
                 totalOffset += constantIndices[i] * multiplier * 8;
             }
 
-            std::string instruction = "    mov rax, [rbp - " + std::to_string(totalOffset) + "]";
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+            if (isGlobal)
+            {
+                // Global array: use symbol + offset
+                std::string instruction = "    mov rax, [" + identifier;
+                if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
+                instruction += "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+            }
+            else
+            {
+                std::string instruction = "    mov rax, [rbp - " + std::to_string(totalOffset) + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+            }
             for (size_t i = 0; i < constantIndices.size(); ++i)
                 f << (i > 0 ? "," : "") << constantIndices[i];
             f << "]" << std::endl;
@@ -1240,11 +1328,20 @@ struct ArrayAccessNode : ASTNode
             }
 
             f << std::left << std::setw(COMMENT_COLUMN) << "    shl rax, 3" << ";; Scale offset by 8 (sizeof(int64))" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
-            std::string instruction = "    sub rcx, " + std::to_string(baseOffset);
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Adjust to array base" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << ";; Subtract scaled index" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rcx]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+            if (isGlobal)
+            {
+                // global base is label
+                f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, " + identifier << " ;; add base address" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+            }
+            else
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
+                std::string instruction = "    sub rcx, " + std::to_string(baseOffset);
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Adjust to array base" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << ";; Subtract scaled index" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rcx]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+            }
         }
     }
 };
@@ -1293,25 +1390,44 @@ struct AssignmentNode : ASTNode
         {
             // Pointer dereference assignment
             auto lookupResult = lookupVariable(identifier);
-            if (lookupResult.first)
+            bool found = lookupResult.first;
+            bool isGlobal = false;
+            if (!found)
             {
-                auto pairA = lookupResult.second;
-                std::string uniqueName = pairA.first;
-                size_t index = pairA.second;
+                isGlobal = (globalVariables.find(identifier) != globalVariables.end());
+                if (!isGlobal)
+                {
+                    reportError(line, col, "Dereference assignment to undefined variable " + identifier);
+                    hadError = true;
+                }
+            }
+
+            if (found || isGlobal)
+            {
+                std::string uniqueName;
+                size_t index = 0;
+                if (found)
+                {
+                    auto pairA = lookupResult.second;
+                    uniqueName = pairA.first;
+                    index = pairA.second;
+                }
                 f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Save the value" << std::endl;
-                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load pointer " << uniqueName << std::endl;
+                if (found)
+                {
+                    std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load pointer " << uniqueName << std::endl;
+                }
+                else
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << identifier << "]" << ";; Load global pointer " << identifier << std::endl;
+                }
                 for (int i = 1; i < dereferenceLevel; i++)
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rax]" << ";; Dereference level " << i << std::endl;
                 }
                 f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Restore the value" << std::endl;
                 f << std::left << std::setw(COMMENT_COLUMN) << "    mov [rax], rcx" << ";; Store value at final address" << std::endl;
-            }
-            else
-            {
-                reportError(line, col, "Dereference assignment to undefined variable " + identifier);
-                hadError = true;
             }
         }
         else if (!indices.empty())
@@ -1943,6 +2059,9 @@ struct CharLiteralNode : ASTNode
         std::string instruction = "    mov rax, " + std::to_string(ascii_value);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load char literal '" << the_value << "' into rax" << std::endl;
     }
+
+    bool isConstant() const override { return true; }
+    int getConstantValue() const override { return value; }
 };
 
 
@@ -2028,13 +2147,18 @@ struct IdentifierNode : ASTNode
         auto lookupResult = lookupVariable(name);
         bool found = lookupResult.first;
         auto infoResult = lookupResult.second;
+        bool isGlobal = false;
         if (!found)
         {
-            // Variable not found in any scope - report error but don't hard stop yet
-            reportError(line, col, "Use of undefined variable '" + name + "'");
-            hadError = true;
+            isGlobal = (globalVariables.find(name) != globalVariables.end());
+            if (!isGlobal)
+            {
+                // Variable not found anywhere
+                reportError(line, col, "Use of undefined variable '" + name + "'");
+                hadError = true;
+            }
         }
-        
+
         if (found)
         {
             auto uniqueName = infoResult.first;
@@ -2055,11 +2179,16 @@ struct IdentifierNode : ASTNode
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load variable " << uniqueName << std::endl;
             }
         }
-        else
+        else if (isGlobal)
         {
             // The variable is global (in the .data section)
             std::string instruction = "    mov rax, [" + name + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load global variable " << name << std::endl;
+        }
+        else
+        {
+            // Already reported error; emit dummy zero
+            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << ";; undefined variable fallback" << std::endl;
         }
     }
 };
@@ -2741,7 +2870,8 @@ class Parser
     ************************************************************************************/
 
 
-    std::unique_ptr<FunctionNode> function()
+    // Parses a top‑level item which may be either a function or a global variable
+    std::unique_ptr<ASTNode> function()
     {
         bool isExternal = false;
         // If the function is external - parse the extern token
@@ -2769,11 +2899,24 @@ class Parser
         }
         eat(returnType);
         
-        // Parse the function name
+        // Parse the function/variable name
         std::string name = currentToken.value;
         eat(TOKEN_IDENTIFIER);
 
-        // Parse the parameters list
+        // If the next token is not '(', we treat this as a global variable
+        if (currentToken.type != TOKEN_LPAREN)
+        {
+            std::unique_ptr<ASTNode> init = nullptr;
+            if (currentToken.type == TOKEN_ASSIGN)
+            {
+                eat(TOKEN_ASSIGN);
+                init = expression();
+            }
+            eat(TOKEN_SEMICOLON);
+            return std::make_unique<GlobalDeclarationNode>(name, std::move(init), returnType, 0, isExternal);
+        }
+
+        // Parse the parameters list for a function
         eat(TOKEN_LPAREN);
         std::vector<std::pair<std::string, std::string>> parameters; // Store (type, name) pairs
         while (currentToken.type != TOKEN_RPAREN)
@@ -2914,7 +3057,16 @@ public:
 	    {
             if (currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID)
             {
-                functions.push_back(function());
+                auto node = function();
+                // if (auto gd = dynamic_cast<GlobalDeclarationNode*>(node.get()))
+                // {
+                //     std::cerr << "[debug] parsed global " << gd->identifier << "\n";
+                // }
+                // else if (auto fn = dynamic_cast<FunctionNode*>(node.get()))
+                // {
+                //     std::cerr << "[debug] parsed function " << fn->name << "\n";
+                // }
+                functions.push_back(std::move(node));
             }
             else
             {
@@ -3059,6 +3211,7 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 // Semantic check helpers: walk the AST and ensure variables are declared in scope
 static bool localLookupName(const std::stack<std::map<std::string, std::pair<std::string, size_t>>>& s, const std::string& name)
 {
+    // Look through all local scopes first
     std::stack<std::map<std::string, std::pair<std::string, size_t>>> tmp = s;
     while (!tmp.empty())
     {
@@ -3066,6 +3219,11 @@ static bool localLookupName(const std::stack<std::map<std::string, std::pair<std
         if (m.find(name) != m.end()) return true;
         tmp.pop();
     }
+
+    // Not found locally? check if it's a global variable
+    if (globalVariables.find(name) != globalVariables.end())
+        return true;
+
     return false;
 }
 
@@ -3214,8 +3372,42 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
     semanticCheckExpression(node, scopes, currentFunction);
 }
 
+// Perform semantic checks on the AST, including globals and functions
 static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
 {
+    // First pass: collect all globals and validate their initializers
+    for (const auto& node : ast)
+    {
+        if (auto gd = dynamic_cast<const class GlobalDeclarationNode*>(node.get()))
+        {
+            const std::string& name = gd->identifier;
+            // std::cerr << "[debug] semanticPass saw global declaration " << name << "\n";
+            if (globalVariables.find(name) != globalVariables.end())
+            {
+                reportError(0, 0, "Redefinition of global variable '" + name + "'");
+                hadError = true;
+            }
+            globalVariables.insert(name);
+            if (gd->isExternal)
+                externGlobals.insert(name);
+
+            if (gd->initializer)
+            {
+                // allow only constant initializers for globals
+                {
+                    std::stack<std::map<std::string, std::pair<std::string, size_t>>> emptyScopes;
+                    semanticCheckExpression(gd->initializer.get(), emptyScopes, nullptr);
+                }
+                if (!gd->initializer->isConstant())
+                {
+                    reportError(0, 0, "Global initializer for '" + name + "' must be a constant expression");
+                    hadError = true;
+                }
+            }
+        }
+    }
+
+    // Second pass: check functions (locals) with global names visible
     for (const auto& node : ast)
     {
         if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
