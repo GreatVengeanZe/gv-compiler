@@ -9,10 +9,10 @@ void printFib(int n)
 
     for (int i = 1; i <= n; i++)
     {
-            printf("%d ", a);
-            int curr = a + b;
-            a = b;
-            b = curr;
+       printf("%d ", a);
+       int curr = a + b;
+       a = b;
+       b = curr;
     }
     putchar(10);
 }

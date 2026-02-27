@@ -21,6 +21,9 @@
 // Global stack to track scopes
 std::stack<std::map<std::string, std::pair<std::string, size_t>>> scopes;
 
+// Global index counter for function local variables (incremented per declaration)
+static size_t functionVariableIndex = 0;
+
 // Structure to hold deferred postfix operations
 struct DeferredPostfixOp {
     std::string op;        // "++" or "--"
@@ -157,14 +160,34 @@ std::string generateUniqueName(const std::string& name)
     return name + "_" + std::to_string(counter++);
 }
 
+// Helper function to look up a variable in the scope stack (search all scopes)
+static std::pair<bool, std::pair<std::string, size_t>> lookupVariable(const std::string& name)
+{
+    // Create a temporary copy of the scopes stack to search from top to bottom
+    std::stack<std::map<std::string, std::pair<std::string, size_t>>> tempStack = scopes;
+    while (!tempStack.empty())
+    {
+        auto& currentScope = tempStack.top();
+        if (currentScope.find(name) != currentScope.end())
+        {
+            return {true, currentScope[name]};
+        }
+        tempStack.pop();
+    }
+    return {false, {"", 0}}; // Not found
+}
+
 // Function to emit code for applying deferred postfix operations
 void emitDeferredPostfixOps(std::ofstream& f)
 {
     for (const auto& deferredOp : deferredPostfixOps)
     {
-        if (scopes.top().find(deferredOp.varName) != scopes.top().end())
+        auto lookupResult = lookupVariable(deferredOp.varName);
+        if (lookupResult.first)
         {
-            auto [uniqueName, index] = scopes.top()[deferredOp.varName];
+            auto pair = lookupResult.second;
+            std::string uniqueName = pair.first;
+            size_t index = pair.second;
             std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " for deferred postfix" << std::endl;
             if (deferredOp.op == "++")
@@ -842,6 +865,8 @@ struct FunctionNode : ASTNode
             f << name << " = PLT _" << name << std::endl;
             return;
         }
+        // Reset function variable index for this function
+        functionVariableIndex = 0;
         // Push a new scope onto the stack
         scopes.push({});
 
@@ -885,11 +910,12 @@ struct FunctionNode : ASTNode
             std::string paramName = parameters[i].second;
             std::string uniqueName = generateUniqueName(paramName);
 
+            functionVariableIndex++;  // Allocate index for parameter
             size_t index;
             if (i < 6)
             {
-                // Parameters 0-5: stored at [rbp - (i + 1) * 8] (negative offset)
-                index = i + 1;
+                // Parameters 0-5: stored at [rbp - functionVariableIndex * 8]
+                index = functionVariableIndex;
             }
             else
             {
@@ -996,7 +1022,8 @@ struct DeclarationNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         std::string uniqueName = generateUniqueName(identifier);
-        size_t index = scopes.top().size() + 1; // Next free slot
+        functionVariableIndex++;  // Allocate next index
+        size_t index = functionVariableIndex;
         scopes.top()[identifier] = {uniqueName, index};
 
         // f << std::left << std::setw(COMMENT_COLUMN) << "    sub rsp, 8" << ";; Allocate space for " << uniqueName << std::endl;
@@ -1041,14 +1068,16 @@ struct AddressOfNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        if (scopes.top().find(Identifier) != scopes.top().end())
+        auto lookupResult = lookupVariable(Identifier);
+        if (lookupResult.first)
         {
-            auto [uniqueName, index] = scopes.top()[Identifier];
+            auto pair = lookupResult.second;
+            std::string uniqueName = pair.first;
+            size_t index = pair.second;
             // All variables (parameters and locals) are now on the stack relative to rbp
             std::string instruction = "    lea rax, [rbp - " + std::to_string(index * 8) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of variable " << uniqueName << std::endl;
         }
-
         else
         {
             // Global variable
@@ -1082,7 +1111,8 @@ struct ArrayDeclarationNode : ASTNode
         for (size_t dim : dimensions) totalElements *= dim; // Total number of elements
         size_t totalSize = totalElements * 8; // Total size in bytes (64-bit)
 
-        size_t baseIndex = scopes.top().size() + 1; // Starting index
+        functionVariableIndex++;  // Allocate index for array base
+        size_t baseIndex = functionVariableIndex;
         scopes.top()[identifier] = {uniqueName, baseIndex};
 
         std::string instruction = "    sub rsp, " + std::to_string(totalSize);
@@ -1108,6 +1138,7 @@ struct ArrayDeclarationNode : ASTNode
         // Reserve space in the scope for the entire array
         for (size_t i = 1; i < totalElements; ++i)
         {
+            functionVariableIndex++;
             scopes.top()["__reserved_" + uniqueName + "_" + std::to_string(i)] = {uniqueName, baseIndex + i};
         }
     }
@@ -1119,21 +1150,26 @@ struct ArrayAccessNode : ASTNode
     std::string identifier;
     std::vector<std::unique_ptr<ASTNode>> indices;
     const FunctionNode* currentFunction;
+    int line = 0;
+    int col = 0;
 
-    ArrayAccessNode(const std::string& id, std::vector<std::unique_ptr<ASTNode>> idx, const FunctionNode* func)
-        : identifier(id), indices(std::move(idx)), currentFunction(func) {}
+    ArrayAccessNode(const std::string& id, std::vector<std::unique_ptr<ASTNode>> idx, const FunctionNode* func, int l = 0, int c = 0)
+        : identifier(id), indices(std::move(idx)), currentFunction(func), line(l), col(c) {}
 
     void emitData(std::ofstream& f) const override {}
 
     void emitCode(std::ofstream& f) const override
     {
-        if (scopes.top().find(identifier) == scopes.top().end())
+        auto lookupResult = lookupVariable(identifier);
+        if (!lookupResult.first)
         {
-            reportError(0, 0, "Array " + identifier + " not found in scope");
+            reportError(line, col, "Array " + identifier + " not found in scope");
             hadError = true;
         }
 
-        auto [uniqueName, baseIndex] = scopes.top()[identifier];
+        auto pairAA = lookupResult.second;
+        std::string uniqueName = pairAA.first;
+        size_t baseIndex = pairAA.second;
         size_t baseOffset = baseIndex * 8; // Base offset from rbp in bytes
 
         // Check if all indices are constants
@@ -1231,10 +1267,12 @@ struct AssignmentNode : ASTNode
     std::unique_ptr<ASTNode> expression;
     int dereferenceLevel;                       // For pointer dereferencing
     std::vector<std::unique_ptr<ASTNode>> indices; // For array indexing (empty if not an array access)
+    int line = 0;
+    int col = 0;
  
     AssignmentNode(const std::string& id, std::unique_ptr<ASTNode> expr, int derefLevel = 0,
-                std::vector<std::unique_ptr<ASTNode>> idx = {})
-        : identifier(id), expression(std::move(expr)), dereferenceLevel(derefLevel), indices(std::move(idx)) {}
+        std::vector<std::unique_ptr<ASTNode>> idx = {}, int l = 0, int c = 0)
+    : identifier(id), expression(std::move(expr)), dereferenceLevel(derefLevel), indices(std::move(idx)), line(l), col(c) {}
  
     void emitData(std::ofstream& f) const override
     {
@@ -1254,9 +1292,12 @@ struct AssignmentNode : ASTNode
         if (dereferenceLevel > 0)
         {
             // Pointer dereference assignment
-            if (scopes.top().find(identifier) != scopes.top().end())
+            auto lookupResult = lookupVariable(identifier);
+            if (lookupResult.first)
             {
-                auto [uniqueName, index] = scopes.top()[identifier];
+                auto pairA = lookupResult.second;
+                std::string uniqueName = pairA.first;
+                size_t index = pairA.second;
                 f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Save the value" << std::endl;
                 std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load pointer " << uniqueName << std::endl;
@@ -1269,19 +1310,22 @@ struct AssignmentNode : ASTNode
             }
             else
             {
-                reportError(0, 0, "Dereference assignment to undefined variable " + identifier);
+                reportError(line, col, "Dereference assignment to undefined variable " + identifier);
                 hadError = true;
             }
         }
         else if (!indices.empty())
         {
             // Array element assignment
-            if (scopes.top().find(identifier) == scopes.top().end())
+            auto lookupResult = lookupVariable(identifier);
+            if (!lookupResult.first)
             {
-                reportError(0, 0, "Array " + identifier + " not found in scope");
+                reportError(line, col, "Array " + identifier + " not found in scope");
                 hadError = true;
             }
-            auto [uniqueName, baseIndex] = scopes.top()[identifier];
+            auto pairB = lookupResult.second;
+            std::string uniqueName = pairB.first;
+            size_t baseIndex = pairB.second;
             size_t baseOffset = baseIndex * 8;
 
             f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Save the value to assign" << std::endl;
@@ -1365,9 +1409,12 @@ struct AssignmentNode : ASTNode
         else
         {
             // Regular variable assignment
-            if (scopes.top().find(identifier) != scopes.top().end())
+            auto lookupResult = lookupVariable(identifier);
+            if (lookupResult.first)
             {
-                auto [uniqueName, index] = scopes.top()[identifier];
+                auto pairC = lookupResult.second;
+                std::string uniqueName = pairC.first;
+                size_t index = pairC.second;
                 std::string instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in local variable " << uniqueName << std::endl;
             }
@@ -1414,9 +1461,9 @@ struct AssignmentNode : ASTNode
          {
              stmt->emitData(f);
          }
-         for (const auto& [cond, body] : elseIfBlocks)
+         for (const auto& condBodyPair : elseIfBlocks)
          {
-             for (const auto& stmt : body)
+             for (const auto& stmt : condBodyPair.second)
              {
                  stmt->emitData(f);
              }
@@ -1454,11 +1501,13 @@ struct AssignmentNode : ASTNode
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
         }
 
-        // Emit 'if' body
+        // Emit 'if' body (with its own scope)
+        scopes.push({});
         for (const auto& stmt : body)
         {
             stmt->emitCode(f);
         }
+        scopes.pop();
         instruction = "    jmp " + endLabel;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end to skip all else-if and else blocks" << std::endl;
 
@@ -1485,23 +1534,27 @@ struct AssignmentNode : ASTNode
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
             }
 
+            scopes.push({});
             for (const auto& stmt : elseIfBlocks[i].second)
             {
                 stmt->emitCode(f);
             }
+            scopes.pop();
 
             instruction = "    jmp " + endLabel;
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end to skip remaining blocks" << std::endl;
         }
 
-        // Emit 'else' block
+        // Emit 'else' block (with its own scope)
         if (!elseBody.empty())
         {
             f << std::endl << functionName << ".else_" << labelID << ":" << std::endl;
+            scopes.push({});
             for (const auto& stmt : elseBody)
             {
                 stmt->emitCode(f);
             }
+            scopes.pop();
         }
 
         f << std::endl << endLabel << ":" << std::endl;
@@ -1537,11 +1590,13 @@ struct WhileLoopNode : ASTNode
         f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << ";; Compare condition result with 0" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
 
-        // Emit the loop body
+        // Emit the loop body (with its own scope)
+        scopes.push({});
         for (const auto& stmt : body)
         {
             stmt->emitCode(f);
         }
+        scopes.pop();
         
         instruction = "    jmp " + functionName + ".loop_start_" + std::to_string(loopStartLabel);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump back to start of loop" << std::endl;
@@ -1585,6 +1640,9 @@ struct ForLoopNode : ASTNode
         std::string fullStartLabel = functionName + ".loop_start_" + std::to_string(loopStartLabel);
         std::string fullEndLabel = functionName + ".loop_end_" + std::to_string(loopEndLabel);
 
+        // Create a loop scope for loop variables
+        scopes.push({});
+
         if (initialization)
         {
             initialization->emitCode(f); // e.g., int i = 0
@@ -1611,6 +1669,9 @@ struct ForLoopNode : ASTNode
         std::string instruction = "    jmp " + fullStartLabel;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump back to start of loop" << std::endl;
         f << std::endl << fullEndLabel << ":" << std::endl;
+
+        // Pop the loop scope
+        scopes.pop();
     }
 };
 
@@ -1750,9 +1811,11 @@ struct UnaryOpNode : ASTNode
     std::string op;
     std::string name; // Store the name of the operand
     bool isPrefix;
+    int line = 0;
+    int col = 0;
 
-    UnaryOpNode(const std::string& op, const std::string& name, bool isPrefix)
-        : op(op), name(name), isPrefix(isPrefix) {}
+    UnaryOpNode(const std::string& op, const std::string& name, bool isPrefix, int l = 0, int c = 0)
+        : op(op), name(name), isPrefix(isPrefix), line(l), col(c) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1764,9 +1827,12 @@ struct UnaryOpNode : ASTNode
         if (isPrefix)
         {
             // Prefix: execute immediately - increment/decrement, then return new value
-            if (scopes.top().find(name) != scopes.top().end())
+            auto lookupResult = lookupVariable(name);
+            if (lookupResult.first)
             {
-                auto [uniqueName, index] = scopes.top()[name];
+                auto pairD = lookupResult.second;
+                std::string uniqueName = pairD.first;
+                size_t index = pairD.second;
                 std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax" << std::endl;
                 if (op == "++")
@@ -1798,9 +1864,12 @@ struct UnaryOpNode : ASTNode
         else
         {
             // Postfix: return old value NOW, but defer the actual increment/decrement
-            if (scopes.top().find(name) != scopes.top().end())
+            auto lookupResult = lookupVariable(name);
+            if (lookupResult.first)
             {
-                auto [uniqueName, index] = scopes.top()[name];
+                auto pair = lookupResult.second;
+                std::string uniqueName = pair.first;
+                size_t index = pair.second;
                 // Load the current value and save it
                 std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax (postfix value)" << std::endl;
@@ -1938,14 +2007,15 @@ struct StringLiteralNode : ASTNode
  *                                                                                       *
  *****************************************************************************************/
 
-
 struct IdentifierNode : ASTNode
 {
     std::string name;
     const FunctionNode* currentFunction = nullptr; // Track the current function context
+    int line = 0;
+    int col = 0;
 
-    IdentifierNode(const std::string& name, const FunctionNode* currentFunction = nullptr)
-        : name(name), currentFunction(currentFunction) {}
+    IdentifierNode(const std::string& name, int l, int c, const FunctionNode* currentFunction = nullptr)
+        : name(name), currentFunction(currentFunction), line(l), col(c) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1954,10 +2024,21 @@ struct IdentifierNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        // Look up the variable in the current scope
-        if (scopes.top().find(name) != scopes.top().end())
+        // Look up the variable in the scope stack
+        auto lookupResult = lookupVariable(name);
+        bool found = lookupResult.first;
+        auto infoResult = lookupResult.second;
+        if (!found)
         {
-            auto [uniqueName, index] = scopes.top()[name];
+            // Variable not found in any scope - report error but don't hard stop yet
+            reportError(line, col, "Use of undefined variable '" + name + "'");
+            hadError = true;
+        }
+        
+        if (found)
+        {
+            auto uniqueName = infoResult.first;
+            auto index = infoResult.second;
 
             // Check if this is a stack parameter (index >= 1000)
             if (index >= 1000)
@@ -1980,6 +2061,35 @@ struct IdentifierNode : ASTNode
             std::string instruction = "    mov rax, [" + name + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load global variable " << name << std::endl;
         }
+    }
+};
+
+
+struct BlockNode : ASTNode
+{
+    std::vector<std::unique_ptr<ASTNode>> statements;
+
+    BlockNode(std::vector<std::unique_ptr<ASTNode>> stmts)
+        : statements(std::move(stmts)) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        for (const auto& stmt : statements)
+        {
+            stmt->emitData(f);
+        }
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        // Push a new scope for this block
+        scopes.push({});
+        for (const auto& stmt : statements)
+        {
+            stmt->emitCode(f);
+        }
+        // Pop the scope when exiting the block
+        scopes.pop();
     }
 };
 
@@ -2035,9 +2145,10 @@ class Parser
         if (token.type == TOKEN_INCREMENT || token.type == TOKEN_DECREMENT)
         {
             eat(token.type); // Consume the operator
-            std::string identifier = currentToken.value;
+            Token idToken = currentToken;
+            std::string identifier = idToken.value;
             eat(TOKEN_IDENTIFIER); // Consume the identifier
-            return std::make_unique<UnaryOpNode>(token.value, identifier, true); // true for prefix
+            return std::make_unique<UnaryOpNode>(token.value, identifier, true, idToken.line, idToken.col); // true for prefix
         }
 
         else if (token.type == TOKEN_NUMBER)
@@ -2103,14 +2214,14 @@ class Parser
 
             if (!indices.empty())
             {
-                return std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction);
+                return std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction, token.line, token.col);
             }
 
             if (currentToken.type == TOKEN_INCREMENT || currentToken.type == TOKEN_DECREMENT)
             {
                 Token opToken = currentToken;
                 eat(opToken.type); // Consume the operator
-                return std::make_unique<UnaryOpNode>(opToken.value, identifier, false); // false for postfix
+                return std::make_unique<UnaryOpNode>(opToken.value, identifier, false, token.line, token.col); // false for postfix
             }
 
             // Check if this is a function call
@@ -2120,7 +2231,7 @@ class Parser
             }
 
             // Otherwise it's a variable or parameter
-            return std::make_unique<IdentifierNode>(identifier, currentFunction);
+            return std::make_unique<IdentifierNode>(identifier, token.line, token.col, currentFunction);
         }
 
         else if (token.type == TOKEN_LPAREN)
@@ -2237,6 +2348,16 @@ class Parser
     {
         Token token = currentToken;
 
+        if (token.type == TOKEN_LBRACE) {
+            eat(TOKEN_LBRACE);
+            std::vector<std::unique_ptr<ASTNode>> stmts;
+            while (currentToken.type != TOKEN_RBRACE && currentToken.type != TOKEN_EOF) {
+                stmts.push_back(statement(currentFunction));
+            }
+            eat(TOKEN_RBRACE);
+            return std::make_unique<BlockNode>(std::move(stmts));
+        }
+
         if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID)
 	    {
             TokenType type = token.type;
@@ -2256,7 +2377,8 @@ class Parser
                 hadError = true;
             }
 
-            std::string identifier = currentToken.value;
+            Token idToken = currentToken;
+            std::string identifier = idToken.value;
             eat(TOKEN_IDENTIFIER);
 
             // Handle array dimensions (e.g., int array[5][10])
@@ -2314,7 +2436,8 @@ class Parser
                 reportError(currentToken.line, currentToken.col, "Expected identifier after dereference operator(s)");
                 hadError = true;
             }
-            std::string identifier = currentToken.value;
+            Token idToken = currentToken;
+            std::string identifier = idToken.value;
             eat(TOKEN_IDENTIFIER);
 
             if (currentToken.type != TOKEN_ASSIGN)
@@ -2326,12 +2449,13 @@ class Parser
 
             auto expr = expression(currentFunction);
             eat(TOKEN_SEMICOLON);
-            return std::make_unique<AssignmentNode>(identifier, std::move(expr), dereferenceLevel); // true for dereference
+            return std::make_unique<AssignmentNode>(identifier, std::move(expr), dereferenceLevel, std::vector<std::unique_ptr<ASTNode>>(), idToken.line, idToken.col); // true for dereference
         }
 
         else if (token.type == TOKEN_IDENTIFIER)
 	    {
-            std::string identifier = currentToken.value;
+            Token idToken = currentToken;
+            std::string identifier = idToken.value;
             eat(TOKEN_IDENTIFIER);
 
             // Check for array indexing
@@ -2350,13 +2474,13 @@ class Parser
                     eat(TOKEN_ASSIGN);
                     auto expr = expression(currentFunction);
                     eat(TOKEN_SEMICOLON);
-                    return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::move(indices));
+                    return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::move(indices), idToken.line, idToken.col);
                 }
 
                 else
                 {
                     eat(TOKEN_SEMICOLON); // Standalone array access (e.g., arr[0];)
-                    return std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction);
+                    return std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction, idToken.line, idToken.col);
                 }
             }
 
@@ -2375,7 +2499,7 @@ class Parser
                 eat(TOKEN_ASSIGN);
                 auto expr = expression(currentFunction); // Parse the right-hand side
                 eat(TOKEN_SEMICOLON);
-                return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0);
+                return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::vector<std::unique_ptr<ASTNode>>(), idToken.line, idToken.col);
             }
 
             // Check if this is a postfix increment/decrement (e.g., x++; or x--;)
@@ -2394,13 +2518,13 @@ class Parser
                     }
                     // Wrap in StatementWithDeferredOpsNode to apply deferred postfix ops
                     return std::make_unique<StatementWithDeferredOpsNode>(
-                        std::make_unique<UnaryOpNode>(opToken.value, identifier, false) // false for postfix
+                        std::make_unique<UnaryOpNode>(opToken.value, identifier, false, idToken.line, idToken.col) // false for postfix
                     );
                 }
                 else
                 {
                     // If not followed by a semicolon or closing parenthesis, treat it as part of an expression
-                    return std::make_unique<UnaryOpNode>(opToken.value, identifier, false); // false for postfix
+                    return std::make_unique<UnaryOpNode>(opToken.value, identifier, false, idToken.line, idToken.col); // false for postfix
                 }
             }
             else
@@ -2415,7 +2539,8 @@ class Parser
             // Handle prefix increment/decrement (e.g., ++x; or --x;)
             Token opToken = currentToken;
             eat(opToken.type); // Consume the operator
-            std::string identifier = currentToken.value;
+            Token idToken = currentToken;
+            std::string identifier = idToken.value;
             eat(TOKEN_IDENTIFIER); // Consume the identifier
     
             // Check if this is part of an expression (e.g., in a for loop)
@@ -2428,13 +2553,13 @@ class Parser
                 }
                 // Wrap in StatementWithDeferredOpsNode to apply deferred postfix ops if any
                 return std::make_unique<StatementWithDeferredOpsNode>(
-                    std::make_unique<UnaryOpNode>(opToken.value, identifier, true) // true for prefix
+                    std::make_unique<UnaryOpNode>(opToken.value, identifier, true, idToken.line, idToken.col) // true for prefix
                 );
             }
             else
             {
                 // If not followed by a semicolon or closing parenthesis, treat it as part of an expression
-                return std::make_unique<UnaryOpNode>(opToken.value, identifier, true); // true for prefix
+                return std::make_unique<UnaryOpNode>(opToken.value, identifier, true, idToken.line, idToken.col); // true for prefix
             }
         }
 
@@ -2795,6 +2920,7 @@ public:
             {
                 reportError(currentToken.line, currentToken.col, "Unexpected token at global scope");
                 hadError = true;
+                currentToken = lexer.nextToken(); // Advance to avoid infinite loop
             }
         }
 
@@ -2904,7 +3030,8 @@ public:
 
 void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstream& f)
 {
-    // Reset the global stack
+    // Reset the global stack and index counter
+    functionVariableIndex = 0;
     while(!scopes.empty())
     {
         scopes.pop();
@@ -2926,6 +3053,183 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
     for (const auto& node : ast)
     {
         node->emitData(f);
+    }
+}
+
+// Semantic check helpers: walk the AST and ensure variables are declared in scope
+static bool localLookupName(const std::stack<std::map<std::string, std::pair<std::string, size_t>>>& s, const std::string& name)
+{
+    std::stack<std::map<std::string, std::pair<std::string, size_t>>> tmp = s;
+    while (!tmp.empty())
+    {
+        auto &m = tmp.top();
+        if (m.find(name) != m.end()) return true;
+        tmp.pop();
+    }
+    return false;
+}
+
+// Forward declaration
+static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, std::pair<std::string, size_t>>> &scopes, const FunctionNode* currentFunction);
+
+static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std::string, std::pair<std::string, size_t>>> &scopes, const FunctionNode* currentFunction)
+{
+    if (!node) return;
+    // Identifier usage
+    if (auto idn = dynamic_cast<const IdentifierNode*>(node))
+    {
+        if (!localLookupName(scopes, idn->name))
+        {
+            reportError(idn->line, idn->col, "Use of undefined variable '" + idn->name + "'");
+            hadError = true;
+        }
+        return;
+    }
+
+    // Binary op
+    if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
+    {
+        semanticCheckExpression(bin->left.get(), scopes, currentFunction);
+        semanticCheckExpression(bin->right.get(), scopes, currentFunction);
+        return;
+    }
+
+    // Unary op (UnaryOpNode stores a name for ++/--)
+    if (auto un = dynamic_cast<const UnaryOpNode*>(node))
+    {
+        if (!localLookupName(scopes, un->name))
+        {
+            reportError(un->line, un->col, "Use of undefined variable '" + un->name + "'");
+            hadError = true;
+        }
+        return;
+    }
+
+    // Function call
+    if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
+    {
+        for (const auto& arg : fc->arguments)
+            semanticCheckExpression(arg.get(), scopes, currentFunction);
+        return;
+    }
+
+    // Array access
+    if (auto aa = dynamic_cast<const ArrayAccessNode*>(node))
+    {
+        if (!localLookupName(scopes, aa->identifier))
+        {
+            reportError(aa->line, aa->col, "Use of undefined array '" + aa->identifier + "'");
+            hadError = true;
+        }
+        for (const auto& idx : aa->indices) semanticCheckExpression(idx.get(), scopes, currentFunction);
+        return;
+    }
+}
+
+static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, std::pair<std::string, size_t>>> &scopes, const FunctionNode* currentFunction)
+{
+    if (!node) return;
+
+    if (auto decl = dynamic_cast<const DeclarationNode*>(node))
+    {
+        // Add to current scope
+        std::string name = decl->identifier;
+        size_t index = scopes.top().size() + 1;
+        scopes.top()[name] = {generateUniqueName(name), index};
+        if (decl->initializer) semanticCheckExpression(decl->initializer.get(), scopes, currentFunction);
+        return;
+    }
+
+    if (auto arrd = dynamic_cast<const ArrayDeclarationNode*>(node))
+    {
+        std::string name = arrd->identifier;
+        size_t baseIndex = scopes.top().size() + 1;
+        scopes.top()[name] = {generateUniqueName(name), baseIndex};
+        for (const auto& init : arrd->initializer) semanticCheckExpression(init.get(), scopes, currentFunction);
+        return;
+    }
+
+    if (auto asg = dynamic_cast<const AssignmentNode*>(node))
+    {
+        semanticCheckExpression(asg->expression.get(), scopes, currentFunction);
+        return;
+    }
+
+    if (auto ifn = dynamic_cast<const IfStatementNode*>(node))
+    {
+        semanticCheckExpression(ifn->condition.get(), scopes, currentFunction);
+        scopes.push({});
+        for (const auto& stmt : ifn->body) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+        scopes.pop();
+        for (const auto& eb : ifn->elseIfBlocks)
+        {
+            semanticCheckExpression(eb.first.get(), scopes, currentFunction);
+            scopes.push({});
+            for (const auto& stmt : eb.second) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+            scopes.pop();
+        }
+        if (!ifn->elseBody.empty())
+        {
+            scopes.push({});
+            for (const auto& stmt : ifn->elseBody) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+            scopes.pop();
+        }
+        return;
+    }
+
+    if (auto forn = dynamic_cast<const ForLoopNode*>(node))
+    {
+        scopes.push({});
+        if (forn->initialization) semanticCheckStatement(forn->initialization.get(), scopes, currentFunction);
+        if (forn->condition) semanticCheckExpression(forn->condition.get(), scopes, currentFunction);
+        if (forn->iteration) semanticCheckStatement(forn->iteration.get(), scopes, currentFunction);
+        for (const auto& stmt : forn->body) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+        scopes.pop();
+        return;
+    }
+
+    if (auto whilen = dynamic_cast<const WhileLoopNode*>(node))
+    {
+        semanticCheckExpression(whilen->condition.get(), scopes, currentFunction);
+        scopes.push({});
+        for (const auto& stmt : whilen->body) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+        scopes.pop();
+        return;
+    }
+
+    if (auto rn = dynamic_cast<const ReturnNode*>(node))
+    {
+        if (rn->expression) semanticCheckExpression(rn->expression.get(), scopes, currentFunction);
+        return;
+    }
+
+    if (auto bn = dynamic_cast<const BlockNode*>(node))
+    {
+        scopes.push({});
+        for (const auto& stmt : bn->statements) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+        scopes.pop();
+        return;
+    }
+
+    semanticCheckExpression(node, scopes, currentFunction);
+}
+
+static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
+{
+    for (const auto& node : ast)
+    {
+        if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
+        {
+            std::stack<std::map<std::string, std::pair<std::string, size_t>>> localScopes;
+            localScopes.push({});
+            for (size_t i = 0; i < fn->parameters.size(); ++i)
+            {
+                const auto& pname = fn->parameters[i].second;
+                size_t index = localScopes.top().size() + 1;
+                localScopes.top()[pname] = {generateUniqueName(pname), index};
+            }
+            for (const auto& stmt : fn->body) semanticCheckStatement(stmt.get(), localScopes, fn);
+        }
     }
 }
  
@@ -2970,6 +3274,9 @@ int main(int argc, char** argv)
     Lexer lexer(source); // Pass the preprocessed source to the lexer
     Parser parser(lexer);
     auto ast = parser.parse();
+
+    // Run semantic checks to catch undefined-variable/array uses before code generation
+    semanticPass(ast);
 
     if (!compileErrors.empty())
     {

@@ -2,17 +2,27 @@ extern printf;
 
 int main()
 {
+    // Valid: variable declared at function scope
+    int y = 10;
+    printf("y = %d\n", y);
 
-    // Test escape sequences
-    printf("Escapes: newline='%c', tab='%c', bell='%c', backspace='%c', formfeed='%c', question='%c'\n",
-           '\n', '\t', '\a', '\b', '\f', '\?');
+    // Valid: variable in if block, but declared in outer scope
+    {
+        int z = 20;
+        printf("z = %d\n", z);
+    }
 
-    // implicit concatenation
-    printf("concatenated "
-           "string\n");
+    // Invalid: z was declared in inner block
+    // printf("z outside = %d\n", z);
 
-    // show literal backslash and quotes
-    printf("\\\"\'\n");
+    // Valid: loop variable accessed within loop
+    for (int i = 0; i < 5; i++)
+    {
+        printf("i = %d\n", i);
+    }
+
+    // Invalid: loop variable i accessed outside loop
+    // printf("i outside = %d\n", i);
 
     return 0;
 }
