@@ -18,16 +18,47 @@
 // Define fixed column position for comments
 #define COMMENT_COLUMN 32
 
-// Global stack to track scopes
-std::stack<std::map<std::string, std::pair<std::string, size_t>>> scopes;
+// Type system used for static checking
+struct Type {
+    enum Base { INT, CHAR, VOID } base;
+    int pointerLevel = 0; // number of '*' qualifiers
 
-// Registry for variables declared at global scope.  This is used by the
-// semantic checker so that identifiers referring to globals are considered
-// defined, and by the code generator when deciding whether to emit data or
-// access a symbol in the .data section.
-static std::set<std::string> globalVariables;
+    bool operator==(const Type& o) const {
+        return base == o.base && pointerLevel == o.pointerLevel;
+    }
+    bool operator!=(const Type& o) const {
+        return !(*this == o);
+    }
+    std::string toString() const {
+        std::string s;
+        switch (base) {
+            case INT:  s = "int"; break;
+            case CHAR: s = "char"; break;
+            case VOID: s = "void"; break;
+        }
+        for (int i = 0; i < pointerLevel; ++i) s += "*";
+        return s;
+    }
+};
+
+// information stored for each variable in a scope
+struct VarInfo {
+    std::string uniqueName;
+    size_t index;
+    Type type;
+};
+
+// Global stack to track scopes
+static std::stack<std::map<std::string, VarInfo>> scopes;
+
+// Registry for variables declared at global scope along with their types.
+static std::unordered_map<std::string, Type> globalVariables;
 // Track which globals were declared with "extern" so we avoid emitting storage
 static std::set<std::string> externGlobals;
+
+// Function signature tables used during semantic checking
+static std::unordered_map<std::string, Type> functionReturnTypes;
+static std::unordered_map<std::string, std::vector<Type>> functionParamTypes;
 
 // Global index counter for function local variables (incremented per declaration)
 static size_t functionVariableIndex = 0;
@@ -154,6 +185,21 @@ std::string tokenTypeToString(TokenType t)
     }
 }
 
+// utility to construct a Type value from a TokenType and optional pointer count
+Type makeType(TokenType tok, int ptrLevel = 0)
+{
+    Type t;
+    switch (tok)
+    {
+        case TOKEN_INT:   t.base = Type::INT;  break;
+        case TOKEN_CHAR:  t.base = Type::CHAR; break;
+        case TOKEN_VOID:  t.base = Type::VOID; break;
+        default:          t.base = Type::INT;  break; // fallback
+    }
+    t.pointerLevel = ptrLevel;
+    return t;
+}
+
 // Report an error (also prints it immediately)
 void reportError(int line, int col, const std::string& msg)
 {
@@ -169,10 +215,10 @@ std::string generateUniqueName(const std::string& name)
 }
 
 // Helper function to look up a variable in the scope stack (search all scopes)
-static std::pair<bool, std::pair<std::string, size_t>> lookupVariable(const std::string& name)
+static std::pair<bool, VarInfo> lookupVariable(const std::string& name)
 {
     // Create a temporary copy of the scopes stack to search from top to bottom
-    std::stack<std::map<std::string, std::pair<std::string, size_t>>> tempStack = scopes;
+    std::stack<std::map<std::string, VarInfo>> tempStack = scopes;
     while (!tempStack.empty())
     {
         auto& currentScope = tempStack.top();
@@ -182,7 +228,8 @@ static std::pair<bool, std::pair<std::string, size_t>> lookupVariable(const std:
         }
         tempStack.pop();
     }
-    return {false, {"", 0}}; // Not found
+    // not found; return a default VarInfo to satisfy the type
+    return {false, {"", 0, Type{Type::INT,0}}};
 }
 
 // Function to emit code for applying deferred postfix operations
@@ -193,9 +240,9 @@ void emitDeferredPostfixOps(std::ofstream& f)
         auto lookupResult = lookupVariable(deferredOp.varName);
         if (lookupResult.first)
         {
-            auto pair = lookupResult.second;
-            std::string uniqueName = pair.first;
-            size_t index = pair.second;
+            VarInfo info = lookupResult.second;
+            std::string uniqueName = info.uniqueName;
+            size_t index = info.index;
             std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " for deferred postfix" << std::endl;
             if (deferredOp.op == "++")
@@ -849,12 +896,12 @@ struct FunctionCallNode : ASTNode
 struct FunctionNode : ASTNode
 {
     std::string name;
-    TokenType returnType; // Store the return type (TOKEN_INT, TOKEN_CHAR, or TOKEN_VOID)
-    std::vector<std::pair<std::string, std::string>> parameters; // (type, name) pairs
+    Type returnType; // Store the return type (with possible pointer levels)
+    std::vector<std::pair<Type, std::string>> parameters; // (type, name) pairs
     std::vector<std::unique_ptr<ASTNode>> body;
     bool isExternal;
 
-    FunctionNode(const std::string& name, TokenType rtype, std::vector<std::pair<std::string, std::string>> params, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern)
+    FunctionNode(const std::string& name, Type rtype, std::vector<std::pair<Type, std::string>> params, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern)
         : name(name), returnType(rtype), parameters(std::move(params)), body(std::move(body)), isExternal(isExtern) {}
 
     void emitData(std::ofstream& f) const override
@@ -933,8 +980,8 @@ struct FunctionNode : ASTNode
                 index = 1000 + (i - 6) * 8;
             }
 
-            // Add the parameter to the current scope
-            scopes.top()[paramName] = {uniqueName, index};
+            // Add the parameter to the current scope (record its type as well)
+            scopes.top()[paramName] = {uniqueName, index, parameters[i].first};
         }
 
         // Emit the function body
@@ -945,7 +992,7 @@ struct FunctionNode : ASTNode
 
         // No epilogue here anymore; handled by ReturnNode
         // If no return statement, we'll add an implicit one for void functions later
-        if (returnType == TOKEN_VOID)
+        if (returnType.base == Type::VOID && returnType.pointerLevel == 0)
         {
             f << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "    mov rsp, rbp " << ";; Restore stack pointer" << std::endl;
@@ -1016,11 +1063,10 @@ struct DeclarationNode : ASTNode
 {
     std::string identifier;
     std::unique_ptr<ASTNode> initializer;
-    TokenType type;
-    int pointerLevel;   // 0 for non-pointer, 1 for *, 2 for **, etc.
+    Type varType;        // includes base and pointer levels
 
-    DeclarationNode(const std::string& id, std::unique_ptr<ASTNode> init = nullptr, TokenType t = TOKEN_INT, int pLevel = 0)
-        : identifier(id), initializer(std::move(init)), type(t), pointerLevel(pLevel) {}
+    DeclarationNode(const std::string& id, Type t, std::unique_ptr<ASTNode> init = nullptr)
+        : identifier(id), initializer(std::move(init)), varType(t) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1035,7 +1081,7 @@ struct DeclarationNode : ASTNode
         std::string uniqueName = generateUniqueName(identifier);
         functionVariableIndex++;  // Allocate next index
         size_t index = functionVariableIndex;
-        scopes.top()[identifier] = {uniqueName, index};
+        scopes.top()[identifier] = {uniqueName, index, varType};
 
         // f << std::left << std::setw(COMMENT_COLUMN) << "    sub rsp, 8" << ";; Allocate space for " << uniqueName << std::endl;
 
@@ -1054,17 +1100,15 @@ struct GlobalDeclarationNode : ASTNode
 {
     std::string identifier;
     std::unique_ptr<ASTNode> initializer;
-    TokenType type;
-    int pointerLevel;
+    Type varType;
     bool isExternal;
 
     GlobalDeclarationNode(const std::string& id,
+                          Type t,
                           std::unique_ptr<ASTNode> init = nullptr,
-                          TokenType t = TOKEN_INT,
-                          int pLevel = 0,
                           bool isExtern = false)
-        : identifier(id), initializer(std::move(init)), type(t),
-          pointerLevel(pLevel), isExternal(isExtern) {}
+        : identifier(id), initializer(std::move(init)), varType(t),
+          isExternal(isExtern) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1133,9 +1177,9 @@ struct AddressOfNode : ASTNode
 
         if (found)
         {
-            auto pair = lookupResult.second;
-            std::string uniqueName = pair.first;
-            size_t index = pair.second;
+            VarInfo info = lookupResult.second;
+            std::string uniqueName = info.uniqueName;
+            size_t index = info.index;
             // All variables (parameters and locals) are now on the stack relative to rbp
             std::string instruction = "    lea rax, [rbp - " + std::to_string(index * 8) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of variable " << uniqueName << std::endl;
@@ -1156,13 +1200,13 @@ struct AddressOfNode : ASTNode
 struct ArrayDeclarationNode : ASTNode
 {
     std::string identifier;
-    TokenType type;                    // Base type (e.g., TOKEN_INT)
+    Type varType;                    // Type for array (treated as pointer to element for checking)
     std::vector<size_t> dimensions;    // Array dimensions (e.g., {5} for arr[5], {2, 3} for arr[2][3])
     std::vector<std::unique_ptr<ASTNode>> initializer; // Optional initializer list
 
-    ArrayDeclarationNode(const std::string& id, TokenType t, std::vector<size_t> dims,
+    ArrayDeclarationNode(const std::string& id, Type t, std::vector<size_t> dims,
                          std::vector<std::unique_ptr<ASTNode>> init = {})
-        : identifier(id), type(t), dimensions(std::move(dims)), initializer(std::move(init)) {}
+        : identifier(id), varType(t), dimensions(std::move(dims)), initializer(std::move(init)) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1178,7 +1222,7 @@ struct ArrayDeclarationNode : ASTNode
 
         functionVariableIndex++;  // Allocate index for array base
         size_t baseIndex = functionVariableIndex;
-        scopes.top()[identifier] = {uniqueName, baseIndex};
+        scopes.top()[identifier] = {uniqueName, baseIndex, varType};
 
         std::string instruction = "    sub rsp, " + std::to_string(totalSize);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Allocate space for array " << uniqueName
@@ -1204,7 +1248,7 @@ struct ArrayDeclarationNode : ASTNode
         for (size_t i = 1; i < totalElements; ++i)
         {
             functionVariableIndex++;
-            scopes.top()["__reserved_" + uniqueName + "_" + std::to_string(i)] = {uniqueName, baseIndex + i};
+            scopes.top()["__reserved_" + uniqueName + "_" + std::to_string(i)] = {uniqueName, baseIndex + i, varType};
         }
     }
 };
@@ -1243,9 +1287,9 @@ struct ArrayAccessNode : ASTNode
         size_t baseOffset = 0;
         if (found)
         {
-            auto pairAA = lookupResult.second;
-            uniqueName = pairAA.first;
-            baseIndex = pairAA.second;
+            VarInfo infoAA = lookupResult.second;
+            uniqueName = infoAA.uniqueName;
+            baseIndex = infoAA.index;
             baseOffset = baseIndex * 8; // Base offset from rbp in bytes
         }
 
@@ -1408,9 +1452,9 @@ struct AssignmentNode : ASTNode
                 size_t index = 0;
                 if (found)
                 {
-                    auto pairA = lookupResult.second;
-                    uniqueName = pairA.first;
-                    index = pairA.second;
+                    VarInfo infoA = lookupResult.second;
+                    uniqueName = infoA.uniqueName;
+                    index = infoA.index;
                 }
                 f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Save the value" << std::endl;
                 if (found)
@@ -1439,9 +1483,9 @@ struct AssignmentNode : ASTNode
                 reportError(line, col, "Array " + identifier + " not found in scope");
                 hadError = true;
             }
-            auto pairB = lookupResult.second;
-            std::string uniqueName = pairB.first;
-            size_t baseIndex = pairB.second;
+            VarInfo infoB = lookupResult.second;
+            std::string uniqueName = infoB.uniqueName;
+            size_t baseIndex = infoB.index;
             size_t baseOffset = baseIndex * 8;
 
             f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Save the value to assign" << std::endl;
@@ -1528,9 +1572,9 @@ struct AssignmentNode : ASTNode
             auto lookupResult = lookupVariable(identifier);
             if (lookupResult.first)
             {
-                auto pairC = lookupResult.second;
-                std::string uniqueName = pairC.first;
-                size_t index = pairC.second;
+                VarInfo infoC = lookupResult.second;
+                std::string uniqueName = infoC.uniqueName;
+                size_t index = infoC.index;
                 std::string instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in local variable " << uniqueName << std::endl;
             }
@@ -1946,9 +1990,9 @@ struct UnaryOpNode : ASTNode
             auto lookupResult = lookupVariable(name);
             if (lookupResult.first)
             {
-                auto pairD = lookupResult.second;
-                std::string uniqueName = pairD.first;
-                size_t index = pairD.second;
+                VarInfo infoD = lookupResult.second;
+                std::string uniqueName = infoD.uniqueName;
+                size_t index = infoD.index;
                 std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax" << std::endl;
                 if (op == "++")
@@ -1983,9 +2027,9 @@ struct UnaryOpNode : ASTNode
             auto lookupResult = lookupVariable(name);
             if (lookupResult.first)
             {
-                auto pair = lookupResult.second;
-                std::string uniqueName = pair.first;
-                size_t index = pair.second;
+                VarInfo info = lookupResult.second;
+                std::string uniqueName = info.uniqueName;
+                size_t index = info.index;
                 // Load the current value and save it
                 std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax (postfix value)" << std::endl;
@@ -2146,7 +2190,7 @@ struct IdentifierNode : ASTNode
         // Look up the variable in the scope stack
         auto lookupResult = lookupVariable(name);
         bool found = lookupResult.first;
-        auto infoResult = lookupResult.second;
+        VarInfo infoResult = lookupResult.second;
         bool isGlobal = false;
         if (!found)
         {
@@ -2161,8 +2205,8 @@ struct IdentifierNode : ASTNode
 
         if (found)
         {
-            auto uniqueName = infoResult.first;
-            auto index = infoResult.second;
+            std::string uniqueName = infoResult.uniqueName;
+            size_t index = infoResult.index;
 
             // Check if this is a stack parameter (index >= 1000)
             if (index >= 1000)
@@ -2489,11 +2533,11 @@ class Parser
 
         if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID)
 	    {
-            TokenType type = token.type;
-            eat(type);
+            TokenType typeTok = token.type;
+            eat(typeTok);
             int pointerLevel = 0;
 
-            // Check for pointer or array declaration
+            // Check for pointer qualification
             while (currentToken.type == TOKEN_MUL)
             {
                 eat(TOKEN_MUL);
@@ -2525,9 +2569,13 @@ class Parser
                 eat(TOKEN_RBRACKET);
             }
 
+            Type baseType = makeType(typeTok, pointerLevel);
+
             if (!dimensions.empty())
             {
-                // Array declaration
+                // Array declaration - treat as pointer to element
+                Type arrayType = baseType;
+                arrayType.pointerLevel += 1;
                 std::vector<std::unique_ptr<ASTNode>> initializer;
                 if (currentToken.type == TOKEN_ASSIGN)
                 {
@@ -2535,7 +2583,7 @@ class Parser
                     initializer = parseInitializerList(); // Parse the initializer list
                 }
                 eat(TOKEN_SEMICOLON);
-                return std::make_unique<ArrayDeclarationNode>(identifier, type, std::move(dimensions), std::move(initializer));
+                return std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer));
             }
             else
             {
@@ -2547,10 +2595,9 @@ class Parser
                     initializer = expression(currentFunction);
                 }
                 eat(TOKEN_SEMICOLON);
-                return std::make_unique<DeclarationNode>(identifier, std::move(initializer), type, pointerLevel);
+                return std::make_unique<DeclarationNode>(identifier, baseType, std::move(initializer));
             }
         }
-
         else if (token.type == TOKEN_MUL) // Dereference assignment (e.g., *ptr = ...)
         {
             int dereferenceLevel = 0;
@@ -2885,7 +2932,7 @@ class Parser
                 std::string name = currentToken.value;
                 eat(TOKEN_IDENTIFIER);
                 eat(TOKEN_SEMICOLON);
-                auto functionNode = std::make_unique<FunctionNode>(name, TOKEN_VOID, std::vector<std::pair<std::string, std::string>>(), std::vector<std::unique_ptr<ASTNode>>(), isExternal);
+                auto functionNode = std::make_unique<FunctionNode>(name, makeType(TOKEN_VOID), std::vector<std::pair<Type, std::string>>(), std::vector<std::unique_ptr<ASTNode>>(), isExternal);
                 return functionNode;
             }
         }
@@ -2913,14 +2960,14 @@ class Parser
                 init = expression();
             }
             eat(TOKEN_SEMICOLON);
-            return std::make_unique<GlobalDeclarationNode>(name, std::move(init), returnType, 0, isExternal);
+            return std::make_unique<GlobalDeclarationNode>(name, makeType(returnType), std::move(init), isExternal);
         }
 
         // Parse the parameters list for a function
         eat(TOKEN_LPAREN);
-        std::vector<std::pair<std::string, std::string>> parameters; // Store (type, name) pairs
+        std::vector<std::pair<Type, std::string>> parameters; // Store (type, name) pairs
         while (currentToken.type != TOKEN_RPAREN)
-	    {
+        {
             // Parse the parameter type (int, char or void)
             TokenType paramType = currentToken.type;
             if (paramType != TOKEN_INT && paramType != TOKEN_CHAR && paramType != TOKEN_VOID)
@@ -2928,17 +2975,20 @@ class Parser
                 reportError(currentToken.line, currentToken.col, "Expected parameter type (int, char or void)");
                 hadError = true;
             }
-            
-            eat(TOKEN_INT);
-            
+            eat(paramType);
+            int ptrLevel = 0;
+            while (currentToken.type == TOKEN_MUL)
+            {
+                eat(TOKEN_MUL);
+                ptrLevel++;
+            }
+
             // Parse the parameter name
             std::string name = currentToken.value;
             eat(TOKEN_IDENTIFIER);
 
             // Add the parameter to the list
-            parameters.push_back({paramType == TOKEN_INT ? "int" : "char", name});
-
-            // Check for a comma (more parameters)
+            parameters.push_back({ makeType(paramType, ptrLevel), name });
             if (currentToken.type == TOKEN_COMMA)
 	        {
                 eat(TOKEN_COMMA);
@@ -2948,7 +2998,7 @@ class Parser
         eat(TOKEN_RPAREN);
 
         // Create the FunctionNode
-        auto functionNode = std::make_unique<FunctionNode>(name, returnType, parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal);
+        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal);
 
         if (isExternal)
         {
@@ -3209,10 +3259,10 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 }
 
 // Semantic check helpers: walk the AST and ensure variables are declared in scope
-static bool localLookupName(const std::stack<std::map<std::string, std::pair<std::string, size_t>>>& s, const std::string& name)
+static bool localLookupName(const std::stack<std::map<std::string, VarInfo>>& s, const std::string& name)
 {
     // Look through all local scopes first
-    std::stack<std::map<std::string, std::pair<std::string, size_t>>> tmp = s;
+    std::stack<std::map<std::string, VarInfo>> tmp = s;
     while (!tmp.empty())
     {
         auto &m = tmp.top();
@@ -3228,9 +3278,124 @@ static bool localLookupName(const std::stack<std::map<std::string, std::pair<std
 }
 
 // Forward declaration
-static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, std::pair<std::string, size_t>>> &scopes, const FunctionNode* currentFunction);
+static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, VarInfo>> &scopes, const FunctionNode* currentFunction);
 
-static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std::string, std::pair<std::string, size_t>>> &scopes, const FunctionNode* currentFunction)
+// simple compatibility predicate (allow integer-to-integer conversions, pointer == pointer).
+static bool typesCompatible(const Type& dest, const Type& src)
+{
+    if (dest == src) return true;
+    auto isIntLike = [&](const Type& t){ return t.pointerLevel == 0 && (t.base == Type::INT || t.base == Type::CHAR); };
+    if (isIntLike(dest) && isIntLike(src)) return true;
+    // allow assigning 0 to any pointer
+    if (isIntLike(src) && src.pointerLevel == 0 && dest.pointerLevel > 0)
+        return true;
+    return false;
+}
+
+// helper used during semantic checking to lookup a name in the provided scope stack
+static std::pair<bool, VarInfo> lookupInScopes(const std::stack<std::map<std::string, VarInfo>> &s, const std::string &name)
+{
+    std::stack<std::map<std::string, VarInfo>> tmp = s;
+    while (!tmp.empty())
+    {
+        auto &m = tmp.top();
+        if (m.find(name) != m.end())
+            return {true, m.at(name)};
+        tmp.pop();
+    }
+    return {false, {"",0,{Type::INT,0}}};
+}
+
+// determine type of left-hand side of an assignment
+static Type getLValueType(const AssignmentNode* asg, const std::stack<std::map<std::string, VarInfo>> &scopes)
+{
+    Type baseType = {Type::INT,0};
+    auto lookupResult = lookupInScopes(scopes, asg->identifier);
+    if (lookupResult.first)
+        baseType = lookupResult.second.type;
+    else if (globalVariables.count(asg->identifier))
+        baseType = globalVariables[asg->identifier];
+
+    int ptr = baseType.pointerLevel - asg->dereferenceLevel;
+    if (ptr < 0) ptr = 0;
+    baseType.pointerLevel = ptr;
+    for (size_t i = 0; i < asg->indices.size(); ++i)
+    {
+        if (baseType.pointerLevel > 0) baseType.pointerLevel--;
+    }
+    return baseType;
+}
+
+// compute the static type of an expression
+static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::string, VarInfo>> &scopes, const FunctionNode* currentFunction)
+{
+    if (!node) return {Type::INT,0};
+    if (auto idn = dynamic_cast<const IdentifierNode*>(node))
+    {
+        auto lookupResult = lookupInScopes(scopes, idn->name);
+        if (lookupResult.first) return lookupResult.second.type;
+        auto git = globalVariables.find(idn->name);
+        if (git != globalVariables.end()) return git->second;
+        return {Type::INT,0};
+    }
+    if (auto num = dynamic_cast<const NumberNode*>(node)) return {Type::INT,0};
+    if (auto ch = dynamic_cast<const CharLiteralNode*>(node)) return {Type::CHAR,0};
+    if (auto str = dynamic_cast<const StringLiteralNode*>(node)) { Type t; t.base=Type::CHAR; t.pointerLevel=1; return t; }
+    if (auto un = dynamic_cast<const UnaryOpNode*>(node))
+    {
+        if (un->op == "++" || un->op == "--")
+        {
+            auto lookupResult = lookupInScopes(scopes, un->name);
+            if (lookupResult.first) return lookupResult.second.type;
+            auto git = globalVariables.find(un->name);
+            if (git != globalVariables.end()) return git->second;
+            return {Type::INT,0};
+        }
+    }
+    if (auto ao = dynamic_cast<const AddressOfNode*>(node))
+    {
+        auto lookupResult = lookupVariable(ao->Identifier);
+        Type bt = {Type::INT,0};
+        if (lookupResult.first) bt = lookupResult.second.type;
+        else if (globalVariables.count(ao->Identifier)) bt = globalVariables[ao->Identifier];
+        bt.pointerLevel++;
+        return bt;
+    }
+    if (auto dn = dynamic_cast<const DereferenceNode*>(node))
+    {
+        Type pt = computeExprType(dn->operand.get(), scopes, currentFunction);
+        if (pt.pointerLevel > 0) pt.pointerLevel--;
+        return pt;
+    }
+    if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
+    {
+        Type lt = computeExprType(bin->left.get(), scopes, currentFunction);
+        Type rt = computeExprType(bin->right.get(), scopes, currentFunction);
+        auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT||t.base==Type::CHAR); };
+        if (isIntLike(lt) && isIntLike(rt)) return {Type::INT,0};
+        if (lt.pointerLevel>0 && isIntLike(rt) && (bin->op=="+"||bin->op=="-")) return lt;
+        if (rt.pointerLevel>0 && isIntLike(lt) && bin->op=="+") return rt;
+        return lt;
+    }
+    if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
+    {
+        auto it = functionReturnTypes.find(fc->functionName);
+        if (it != functionReturnTypes.end()) return it->second;
+        return {Type::INT,0};
+    }
+    if (auto aa = dynamic_cast<const ArrayAccessNode*>(node))
+    {
+        Type baseType = {Type::INT,0};
+        auto lookupResult = lookupVariable(aa->identifier);
+        if (lookupResult.first) baseType = lookupResult.second.type;
+        else if (globalVariables.count(aa->identifier)) baseType = globalVariables[aa->identifier];
+        if (baseType.pointerLevel>0) baseType.pointerLevel--;
+        return baseType;
+    }
+    return {Type::INT,0};
+}
+
+static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std::string, VarInfo>> &scopes, const FunctionNode* currentFunction)
 {
     if (!node) return;
     // Identifier usage
@@ -3249,6 +3414,34 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
     {
         semanticCheckExpression(bin->left.get(), scopes, currentFunction);
         semanticCheckExpression(bin->right.get(), scopes, currentFunction);
+        // type check
+        Type lt = computeExprType(bin->left.get(), scopes, currentFunction);
+        Type rt = computeExprType(bin->right.get(), scopes, currentFunction);
+        bool ok = true;
+        // relational/comparison operators allow most combinations but pointers must match
+        if (bin->op == "<" || bin->op == ">" || bin->op == "<=" || bin->op == ">=" ||
+            bin->op == "==" || bin->op == "!=" )
+        {
+            if (lt.pointerLevel != rt.pointerLevel || lt.base != rt.base)
+                ok = false;
+        }
+        else if (bin->op == "+" || bin->op == "-" || bin->op == "*" || bin->op == "/" ||
+                 bin->op == "&" || bin->op == "|" || bin->op == "^" || bin->op == "<<" || bin->op == ">>")
+        {
+            // arithmetic: at least one must be integer-like; pointer arithmetic only + or -
+            auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT || t.base==Type::CHAR); };
+            if (!( (isIntLike(lt) && isIntLike(rt)) ||
+                   (lt.pointerLevel>0 && isIntLike(rt) && (bin->op=="+"||bin->op=="-")) ||
+                   (rt.pointerLevel>0 && isIntLike(lt) && bin->op=="+") ))
+            {
+                ok = false;
+            }
+        }
+        if (!ok)
+        {
+            reportError(0, 0, "Incompatible operand types for operator '" + bin->op + "'");
+            hadError = true;
+        }
         return;
     }
 
@@ -3268,6 +3461,29 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
     {
         for (const auto& arg : fc->arguments)
             semanticCheckExpression(arg.get(), scopes, currentFunction);
+        // check against known signature if available
+        auto it = functionParamTypes.find(fc->functionName);
+        if (it != functionParamTypes.end())
+        {
+            const auto& params = it->second;
+            if (params.size() != fc->arguments.size())
+            {
+                reportError(0, 0, "Function '" + fc->functionName + "' called with wrong number of arguments");
+                hadError = true;
+            }
+            else
+            {
+                for (size_t i = 0; i < params.size(); ++i)
+                {
+                    Type argType = computeExprType(fc->arguments[i].get(), scopes, currentFunction);
+                    if (!typesCompatible(params[i], argType))
+                    {
+                        reportError(0, 0, "Argument " + std::to_string(i) + " of '" + fc->functionName + "' has incompatible type");
+                        hadError = true;
+                    }
+                }
+            }
+        }
         return;
     }
 
@@ -3284,7 +3500,7 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
     }
 }
 
-static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, std::pair<std::string, size_t>>> &scopes, const FunctionNode* currentFunction)
+static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, VarInfo>> &scopes, const FunctionNode* currentFunction)
 {
     if (!node) return;
 
@@ -3293,7 +3509,7 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
         // Add to current scope
         std::string name = decl->identifier;
         size_t index = scopes.top().size() + 1;
-        scopes.top()[name] = {generateUniqueName(name), index};
+        scopes.top()[name] = {generateUniqueName(name), index, decl->varType};
         if (decl->initializer) semanticCheckExpression(decl->initializer.get(), scopes, currentFunction);
         return;
     }
@@ -3302,14 +3518,24 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
     {
         std::string name = arrd->identifier;
         size_t baseIndex = scopes.top().size() + 1;
-        scopes.top()[name] = {generateUniqueName(name), baseIndex};
+        scopes.top()[name] = {generateUniqueName(name), baseIndex, arrd->varType};
         for (const auto& init : arrd->initializer) semanticCheckExpression(init.get(), scopes, currentFunction);
         return;
     }
 
     if (auto asg = dynamic_cast<const AssignmentNode*>(node))
     {
+        // first, recurse into the right-hand expression to report undefined names
         semanticCheckExpression(asg->expression.get(), scopes, currentFunction);
+        // perform a basic type check
+        Type lhs = getLValueType(asg, scopes);
+        Type rhs = computeExprType(asg->expression.get(), scopes, currentFunction);
+        if (!typesCompatible(lhs, rhs))
+        {
+            reportError(asg->line, asg->col,
+                        "Type mismatch in assignment: cannot assign '" + rhs.toString() + "' to '" + lhs.toString() + "'");
+            hadError = true;
+        }
         return;
     }
 
@@ -3357,7 +3583,20 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
 
     if (auto rn = dynamic_cast<const ReturnNode*>(node))
     {
-        if (rn->expression) semanticCheckExpression(rn->expression.get(), scopes, currentFunction);
+        if (rn->expression)
+        {
+            semanticCheckExpression(rn->expression.get(), scopes, currentFunction);
+            if (currentFunction)
+            {
+                Type exprType = computeExprType(rn->expression.get(), scopes, currentFunction);
+                if (!typesCompatible(currentFunction->returnType, exprType))
+                {
+                    reportError(0, 0,
+                                "Return type mismatch: function '" + currentFunction->name + "' returns '" + currentFunction->returnType.toString() + "' but expression is '" + exprType.toString() + "'");
+                    hadError = true;
+                }
+            }
+        }
         return;
     }
 
@@ -3375,7 +3614,7 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
 // Perform semantic checks on the AST, including globals and functions
 static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
 {
-    // First pass: collect all globals and validate their initializers
+    // First pass: collect all globals, functions and validate initializers
     for (const auto& node : ast)
     {
         if (auto gd = dynamic_cast<const class GlobalDeclarationNode*>(node.get()))
@@ -3387,7 +3626,8 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
                 reportError(0, 0, "Redefinition of global variable '" + name + "'");
                 hadError = true;
             }
-            globalVariables.insert(name);
+            // store the type of the global variable as well
+            globalVariables[name] = gd->varType;
             if (gd->isExternal)
                 externGlobals.insert(name);
 
@@ -3395,7 +3635,7 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
             {
                 // allow only constant initializers for globals
                 {
-                    std::stack<std::map<std::string, std::pair<std::string, size_t>>> emptyScopes;
+                    std::stack<std::map<std::string, VarInfo>> emptyScopes;
                     semanticCheckExpression(gd->initializer.get(), emptyScopes, nullptr);
                 }
                 if (!gd->initializer->isConstant())
@@ -3405,6 +3645,15 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
                 }
             }
         }
+        else if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
+        {
+            // record function signature for later checks
+            functionReturnTypes[fn->name] = fn->returnType;
+            std::vector<Type> paramTypes;
+            for (const auto& p : fn->parameters)
+                paramTypes.push_back(p.first);
+            functionParamTypes[fn->name] = std::move(paramTypes);
+        }
     }
 
     // Second pass: check functions (locals) with global names visible
@@ -3412,13 +3661,14 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
     {
         if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
         {
-            std::stack<std::map<std::string, std::pair<std::string, size_t>>> localScopes;
+            std::stack<std::map<std::string, VarInfo>> localScopes;
             localScopes.push({});
             for (size_t i = 0; i < fn->parameters.size(); ++i)
             {
                 const auto& pname = fn->parameters[i].second;
+                const Type& ptype = fn->parameters[i].first;
                 size_t index = localScopes.top().size() + 1;
-                localScopes.top()[pname] = {generateUniqueName(pname), index};
+                localScopes.top()[pname] = {generateUniqueName(pname), index, ptype};
             }
             for (const auto& stmt : fn->body) semanticCheckStatement(stmt.get(), localScopes, fn);
         }

@@ -1,10 +1,10 @@
-extern printf;
-
-char x = 'E';
-int y = 420;
+extern int printf(char* s, char c, int i);
 
 int main()
 {
-    printf("x = %c\ny = %d\n", x, y);
+    char p = 'E';
+    int a = p; // mismatch pointer->int
+
+    printf("p = %c\na = %d\n", p, a);
     return 0;
 }
