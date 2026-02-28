@@ -14,6 +14,7 @@
 #include <regex>
 #include <set>
 #include <map>
+#include <functional>
 
 // Define fixed column position for comments
 #define COMMENT_COLUMN 32
@@ -41,11 +42,16 @@ struct Type {
     }
 };
 
+// forward declarations for AST node types used in early code
+struct ArrayDeclarationNode;
+struct BlockNode;
+
 // information stored for each variable in a scope
 struct VarInfo {
     std::string uniqueName;
     size_t index;
     Type type;
+    std::vector<size_t> dimensions; // for arrays: size of each dimension, empty for scalars/pointers
 };
 
 // Global stack to track scopes
@@ -53,6 +59,8 @@ static std::stack<std::map<std::string, VarInfo>> scopes;
 
 // Registry for variables declared at global scope along with their types.
 static std::unordered_map<std::string, Type> globalVariables;
+// For globals that are arrays, remember their dimensions so indexing works
+static std::unordered_map<std::string, std::vector<size_t>> globalArrayDimensions;
 // Track which globals were declared with "extern" so we avoid emitting storage
 static std::set<std::string> externGlobals;
 
@@ -716,7 +724,55 @@ struct ASTNode
     // Methods for constant checking
     virtual bool isConstant() const { return false; }
     virtual int getConstantValue() const { reportError(0, 0, "Not a constant node"); return 0; }
+
+    // How many bytes of stack space this node requires for array declarations
+    // (used when computing total frame size in function prologue)
+    virtual size_t getArraySpaceNeeded() const { return 0; }
 };
+
+// initializer tree node used for array initialization
+struct InitNode {
+    bool isList;
+    std::vector<InitNode> children;   // valid when isList == true
+    std::unique_ptr<ASTNode> value;   // valid when isList == false
+
+    InitNode() : isList(true) {}
+    explicit InitNode(std::unique_ptr<ASTNode> val)
+        : isList(false), value(std::move(val)) {}
+    explicit InitNode(std::vector<InitNode> list)
+        : isList(true), children(std::move(list)) {}
+
+    // count total number of leaf values (non-list nodes)
+    size_t countLeaves() const {
+        if (isList) {
+            size_t sum = 0;
+            for (const auto &c : children) sum += c.countLeaves();
+            return sum;
+        }
+        return 1;
+    }
+
+    // compute number of top‑level elements (length of immediate list)
+    size_t topLevelCount() const {
+        if (isList) return children.size();
+        return 1;
+    }
+
+    // walk leaves in row‑major order and push pointers to them
+    void flattenLeaves(std::vector<ASTNode*> &out) const {
+        if (isList) {
+            for (const auto &c : children) c.flattenLeaves(out);
+        } else {
+            out.push_back(value.get());
+        }
+    }
+};
+
+// helper free functions (sometimes convenient)
+static size_t countInitLeaves(const InitNode &n) { return n.countLeaves(); }
+static size_t topLevelInitCount(const InitNode &n) { return n.topLevelCount(); }
+static void collectInitLeaves(const InitNode &n, std::vector<ASTNode*> &out) { n.flattenLeaves(out); }
+
 
 // Wrapper node to defer postfix operations until end of statement
 struct StatementWithDeferredOpsNode : ASTNode
@@ -956,9 +1012,15 @@ struct FunctionNode : ASTNode
         size_t totalParams = std::min(parameters.size(), (size_t)6);
         
         // Conservative estimate: count each body statement as potentially needing 8 bytes
-        // This ensures we always have enough space
+        // This covers non-array locals but is not accurate for arrays.
         size_t estimatedLocalVars = body.size();
-        size_t totalLocalSpace = (totalParams + estimatedLocalVars) * 8;
+
+        // Compute additional space required for all local arrays in this function
+        size_t totalArraySpace = 0;
+        for (const auto& stmt : body)
+            totalArraySpace += stmt->getArraySpaceNeeded();
+
+        size_t totalLocalSpace = (totalParams + estimatedLocalVars) * 8 + totalArraySpace;
         
         // Align to multiple of 16: round up to next 16-byte boundary
         size_t alignedSpace = ((totalLocalSpace + 15) / 16) * 16;
@@ -1218,54 +1280,178 @@ struct ArrayDeclarationNode : ASTNode
 {
     std::string identifier;
     Type varType;                    // Type for array (treated as pointer to element for checking)
-    std::vector<size_t> dimensions;    // Array dimensions (e.g., {5} for arr[5], {2, 3} for arr[2][3])
-    std::vector<std::unique_ptr<ASTNode>> initializer; // Optional initializer list
+    std::vector<size_t> dimensions; // Array dimensions ({5} for arr[5], {2,3} for arr[2][3])
+    std::unique_ptr<InitNode> initializer; // optional nested initializer tree
+    bool isGlobal = false;          // true if this declaration appears at file scope
 
     ArrayDeclarationNode(const std::string& id, Type t, std::vector<size_t> dims,
-                         std::vector<std::unique_ptr<ASTNode>> init = {})
-        : identifier(id), varType(t), dimensions(std::move(dims)), initializer(std::move(init)) {}
+                         std::unique_ptr<InitNode> init = nullptr, bool global = false)
+        : identifier(id), varType(t), dimensions(std::move(dims)), initializer(std::move(init)), isGlobal(global) {}
+
+    size_t getArraySpaceNeeded() const override
+    {
+        if (isGlobal) return 0;
+        // compute dimensions with potential inference of first element
+        std::vector<size_t> dimsCopy = dimensions;
+        if (!dimsCopy.empty() && dimsCopy[0] == 0)
+        {
+            if (initializer)
+            {
+                size_t flatCount = initializer->countLeaves();
+                size_t productRest = 1;
+                for (size_t j = 1; j < dimsCopy.size(); ++j)
+                    productRest *= dimsCopy[j];
+                if (productRest == 0) productRest = 1;
+                dimsCopy[0] = (flatCount + productRest - 1) / productRest;
+            }
+            else
+            {
+                dimsCopy[0] = 1; // fallback to avoid zero-sized
+            }
+        }
+        size_t totalElements = 1;
+        for (size_t dim : dimsCopy)
+            totalElements *= (dim == 0 ? 1 : dim);
+        return totalElements * 8;
+    }
 
     void emitData(std::ofstream& f) const override
     {
-        // For now, we'll handle local arrays on the stack; globals could be added later
+        if (!isGlobal) return; // only globals need data
+        // ensure any literals in initializer are emitted
+        // emit data for any literals in initializer
+        if (initializer)
+        {
+            std::vector<ASTNode*> leaves;
+            initializer->flattenLeaves(leaves);
+            for (auto *leaf : leaves)
+                leaf->emitData(f);
+        }
+
+        // compute total elements; for globals the stored dimensions may contain a 0
+        std::vector<size_t> dims = dimensions;
+        if (isGlobal && !dims.empty() && dims[0] == 0)
+        {
+            auto it = globalArrayDimensions.find(identifier);
+            if (it != globalArrayDimensions.end())
+                dims = it->second;
+        }
+        size_t totalElements = 1;
+        for (size_t dim : dims) totalElements *= dim;
+        // Prepare flat list of initializer values
+        std::vector<ASTNode*> flat;
+        if (initializer)
+            initializer->flattenLeaves(flat);
+
+        // emit label and data
+        f << "\t" << identifier << ":" << std::endl;
+        if (!flat.empty())
+        {
+            f << "\t" << "dq ";
+            for (size_t i = 0; i < flat.size(); ++i)
+            {
+                if (i) f << ", ";
+                if (flat[i]->isConstant())
+                    f << flat[i]->getConstantValue();
+                else
+                    f << "0"; // fallback
+            }
+            // pad with zeros if initializer had fewer elements
+            for (size_t i = flat.size(); i < totalElements; ++i)
+            {
+                f << ", 0";
+            }
+        }
+        else
+        {
+            // no initializer: reserve space (indent to avoid being treated as instruction)
+            f << "\trq " << totalElements;
+        }
+        f << "\n";
     }
 
     void emitCode(std::ofstream& f) const override
     {
+        if (isGlobal)
+        {
+            // For globals we don't emit runtime code; data will be emitted via emitData
+            return;
+        }
         std::string uniqueName = generateUniqueName(identifier);
+
+        // make mutable copy of dimensions so we can infer the first element
+        std::vector<size_t> dims = dimensions;
+        if (!dims.empty() && dims[0] == 0)
+        {
+            if (!initializer)
+            {
+                reportError(0, 0, "Cannot infer array size without initializer for " + identifier);
+                hadError = true;
+            }
+            else
+            {
+                size_t flatCount = countInitLeaves(*initializer);
+                size_t productRest = 1;
+                for (size_t j = 1; j < dims.size(); ++j)
+                    productRest *= dims[j];
+                if (productRest == 0) productRest = 1;
+                dims[0] = (flatCount + productRest - 1) / productRest;
+            }
+        }
+
+        // compute total number of elements from the dimensions copy
         size_t totalElements = 1;
-        for (size_t dim : dimensions) totalElements *= dim; // Total number of elements
-        size_t totalSize = totalElements * 8; // Total size in bytes (64-bit)
+        for (size_t dim : dims) totalElements *= dim;
+        size_t totalSize = totalElements * 8; // bytes
 
         functionVariableIndex++;  // Allocate index for array base
         size_t baseIndex = functionVariableIndex;
-        scopes.top()[identifier] = {uniqueName, baseIndex, varType};
+        VarInfo info{uniqueName, baseIndex, varType};
+        info.dimensions = dims; // record dims
+        scopes.top()[identifier] = info;
 
-        std::string instruction = "    sub rsp, " + std::to_string(totalSize);
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Allocate space for array " << uniqueName
-          << " (" << totalElements << " elements)" << std::endl;
+        // We reserved space for all local arrays in the function prologue, so
+        // we no longer need to adjust the stack pointer here.  The offsets for
+        // each element are computed via functionVariableIndex below and will be
+        // valid within the pre-allocated block.
+        // (This avoids growing the stack repeatedly at each declaration, which
+        // could trigger guard-page faults on deep stacks.)
+        
+        // NOTE: we keep the instruction comment for documentation purposes, but
+        // do not actually emit a sub rsp.
+        f << std::left << std::setw(COMMENT_COLUMN) << "    ;; [stack already allocated in prologue for array " << uniqueName << "]" << std::endl;
+        std::string instruction;  // used later when generating initializer stores
 
-        if (!initializer.empty())
+        if (initializer)
         {
-            if (initializer.size() > totalElements)
+            size_t flatCount = initializer->countLeaves();
+            if (flatCount > totalElements)
             {
                 reportError(0, 0, "Too many initializers for array " + identifier);
                 hadError = true;
             }
-
-            for (size_t i = 0; i < initializer.size(); ++i)
+            std::vector<ASTNode*> flat;
+            initializer->flattenLeaves(flat);
+            for (size_t i = 0; i < flat.size(); ++i)
             {
-                initializer[i]->emitCode(f);
+                flat[i]->emitCode(f);
                 instruction = "    mov [rbp - " + std::to_string(baseIndex * 8 + i * 8) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Initialize " << uniqueName << "[" << i << "]" << std::endl;
             }
+            // zero remaining elements
+            for (size_t i = flat.size(); i < totalElements; ++i)
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov qword [rbp - " + std::to_string(baseIndex * 8 + i * 8) + "], 0" << ";; Zero initialize " << uniqueName << "[" << i << "]" << std::endl;
+            }
         }
 
-        // Reserve space in the scope for the entire array
+        // Reserve space in the scope for the entire array (rest of the elements)
         for (size_t i = 1; i < totalElements; ++i)
         {
             functionVariableIndex++;
-            scopes.top()["__reserved_" + uniqueName + "_" + std::to_string(i)] = {uniqueName, baseIndex + i, varType};
+            VarInfo reserve{uniqueName, baseIndex + i, varType};
+            reserve.dimensions.clear();
+            scopes.top()["__reserved_" + uniqueName + "_" + std::to_string(i)] = reserve;
         }
     }
 };
@@ -1326,19 +1512,28 @@ struct ArrayAccessNode : ASTNode
             }
         }
 
+        // fetch dimension sizes from VarInfo or global map
+        std::vector<size_t> dims;
+        if (found)
+            dims = lookupResult.second.dimensions;
+        else if (isGlobal && globalArrayDimensions.count(identifier))
+            dims = globalArrayDimensions[identifier];
+
         if (allConstant && !constantIndices.empty())
         {
-            // Precompute the offset for constant indices
-            size_t totalOffset = baseOffset;
-            for (size_t i = 0; i < constantIndices.size(); ++i)
+            // Precompute the offset for constant indices using dims
+            size_t linear = 0;
+            for (size_t k = 0; k < constantIndices.size(); ++k)
             {
-                size_t multiplier = 1;
-                for (size_t j = i + 1; j < constantIndices.size(); ++j)
+                if (k == 0)
+                    linear = constantIndices[k];
+                else
                 {
-                    multiplier *= constantIndices[j]; // For multi-dimensional arrays
+                    size_t dimSize = (k < dims.size() ? dims[k] : 1);
+                    linear = linear * dimSize + constantIndices[k];
                 }
-                totalOffset += constantIndices[i] * multiplier * 8;
             }
+            size_t totalOffset = baseOffset + linear * 8;
 
             if (isGlobal)
             {
@@ -1359,33 +1554,24 @@ struct ArrayAccessNode : ASTNode
         }
         else
         {
-            // Dynamic indices: compute offset at runtime
-            for (size_t i = 0; i < indices.size(); ++i)
+            // Dynamic indices: compute linear offset at runtime
+            if (indices.empty())
             {
-                indices[i]->emitCode(f); // Evaluate index into rax
-                f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Push index " << i << std::endl;
-
-                if (i > 0)
-                {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Pop current index" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Pop accumulated offset" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    imul rax, rcx" << ";; Multiply by previous dimension" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Push updated offset" << std::endl;
-                }
+                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << ";; no index, treat as base" << std::endl;
             }
-
-            if (indices.size() > 1)
-            {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Pop final index" << std::endl;
-                for (size_t i = 1; i < indices.size(); ++i) {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Pop next index" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, rcx" << ";; Add to offset" << std::endl;
-                }
-            }
-            
             else
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Pop single index" << std::endl;
+                // start with first index
+                indices[0]->emitCode(f); // rax = idx0
+                for (size_t i = 1; i < indices.size(); ++i)
+                {
+                    // save rax (current linear) in rcx
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rax" << ";; save linear so far" << std::endl;
+                    indices[i]->emitCode(f); // rax = idx_i
+                    size_t dimSize = (i < dims.size() ? dims[i] : 1);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    imul rcx, " + std::to_string(dimSize) << ";; multiply by dimension size" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, rcx" << ";; add previous linear*dim" << std::endl;
+                }
             }
 
             f << std::left << std::setw(COMMENT_COLUMN) << "    shl rax, 3" << ";; Scale offset by 8 (sizeof(int64))" << std::endl;
@@ -1493,29 +1679,36 @@ struct AssignmentNode : ASTNode
         }
         else if (!indices.empty())
         {
-            // Array element assignment
+            // Array element assignment (supports global arrays)
             auto lookupResult = lookupVariable(identifier);
-            if (!lookupResult.first)
+            bool found = lookupResult.first;
+            bool isGlobal = false;
+            VarInfo infoB;
+            if (!found)
             {
-                reportError(line, col, "Array " + identifier + " not found in scope");
-                hadError = true;
+                isGlobal = (globalVariables.find(identifier) != globalVariables.end());
+                if (!isGlobal)
+                {
+                    reportError(line, col, "Array " + identifier + " not found in scope");
+                    hadError = true;
+                }
             }
-            VarInfo infoB = lookupResult.second;
+            if (found)
+                infoB = lookupResult.second;
+
             std::string uniqueName = infoB.uniqueName;
             size_t baseIndex = infoB.index;
             size_t baseOffset = baseIndex * 8;
 
             f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Save the value to assign" << std::endl;
 
-            // Check if all indices are constants
+            // gather constant indices
             bool allConstant = true;
             std::vector<size_t> constantIndices;
-            for (const auto& index : indices)
+            for (const auto& idx : indices)
             {
-                if (index->isConstant())
-                {
-                    constantIndices.push_back(index->getConstantValue());
-                }
+                if (idx->isConstant())
+                    constantIndices.push_back(idx->getConstantValue());
                 else
                 {
                     allConstant = false;
@@ -1523,35 +1716,55 @@ struct AssignmentNode : ASTNode
                 }
             }
 
+            // determine dimension sizes
+            std::vector<size_t> dims;
+            if (found)
+                dims = infoB.dimensions;
+            else if (isGlobal && globalArrayDimensions.count(identifier))
+                dims = globalArrayDimensions[identifier];
+
             if (allConstant && !constantIndices.empty())
             {
-                // Precompute the offset for constant indices
-                size_t totalOffset = baseOffset;
-                for (size_t i = 0; i < constantIndices.size(); ++i)
+                // compute linear index
+                size_t linear = 0;
+                for (size_t k = 0; k < constantIndices.size(); ++k)
                 {
-                    size_t multiplier = 1;
-                    for (size_t j = i + 1; j < constantIndices.size(); ++j)
+                    if (k == 0)
+                        linear = constantIndices[k];
+                    else
                     {
-                        multiplier *= constantIndices[j];
+                        size_t dimSize = (k < dims.size() ? dims[k] : 1);
+                        linear = linear * dimSize + constantIndices[k];
                     }
-                    totalOffset += constantIndices[i] * multiplier * 8;
                 }
+                size_t offsetBytes = linear * 8;
+                if (!isGlobal)
+                    offsetBytes += baseOffset;
 
                 f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Restore the value" << std::endl;
-                std::string instruction = "    mov [rbp - " + std::to_string(totalOffset) + "], rax";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store in " << uniqueName << "[";
-                for (size_t i = 0; i < constantIndices.size(); ++i)
-                    f << (i > 0 ? "," : "") << constantIndices[i];
-                f << "]" << std::endl;
+                if (isGlobal)
+                {
+                    std::string instr = "    mov [" + identifier;
+                    if (offsetBytes > 0) instr += " + " + std::to_string(offsetBytes);
+                    instr += "], rax";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store global element" << std::endl;
+                }
+                else
+                {
+                    std::string instr = "    mov [rbp - " + std::to_string(offsetBytes) + "], rax";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store in " << uniqueName << "[";
+                    for (size_t i = 0; i < constantIndices.size(); ++i)
+                        f << (i > 0 ? "," : "") << constantIndices[i];
+                    f << "]" << std::endl;
+                }
             }
             else
             {
-                // Dynamic indices
+                // dynamic computation (borrow from ArrayAccessNode)
                 for (size_t i = 0; i < indices.size(); ++i)
                 {
                     indices[i]->emitCode(f);
                     f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Push index " << i << std::endl;
-
                     if (i > 0)
                     {
                         f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Pop current index" << std::endl;
@@ -1560,7 +1773,6 @@ struct AssignmentNode : ASTNode
                         f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Push updated offset" << std::endl;
                     }
                 }
-
                 if (indices.size() > 1)
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Pop final index" << std::endl;
@@ -1574,13 +1786,22 @@ struct AssignmentNode : ASTNode
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Pop single index" << std::endl;
                 }
-
                 f << std::left << std::setw(COMMENT_COLUMN) << "    shl rax, 3" << ";; Scale offset by 8 (sizeof(int64))" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, " << baseOffset << ";; Adjust to array base" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << ";; Subtract scaled index" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Restore the value" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [rcx], rax" << ";; Store in " << uniqueName << "[dynamic]" << std::endl;
+                if (isGlobal)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, " + identifier << " ;; add base address" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Restore value" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov [rax], rcx" << ";; Store global element" << std::endl;
+                }
+                else
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
+                    std::string inst2 = "    sub rcx, " + std::to_string(baseOffset);
+                    f << std::left << std::setw(COMMENT_COLUMN) << inst2 << ";; Adjust to array base" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << ";; Subtract scaled index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Restore value" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov [rcx], rcx" << ";; Store value" << std::endl;
+                }
             }
         }
         else
@@ -2281,6 +2502,16 @@ struct BlockNode : ASTNode
         // Pop the scope when exiting the block
         scopes.pop();
     }
+
+    size_t getArraySpaceNeeded() const override
+    {
+        size_t sum = 0;
+        for (const auto& stmt : statements)
+        {
+            sum += stmt->getArraySpaceNeeded();
+        }
+        return sum;
+    }
 };
 
 
@@ -2571,18 +2802,32 @@ class Parser
             std::string identifier = idToken.value;
             eat(TOKEN_IDENTIFIER);
 
-            // Handle array dimensions (e.g., int array[5][10])
+            // Handle array dimensions (e.g., int array[5][10] or int arr[][3])
             std::vector<size_t> dimensions;
             while (currentToken.type == TOKEN_LBRACKET)
             {
                 eat(TOKEN_LBRACKET);
-                if (currentToken.type != TOKEN_NUMBER)
+                if (currentToken.type == TOKEN_NUMBER)
                 {
-                    reportError(currentToken.line, currentToken.col, "Expected array size after [");
+                    dimensions.push_back(std::stoul(currentToken.value));
+                    eat(TOKEN_NUMBER);
+                }
+                else if (currentToken.type == TOKEN_RBRACKET)
+                {
+                    // omitted size; only allowed for first dimension
+                    if (!dimensions.empty())
+                    {
+                        reportError(currentToken.line, currentToken.col,
+                                    "Only the first array dimension may be omitted");
+                        hadError = true;
+                    }
+                    dimensions.push_back(0); // placeholder, will be inferred later
+                }
+                else
+                {
+                    reportError(currentToken.line, currentToken.col, "Expected array size or ']' after [");
                     hadError = true;
                 }
-                dimensions.push_back(std::stoul(currentToken.value));
-                eat(TOKEN_NUMBER);
                 eat(TOKEN_RBRACKET);
             }
 
@@ -2593,14 +2838,16 @@ class Parser
                 // Array declaration - treat as pointer to element
                 Type arrayType = baseType;
                 arrayType.pointerLevel += 1;
-                std::vector<std::unique_ptr<ASTNode>> initializer;
+                std::unique_ptr<InitNode> initializer = nullptr;
                 if (currentToken.type == TOKEN_ASSIGN)
                 {
                     eat(TOKEN_ASSIGN);
-                    initializer = parseInitializerList(); // Parse the initializer list
+                    // parse nested initializer tree
+                    initializer = std::make_unique<InitNode>(parseInitializerList());
                 }
                 eat(TOKEN_SEMICOLON);
-                return std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer));
+                auto node = std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer));
+                return node;
             }
             else
             {
@@ -2899,27 +3146,27 @@ class Parser
     }
 
 
-    std::vector<std::unique_ptr<ASTNode>> parseInitializerList() {
-        std::vector<std::unique_ptr<ASTNode>> initializer;
-        eat(TOKEN_LBRACE); // Consume the opening '{'
-    
+    // Parse an initializer which may be a nested list of values.
+    // The returned InitNode represents either a list (isList=true) or
+    // a single value (isList=false with value set).
+    InitNode parseInitializerList() {
+        eat(TOKEN_LBRACE); // opening '{'
+        std::vector<InitNode> elements;
         while (currentToken.type != TOKEN_RBRACE) {
             if (currentToken.type == TOKEN_LBRACE) {
-                // Nested initializer list (e.g., {{1, 2}, {3, 4}})
-                auto nestedList = parseInitializerList();
-                initializer.insert(initializer.end(), std::make_move_iterator(nestedList.begin()), std::make_move_iterator(nestedList.end()));
+                // nested list
+                elements.push_back(parseInitializerList());
             } else {
-                // Single value (e.g., 1, 2, 3, 4)
-                initializer.push_back(expression());
+                // single expression value
+                std::unique_ptr<ASTNode> val = expression();
+                elements.emplace_back(std::move(val));
             }
-    
             if (currentToken.type == TOKEN_COMMA) {
-                eat(TOKEN_COMMA); // Consume the comma
+                eat(TOKEN_COMMA);
             }
         }
-    
-        eat(TOKEN_RBRACE); // Consume the closing '}'
-        return initializer;
+        eat(TOKEN_RBRACE); // closing '}'
+        return InitNode(std::move(elements));
     }
 
 
@@ -2970,14 +3217,65 @@ class Parser
         // If the next token is not '(', we treat this as a global variable
         if (currentToken.type != TOKEN_LPAREN)
         {
+            // parse optional pointer stars
+            int ptrLevel = 0;
+            while (currentToken.type == TOKEN_MUL)
+            {
+                eat(TOKEN_MUL);
+                ptrLevel++;
+            }
+            // parse dimensions (same rules as locals)
+            std::vector<size_t> dimensions;
+            while (currentToken.type == TOKEN_LBRACKET)
+            {
+                eat(TOKEN_LBRACKET);
+                if (currentToken.type == TOKEN_NUMBER)
+                {
+                    dimensions.push_back(std::stoul(currentToken.value));
+                    eat(TOKEN_NUMBER);
+                }
+                else if (currentToken.type == TOKEN_RBRACKET)
+                {
+                    if (!dimensions.empty())
+                    {
+                        reportError(currentToken.line, currentToken.col,
+                                    "Only the first array dimension may be omitted");
+                        hadError = true;
+                    }
+                    dimensions.push_back(0);
+                }
+                else
+                {
+                    reportError(currentToken.line, currentToken.col,
+                                "Expected array size or ']' after [ in global declaration");
+                    hadError = true;
+                }
+                eat(TOKEN_RBRACKET);
+            }
+
             std::unique_ptr<ASTNode> init = nullptr;
+            std::unique_ptr<InitNode> arrayInit = nullptr;
             if (currentToken.type == TOKEN_ASSIGN)
             {
                 eat(TOKEN_ASSIGN);
-                init = expression();
+                if (!dimensions.empty())
+                    arrayInit = std::make_unique<InitNode>(parseInitializerList());
+                else
+                    init = expression();
             }
             eat(TOKEN_SEMICOLON);
-            return std::make_unique<GlobalDeclarationNode>(name, makeType(returnType), std::move(init), isExternal);
+            if (dimensions.empty())
+            {
+                return std::make_unique<GlobalDeclarationNode>(name, makeType(returnType, ptrLevel), std::move(init), isExternal);
+            }
+            else
+            {
+                // create a temporary ArrayDeclarationNode to hold dimension info, then wrap in GlobalDeclaration
+                auto arrType = makeType(returnType, ptrLevel+1);
+                auto arrDecl = std::make_unique<ArrayDeclarationNode>(name, arrType, std::move(dimensions), std::move(arrayInit), true);
+                // general global handling will later pick up type and dims via semantic pass
+                return arrDecl;
+            }
         }
 
         // Parse the parameters list for a function
@@ -3569,8 +3867,35 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
     {
         std::string name = arrd->identifier;
         size_t baseIndex = scopes.top().size() + 1;
-        scopes.top()[name] = {generateUniqueName(name), baseIndex, arrd->varType};
-        for (const auto& init : arrd->initializer) semanticCheckExpression(init.get(), scopes, currentFunction);
+        VarInfo vi{generateUniqueName(name), baseIndex, arrd->varType};
+        vi.dimensions = arrd->dimensions;
+        // infer first dimension if omitted
+        if (!vi.dimensions.empty() && vi.dimensions[0] == 0 && arrd->initializer)
+        {
+            size_t flatCount = countInitLeaves(*arrd->initializer);
+            size_t productRest = 1;
+            for (size_t j = 1; j < vi.dimensions.size(); ++j)
+                productRest *= vi.dimensions[j];
+            if (productRest == 0) productRest = 1;
+            vi.dimensions[0] = (flatCount + productRest - 1) / productRest;
+        }
+        scopes.top()[name] = vi;
+        if (arrd->initializer)
+        {
+            std::vector<ASTNode*> leaves;
+            arrd->initializer->flattenLeaves(leaves);
+            for (auto *leaf : leaves)
+                semanticCheckExpression(leaf, scopes, currentFunction);
+            // check too many initializers
+            size_t flatCount = leaves.size();
+            size_t totalEls = 1;
+            for (size_t d : vi.dimensions) totalEls *= d;
+            if (flatCount > totalEls)
+            {
+                reportError(0, 0, "Too many initializers for array " + name);
+                hadError = true;
+            }
+        }
         return;
     }
 
@@ -3671,13 +3996,11 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
         if (auto gd = dynamic_cast<const class GlobalDeclarationNode*>(node.get()))
         {
             const std::string& name = gd->identifier;
-            // std::cerr << "[debug] semanticPass saw global declaration " << name << "\n";
             if (globalVariables.find(name) != globalVariables.end())
             {
                 reportError(0, 0, "Redefinition of global variable '" + name + "'");
                 hadError = true;
             }
-            // store the type of the global variable as well
             globalVariables[name] = gd->varType;
             if (gd->isExternal)
                 externGlobals.insert(name);
@@ -3693,6 +4016,54 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
                 {
                     reportError(0, 0, "Global initializer for '" + name + "' must be a constant expression");
                     hadError = true;
+                }
+            }
+        }
+        else if (auto ad = dynamic_cast<const ArrayDeclarationNode*>(node.get()))
+        {
+            const std::string& name = ad->identifier;
+            if (globalVariables.find(name) != globalVariables.end())
+            {
+                reportError(0, 0, "Redefinition of global variable '" + name + "'");
+                hadError = true;
+            }
+            globalVariables[name] = ad->varType;
+            globalArrayDimensions[name] = ad->dimensions;
+            // if first dimension omitted, infer from initializer
+            if (!ad->dimensions.empty() && ad->dimensions[0] == 0)
+            {
+                if (!ad->initializer)
+                {
+                    reportError(0, 0, "Cannot infer size of global array '" + name + "' without initializer");
+                    hadError = true;
+                }
+                else
+                {
+                    size_t flatCount = countInitLeaves(*ad->initializer);
+                    size_t productRest = 1;
+                    for (size_t j = 1; j < ad->dimensions.size(); ++j)
+                        productRest *= ad->dimensions[j];
+                    if (productRest == 0) productRest = 1;
+                    size_t inferred = (flatCount + productRest - 1) / productRest;
+                    globalArrayDimensions[name][0] = inferred;
+                }
+            }
+            // check initializer constants
+            if (ad->initializer)
+            {
+                std::stack<std::map<std::string, VarInfo>> emptyScopes;
+                std::vector<ASTNode*> leaves;
+                collectInitLeaves(*ad->initializer, leaves);
+                for (auto *leaf : leaves)
+                    semanticCheckExpression(leaf, emptyScopes, nullptr);
+                for (auto *leaf : leaves)
+                {
+                    if (!leaf->isConstant())
+                    {
+                        reportError(0, 0, "Global array initializer for '" + name + "' must be constant");
+                        hadError = true;
+                        break;
+                    }
                 }
             }
         }
