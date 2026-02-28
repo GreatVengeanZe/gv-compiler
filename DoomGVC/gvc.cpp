@@ -59,6 +59,8 @@ static std::set<std::string> externGlobals;
 // Function signature tables used during semantic checking
 static std::unordered_map<std::string, Type> functionReturnTypes;
 static std::unordered_map<std::string, std::vector<Type>> functionParamTypes;
+static std::unordered_map<std::string, bool> functionIsVariadic; // whether function declared with ...
+
 
 // Global index counter for function local variables (incremented per declaration)
 static size_t functionVariableIndex = 0;
@@ -95,6 +97,7 @@ enum TokenType
     TOKEN_CHAR,
     TOKEN_VOID,
     TOKEN_EXTERN,
+    TOKEN_ELLIPSIS,
     TOKEN_IDENTIFIER,
     TOKEN_NUMBER,
     TOKEN_CHAR_LITERAL,
@@ -143,6 +146,7 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_CHAR: return "char";
         case TOKEN_VOID: return "void";
         case TOKEN_EXTERN: return "extern";
+        case TOKEN_ELLIPSIS: return "...";
         case TOKEN_IDENTIFIER: return "identifier";
         case TOKEN_NUMBER: return "number";
         case TOKEN_CHAR_LITERAL: return "character literal";
@@ -403,6 +407,18 @@ public:
         int tokenLine = line;
         int tokenCol = col;
         char ch = peek();
+
+        // ellipsis '...'
+        if (ch == '.')
+        {
+            // look ahead for three dots
+            if (pos + 2 < source.size() && source[pos] == '.' && source[pos+1] == '.' && source[pos+2] == '.')
+            {
+                advance(); advance(); advance();
+                return Token{TOKEN_ELLIPSIS, "...", tokenLine, tokenCol};
+            }
+            // otherwise fall through to error
+        }
 
         if (ch == '"')
         {
@@ -900,9 +916,10 @@ struct FunctionNode : ASTNode
     std::vector<std::pair<Type, std::string>> parameters; // (type, name) pairs
     std::vector<std::unique_ptr<ASTNode>> body;
     bool isExternal;
+    bool isVariadic;  // true if declared with ...
 
-    FunctionNode(const std::string& name, Type rtype, std::vector<std::pair<Type, std::string>> params, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern)
-        : name(name), returnType(rtype), parameters(std::move(params)), body(std::move(body)), isExternal(isExtern) {}
+    FunctionNode(const std::string& name, Type rtype, std::vector<std::pair<Type, std::string>> params, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern, bool variadic = false)
+        : name(name), returnType(rtype), parameters(std::move(params)), body(std::move(body)), isExternal(isExtern), isVariadic(variadic) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -916,7 +933,7 @@ struct FunctionNode : ASTNode
     {
         if (isExternal)
         {
-            f << "extrn '" << name << "' as _" << name << std::endl;
+            f << std::endl << "extrn '" << name << "' as _" << name << std::endl;
             f << name << " = PLT _" << name << std::endl;
             return;
         }
@@ -2966,8 +2983,16 @@ class Parser
         // Parse the parameters list for a function
         eat(TOKEN_LPAREN);
         std::vector<std::pair<Type, std::string>> parameters; // Store (type, name) pairs
+        bool isVariadic = false;
         while (currentToken.type != TOKEN_RPAREN)
         {
+            if (currentToken.type == TOKEN_ELLIPSIS)
+            {
+                // variadic marker must be last
+                isVariadic = true;
+                eat(TOKEN_ELLIPSIS);
+                break;
+            }
             // Parse the parameter type (int, char or void)
             TokenType paramType = currentToken.type;
             if (paramType != TOKEN_INT && paramType != TOKEN_CHAR && paramType != TOKEN_VOID)
@@ -2990,15 +3015,33 @@ class Parser
             // Add the parameter to the list
             parameters.push_back({ makeType(paramType, ptrLevel), name });
             if (currentToken.type == TOKEN_COMMA)
-	        {
+            {
+                // consume comma and continue parsing next parameter or ellipsis
                 eat(TOKEN_COMMA);
+                continue;
+            }
+            else
+            {
+                // no comma means we're at closing parenthesis or unexpected token
+                break;
             }
         }
 
         eat(TOKEN_RPAREN);
 
-        // Create the FunctionNode
-        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal);
+        // If we see a semicolon immediately after the closing parenthesis, this is just a
+        // function prototype (declaration).  We treat it similarly to an extern
+        // declaration by returning the node early without a body.
+        if (currentToken.type == TOKEN_SEMICOLON)
+        {
+            // create node with empty body and return
+            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic);
+            eat(TOKEN_SEMICOLON);
+            return functionNode;
+        }
+
+        // Create the FunctionNode; body will be filled in below
+        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic);
 
         if (isExternal)
         {
@@ -3008,11 +3051,10 @@ class Parser
         // Parse the function body
         eat(TOKEN_LBRACE);
         std::vector<std::unique_ptr<ASTNode>> body;
-        while (currentToken.type != TOKEN_RBRACE)
-	    {
+        while (currentToken.type != TOKEN_RBRACE && currentToken.type != TOKEN_EOF)
+        {
             body.push_back(statement(functionNode.get()));
         }
-
         eat(TOKEN_RBRACE);
 
         // Set the body of the FuntcionNode
@@ -3244,7 +3286,7 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 
     // Emit text section
     f << "section '.text' executable" << std::endl << std::endl;
-    f << "public main" << std::endl << std::endl;
+    f << "public main" << std::endl;
     
     for (const auto& node : ast)
     {
@@ -3338,9 +3380,9 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
         if (git != globalVariables.end()) return git->second;
         return {Type::INT,0};
     }
-    if (auto num = dynamic_cast<const NumberNode*>(node)) return {Type::INT,0};
-    if (auto ch = dynamic_cast<const CharLiteralNode*>(node)) return {Type::CHAR,0};
-    if (auto str = dynamic_cast<const StringLiteralNode*>(node)) { Type t; t.base=Type::CHAR; t.pointerLevel=1; return t; }
+    if (dynamic_cast<const NumberNode*>(node)) return {Type::INT,0};
+    if (dynamic_cast<const CharLiteralNode*>(node)) return {Type::CHAR,0};
+    if (dynamic_cast<const StringLiteralNode*>(node)) { Type t; t.base=Type::CHAR; t.pointerLevel=1; return t; }
     if (auto un = dynamic_cast<const UnaryOpNode*>(node))
     {
         if (un->op == "++" || un->op == "--")
@@ -3466,21 +3508,30 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         if (it != functionParamTypes.end())
         {
             const auto& params = it->second;
-            if (params.size() != fc->arguments.size())
-            {
-                reportError(0, 0, "Function '" + fc->functionName + "' called with wrong number of arguments");
-                hadError = true;
-            }
-            else
-            {
-                for (size_t i = 0; i < params.size(); ++i)
+            bool variadic = functionIsVariadic[fc->functionName];
+            if (!variadic) {
+                if (params.size() != fc->arguments.size())
                 {
-                    Type argType = computeExprType(fc->arguments[i].get(), scopes, currentFunction);
-                    if (!typesCompatible(params[i], argType))
-                    {
-                        reportError(0, 0, "Argument " + std::to_string(i) + " of '" + fc->functionName + "' has incompatible type");
-                        hadError = true;
-                    }
+                    reportError(0, 0, "Function '" + fc->functionName + "' called with wrong number of arguments");
+                    hadError = true;
+                }
+            } else {
+                // variadic: make sure we have at least the fixed parameters
+                if (fc->arguments.size() < params.size())
+                {
+                    reportError(0, 0, "Function '" + fc->functionName + "' called with too few arguments");
+                    hadError = true;
+                }
+            }
+            // only check as many arguments as both sides have, to avoid OOB
+            size_t checkCount = std::min(params.size(), fc->arguments.size());
+            for (size_t i = 0; i < checkCount; ++i)
+            {
+                Type argType = computeExprType(fc->arguments[i].get(), scopes, currentFunction);
+                if (!typesCompatible(params[i], argType))
+                {
+                    reportError(0, 0, "Argument " + std::to_string(i) + " of '" + fc->functionName + "' has incompatible type");
+                    hadError = true;
                 }
             }
         }
@@ -3653,6 +3704,7 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
             for (const auto& p : fn->parameters)
                 paramTypes.push_back(p.first);
             functionParamTypes[fn->name] = std::move(paramTypes);
+            functionIsVariadic[fn->name] = fn->isVariadic;
         }
     }
 

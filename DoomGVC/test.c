@@ -1,4 +1,4 @@
-extern int printf(char* s, char c, int i);
+extern int printf(char* s, ...);
 
 int main()
 {
