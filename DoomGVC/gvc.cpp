@@ -15,36 +15,84 @@
 #include <set>
 #include <map>
 #include <functional>
+#include <cstdint>
+#include <cstring>
 
 // Define fixed column position for comments
 #define COMMENT_COLUMN 32
 
 // Type system used for static checking
 struct Type {
-    enum Base { INT, CHAR, VOID } base;
+    enum Base { INT, CHAR, VOID, SHORT, LONG, FLOAT, DOUBLE } base;
     int pointerLevel = 0; // number of '*' qualifiers
+    bool isUnsigned = false; // type qualifier
 
     bool operator==(const Type& o) const {
-        return base == o.base && pointerLevel == o.pointerLevel;
+        return base == o.base && pointerLevel == o.pointerLevel && isUnsigned == o.isUnsigned;
     }
     bool operator!=(const Type& o) const {
         return !(*this == o);
     }
     std::string toString() const {
         std::string s;
+        if (isUnsigned)
+            s = "unsigned ";
         switch (base) {
-            case INT:  s = "int"; break;
-            case CHAR: s = "char"; break;
-            case VOID: s = "void"; break;
+            case INT:  s += "int"; break;
+            case CHAR: s += "char"; break;
+            case VOID: s += "void"; break;
+            case SHORT: s += "short"; break;
+            case LONG:  s += "long"; break;
+            case FLOAT: s += "float"; break;
+            case DOUBLE: s += "double"; break;
         }
         for (int i = 0; i < pointerLevel; ++i) s += "*";
         return s;
     }
 };
 
+// -- helpers used for pointer arithmetic -----------------------------
+// compute the size (in bytes) of a type; we now try to give each base type
+// its natural width.  On a typical x86-64 platform we choose:
+//   char    - 1 byte
+//   short   - 2 bytes
+//   int     - 4 bytes
+//   long    - 8 bytes
+//   float   - 4 bytes
+//   double  - 8 bytes
+//   void    - treated as 1 byte (for sizeof and pointer arithmetic)
+// Pointers themselves are still 8 bytes.
+static size_t sizeOfType(const Type &t)
+{
+    // pointers always occupy 8 bytes
+    if (t.pointerLevel > 0)
+        return 8;
+
+    switch (t.base) {
+        case Type::CHAR:   return 1;
+        case Type::SHORT:  return 2;
+        case Type::INT:    return 4;
+        case Type::LONG:   return 8;
+        case Type::FLOAT:  return 4;
+        case Type::DOUBLE: return 8;
+        case Type::VOID:   return 1; // sizeof(void) is not used in C but we pick 1
+        default:           return 8;
+    }
+}
+
+// size of the element pointed to by a pointer type
+static size_t pointeeSize(const Type &t)
+{
+    Type copy = t;
+    if (copy.pointerLevel > 0) copy.pointerLevel--;
+    return sizeOfType(copy);
+}
+
+
 // forward declarations for AST node types used in early code
 struct ArrayDeclarationNode;
 struct BlockNode;
+struct IdentifierNode;                     // used by sizeof handling
 
 // information stored for each variable in a scope
 struct VarInfo {
@@ -108,10 +156,18 @@ enum TokenType
     TOKEN_ELLIPSIS,
     TOKEN_IDENTIFIER,
     TOKEN_NUMBER,
+    TOKEN_FLOAT_LITERAL,
     TOKEN_CHAR_LITERAL,
     TOKEN_STRING_LITERAL,
     TOKEN_SEMICOLON,
+    TOKEN_SIZEOF,
     TOKEN_ASSIGN,
+    TOKEN_SHORT,
+    TOKEN_LONG,
+    TOKEN_FLOAT,
+    TOKEN_DOUBLE,
+    TOKEN_UNSIGNED,
+    TOKEN_SIGNED,
     TOKEN_ADD,
     TOKEN_INCREMENT,
     TOKEN_SUB,
@@ -157,6 +213,7 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_ELLIPSIS: return "...";
         case TOKEN_IDENTIFIER: return "identifier";
         case TOKEN_NUMBER: return "number";
+        case TOKEN_FLOAT_LITERAL: return "float literal";
         case TOKEN_CHAR_LITERAL: return "character literal";
         case TOKEN_STRING_LITERAL: return "string literal";
         case TOKEN_SEMICOLON: return ";";
@@ -175,6 +232,13 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_LBRACKET: return "[";
         case TOKEN_RBRACKET: return "]";
         case TOKEN_IF: return "if";
+        case TOKEN_SIZEOF: return "sizeof";
+        case TOKEN_SHORT: return "short";
+        case TOKEN_LONG: return "long";
+        case TOKEN_FLOAT: return "float";
+        case TOKEN_DOUBLE: return "double";
+        case TOKEN_UNSIGNED: return "unsigned";
+        case TOKEN_SIGNED: return "signed";
         case TOKEN_ELSE: return "else";
         case TOKEN_WHILE: return "while";
         case TOKEN_FOR: return "for";
@@ -198,17 +262,22 @@ std::string tokenTypeToString(TokenType t)
 }
 
 // utility to construct a Type value from a TokenType and optional pointer count
-Type makeType(TokenType tok, int ptrLevel = 0)
+Type makeType(TokenType tok, int ptrLevel = 0, bool isUnsigned = false)
 {
     Type t;
     switch (tok)
     {
-        case TOKEN_INT:   t.base = Type::INT;  break;
         case TOKEN_CHAR:  t.base = Type::CHAR; break;
         case TOKEN_VOID:  t.base = Type::VOID; break;
-        default:          t.base = Type::INT;  break; // fallback
+        case TOKEN_SHORT: t.base = Type::SHORT; break;
+        case TOKEN_LONG:  t.base = Type::LONG; break;
+        case TOKEN_FLOAT: t.base = Type::FLOAT; break;
+        case TOKEN_DOUBLE:t.base = Type::DOUBLE; break;
+        case TOKEN_INT:   t.base = Type::INT;  break;
+        default:          t.base = Type::INT;  break; // fallback for signed/unsigned etc
     }
     t.pointerLevel = ptrLevel;
+    t.isUnsigned = isUnsigned;
     return t;
 }
 
@@ -254,33 +323,33 @@ void emitDeferredPostfixOps(std::ofstream& f)
         {
             VarInfo info = lookupResult.second;
             std::string uniqueName = info.uniqueName;
-            size_t index = info.index;
-            std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+            size_t index = info.index; // byte offset
+            std::string instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " for deferred postfix" << std::endl;
             if (deferredOp.op == "++")
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Deferred increment" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Deferred increment" << std::endl;
             }
             else if (deferredOp.op == "--")
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << ";; Deferred decrement" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Deferred decrement" << std::endl;
             }
-            instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
+            instruction = "\tmov [rbp - " + std::to_string(index) + "], rax";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store deferred result in " << uniqueName << std::endl;
         }
         else
         {
             // Global variable
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
             if (deferredOp.op == "++")
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Deferred increment" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Deferred increment" << std::endl;
             }
             else if (deferredOp.op == "--")
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << ";; Deferred decrement" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Deferred decrement" << std::endl;
             }
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << deferredOp.varName << "], rax" << ";; Store deferred result in " << deferredOp.varName << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [" << deferredOp.varName << "], rax" << ";; Store deferred result in " << deferredOp.varName << std::endl;
         }
     }
     deferredPostfixOps.clear();
@@ -474,11 +543,31 @@ public:
             return Token{ TOKEN_CHAR_LITERAL, std::string(1, charValue), tokenLine, tokenCol };
         }
 
-        if (isdigit(ch))
-	    {
+if (isdigit(ch) || (ch == '.' && isdigit(peek())))
+        {
             std::string num;
-            while (isdigit(peek())) num += advance();
-            return Token{ TOKEN_NUMBER, num, tokenLine, tokenCol };
+            bool isFloat = false;
+            // integer part
+            if (isdigit(ch)) {
+                while (isdigit(peek())) num += advance();
+            }
+            // decimal point and fraction
+            if (peek() == '.') {
+                isFloat = true;
+                num += advance(); // consume '.'
+                while (isdigit(peek())) num += advance();
+            }
+            // exponent part
+            if (peek() == 'e' || peek() == 'E') {
+                isFloat = true;
+                num += advance();
+                if (peek() == '+' || peek() == '-') num += advance();
+                while (isdigit(peek())) num += advance();
+            }
+            if (isFloat)
+                return Token{ TOKEN_FLOAT_LITERAL, num, tokenLine, tokenCol };
+            else
+                return Token{ TOKEN_NUMBER, num, tokenLine, tokenCol };
         }
 
         else if (isalpha(ch) || ch == '_')
@@ -487,6 +576,12 @@ public:
             while (isalnum(peek()) || peek() == '_') ident += advance();
             if (ident == "if")      return Token{ TOKEN_IF    , ident, tokenLine, tokenCol };
             if (ident == "int")     return Token{ TOKEN_INT   , ident, tokenLine, tokenCol };
+            if (ident == "short")   return Token{ TOKEN_SHORT , ident, tokenLine, tokenCol };
+            if (ident == "long")    return Token{ TOKEN_LONG  , ident, tokenLine, tokenCol };
+            if (ident == "float")   return Token{ TOKEN_FLOAT , ident, tokenLine, tokenCol };
+            if (ident == "double")  return Token{ TOKEN_DOUBLE, ident, tokenLine, tokenCol };
+            if (ident == "unsigned")return Token{ TOKEN_UNSIGNED, ident, tokenLine, tokenCol };
+            if (ident == "signed")  return Token{ TOKEN_SIGNED, ident, tokenLine, tokenCol };
             if (ident == "for")     return Token{ TOKEN_FOR   , ident, tokenLine, tokenCol };
             if (ident == "char")    return Token{ TOKEN_CHAR  , ident, tokenLine, tokenCol };
             if (ident == "void")    return Token{ TOKEN_VOID  , ident, tokenLine, tokenCol };
@@ -494,6 +589,7 @@ public:
             if (ident == "while")   return Token{ TOKEN_WHILE , ident, tokenLine, tokenCol };
             if (ident == "return")  return Token{ TOKEN_RETURN, ident, tokenLine, tokenCol };
             if (ident == "extern")  return Token{ TOKEN_EXTERN, ident, tokenLine, tokenCol };
+            if (ident == "sizeof")  return Token{ TOKEN_SIZEOF, ident, tokenLine, tokenCol };
             return Token{ TOKEN_IDENTIFIER, ident, tokenLine, tokenCol };
         }
 
@@ -728,6 +824,10 @@ struct ASTNode
     // How many bytes of stack space this node requires for array declarations
     // (used when computing total frame size in function prologue)
     virtual size_t getArraySpaceNeeded() const { return 0; }
+
+    // helper used by sizeof: return identifier name if this node is an
+    // IdentifierNode, or nullptr otherwise.  Avoids RTTI requirements.
+    virtual const std::string* getIdentifierName() const { return nullptr; }
 };
 
 // initializer tree node used for array initialization
@@ -770,7 +870,6 @@ struct InitNode {
 
 // helper free functions (sometimes convenient)
 static size_t countInitLeaves(const InitNode &n) { return n.countLeaves(); }
-static size_t topLevelInitCount(const InitNode &n) { return n.topLevelCount(); }
 static void collectInitLeaves(const InitNode &n, std::vector<ASTNode*> &out) { n.flattenLeaves(out); }
 
 
@@ -814,18 +913,18 @@ struct LogicalOrNode : ASTNode
     {
         size_t labelID = labelCounter++;
         left->emitCode(f);
-        std::string instruction = "    jne .logical_or_true_" + std::to_string(labelID);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << ";; Compare left operand with 0" << std::endl;
+        std::string instruction = "\tjne .logical_or_true_" + std::to_string(labelID);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare left operand with 0" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump if left operand is true" << std::endl;
         right->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << ";; compare right operand with 0" << std::endl;
-        instruction = "    jne .logical_or_true_" + std::to_string(labelID);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; compare right operand with 0" << std::endl;
+        instruction = "\tjne .logical_or_true_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump if right operand is true" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << ";; Set result to false" << std::endl;
-        instruction = "    jmp .logical_or_end_" + std::to_string(labelID);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; Set result to false" << std::endl;
+        instruction = "\tjmp .logical_or_end_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end" << std::endl;
         f << std::endl << ".logical_or_true_" << labelID << ":" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 1" << ";; Set result to true" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 1" << ";; Set result to true" << std::endl;
         f << std::endl << ".logical_or_end_" << labelID << ":" << std::endl;
     }
 };
@@ -849,18 +948,18 @@ struct LogicalAndNode : ASTNode
     {
         size_t labelID = labelCounter++;
         left->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << ";; Compare left operand with 0" << std::endl;
-        std::string instruction = "    je .logical_and_false_" + std::to_string(labelID);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare left operand with 0" << std::endl;
+        std::string instruction = "\tje .logical_and_false_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) <<  instruction << ";; Jump if left operand is false" << std::endl;
         right->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << ";; Compare Right operand with 0" << std::endl;
-        instruction = "    je .logical_and_false_" + std::to_string(labelID);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare Right operand with 0" << std::endl;
+        instruction = "\tje .logical_and_false_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump if right operand is false" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 1" << ";; Set result to true" << std::endl;
-        instruction = "    jmp .logical_and_end_" + std::to_string(labelID);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 1" << ";; Set result to true" << std::endl;
+        instruction = "\tjmp .logical_and_end_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end" << std::endl;
         f << std::endl << ".logical_and_false_" << labelID << ":" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << ";; Set result to false" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; Set result to false" << std::endl;
         f << std::endl << ".logical_and_end_" << labelID << ":" << std::endl;
     }
 };
@@ -881,6 +980,8 @@ struct FunctionCallNode : ASTNode
 {
     std::string functionName;
     std::vector<std::unique_ptr<ASTNode>> arguments;
+    // filled during semantic analysis
+    std::vector<Type> argTypes;
 
     FunctionCallNode(const std::string& name, std::vector<std::unique_ptr<ASTNode>> args)
         : functionName(name), arguments(std::move(args)) {}
@@ -896,59 +997,159 @@ struct FunctionCallNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         // System V AMD64 ABI calling convention
-        // First 6 arguments in: rdi, rsi, rdx, rcx, r8, r9
-        // Remaining on stack (in reverse order)
+        // First 6 arguments in: rdi, rsi, rdx, rcx, r8, r9 for integer/pointer args
+        // Floating-point args go in xmm0..xmm7. Variadic functions must know how many
+        // xmm registers are used in AL.
         std::vector<std::string> argRegisters = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
         
-        // Calculate how many arguments go on the stack (those beyond the first 6)
-        int stackArgs = (arguments.size() > 6) ? (arguments.size() - 6) : 0;
+        // Determine argument types if they were recorded during semantic checking
+        size_t argCount = arguments.size();
+        // calculate how many arguments go on the stack (those beyond the first 6 registers)
+        int stackArgs = (argCount > 6) ? (argCount - 6) : 0;
         
-        // IMPORTANT: We need 16-byte alignment BEFORE the call instruction
-        // At this point, rsp is 16-byte aligned (or was after prologue)
-        // Pushing stackArgs values will change alignment by stackArgs * 8 bytes
-        // We might need to add padding to ensure alignment at call time
-        
-        // Amount we'll push on stack
+        // alignment logic same as before
         int bytesToPush = stackArgs * 8;
-        
-        // Calculate padding needed: (bytesToPush + 0) % 16 == 0 means aligned after push ret
-        // But we need rsp % 16 == 0 just before call
-        // After "call" there's an implicit push of rip, so we need rsp % 16 == 8 before call
-        // (so after push rip, it becomes 0)
         int alignmentNeeded = (16 - (bytesToPush % 16)) % 16;
-        
-        // If we need padding, adjust rsp before pushing arguments
         if (alignmentNeeded > 0)
         {
-            std::string instruction = "    sub rsp, " + std::to_string(alignmentNeeded);
+            std::string instruction = "\tsub rsp, " + std::to_string(alignmentNeeded);
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Align stack for function call" << std::endl;
         }
         
-        // Push arguments onto stack in reverse order (for args beyond the first 6)
-        for (size_t i = arguments.size(); i > 6; --i)
+        // push stack arguments in reverse order
+        for (size_t i = argCount; i > 6; --i)
         {
             arguments[i-1]->emitCode(f);
-            f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Push argument " << i-1 << " onto stack" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push argument " << i-1 << " onto stack" << std::endl;
         }
 
-        // Load first 6 arguments into registers
-        for (size_t i = 0; i < arguments.size() && i < 6; ++i)
+        int floatRegCount = 0;
+        bool callIsVariadic = functionIsVariadic[functionName];
+        // load up to first six args into appropriate registers, but make sure that
+        // evaluating each argument doesn't clobber registers already assigned for
+        // earlier arguments.  We achieve this by saving any used integer or
+        // floating-point registers before evaluating a new argument, then
+        // restoring them afterwards.
+        int intRegsUsed = 0;
+        int floatRegsUsed = 0;
+        for (size_t i = 0; i < argCount && i < 6; ++i)
         {
+            // save integer registers currently in use
+            for (int j = 0; j < intRegsUsed; ++j) {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tpush " + argRegisters[j]
+                  << ";; save arg reg" << j << " before evaluating next arg" << std::endl;
+            }
+            // save floating regs currently in use to stack slots
+            if (floatRegsUsed > 0) {
+                std::string instr = "\tsub rsp, " + std::to_string(floatRegsUsed * 8);
+                f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; spill float regs" << std::endl;
+                for (int j = 0; j < floatRegsUsed; ++j) {
+                    std::string instr2 = "\tmovq [rsp + " + std::to_string(j*8) + "], xmm" + std::to_string(j);
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr2 << std::endl;
+                }
+            }
+
+            // evaluate the argument expression (result in rax)
             arguments[i]->emitCode(f);
-            std::string instruction = "    mov " + argRegisters[i] + ", rax";
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Pass argument " << i << " in " << argRegisters[i] << std::endl;
+
+            // attempt to convert to expected parameter type if we know it
+            Type actual = {Type::INT,0};
+            if (i < argTypes.size()) actual = argTypes[i];
+            Type expected = actual;
+            auto sigIt = functionParamTypes.find(functionName);
+            if (sigIt != functionParamTypes.end() && i < sigIt->second.size())
+                expected = sigIt->second[i];
+            // only convert non-pointer arithmetic types
+            auto isNum = [&](const Type &tt){ return tt.pointerLevel==0 && (tt.base==Type::INT||tt.base==Type::FLOAT||tt.base==Type::DOUBLE||tt.base==Type::CHAR||tt.base==Type::SHORT||tt.base==Type::LONG); };
+            if (isNum(actual) && isNum(expected) && !(actual==expected)) {
+                // convert rax from actual to expected
+                if (expected.base == Type::FLOAT) {
+                    if (actual.base == Type::DOUBLE) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; load double into xmm0" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << std::endl;
+                    } else {
+                        // int/other -> float
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm0, rax" << ";; convert int->float" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << std::endl;
+                    }
+                    actual = expected;
+                } else if (expected.base == Type::DOUBLE) {
+                    if (actual.base == Type::FLOAT) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd xmm0, rax" << ";; convert float->double" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd xmm0, xmm0" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
+                    } else {
+                        // int -> double
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm0, rax" << ";; convert int->double" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
+                    }
+                    actual = expected;
+                }
+            }
+            // update argTypes so downstream logic sees the converted type
+
+            // restore floating regs
+            if (floatRegsUsed > 0) {
+                for (int j = 0; j < floatRegsUsed; ++j) {
+                    std::string instr2 = "\tmovq xmm" + std::to_string(j) + ", [rsp + " + std::to_string(j*8) + "]";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr2 << std::endl;
+                }
+                std::string instr3 = "\tadd rsp, " + std::to_string(floatRegsUsed * 8);
+                f << std::left << std::setw(COMMENT_COLUMN) << instr3 << ";; restore float regs" << std::endl;
+            }
+            // restore integer regs (reverse order)
+            for (int j = intRegsUsed - 1; j >= 0; --j) {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tpop " + argRegisters[j]
+                  << ";; restore arg reg" << j << std::endl;
+            }
+
+            // determine if this arg is floating
+            bool isFloat = false;
+            Type t;
+            if (i < argTypes.size()) {
+                t = argTypes[i];
+                if (t.pointerLevel == 0 && (t.base == Type::FLOAT || t.base == Type::DOUBLE))
+                    isFloat = true;
+            }
+            if (isFloat) {
+                // pass in xmm register
+                std::string reg = "xmm" + std::to_string(floatRegCount);
+                if (t.base == Type::FLOAT) {
+                    if (callIsVariadic) {
+                        // promote float to double for variadic call
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd " + reg + ", eax" << ";; float arg (promote to double)" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd " + reg + ", " + reg << ";; convert to double" << std::endl;
+                    } else {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd " + reg + ", eax" << ";; float arg " << i << std::endl;
+                    }
+                } else {
+                    // double
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq " + reg + ", rax" << ";; double arg " << i << std::endl;
+                }
+                floatRegCount++;
+                floatRegsUsed++;
+            } else {
+                std::string instruction = "\tmov " + argRegisters[i] + ", rax";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Pass argument " << i << " in " << argRegisters[i] << std::endl;
+                intRegsUsed++;
+            }
         }
+
+        // Set RAX to floatRegCount for variadic calls
+        std::string instrCount = "\tmov rax, " + std::to_string(floatRegCount);
+        f << std::left << std::setw(COMMENT_COLUMN) << instrCount << ";; float register count" << std::endl;
 
         // Call the function
-        std::string instruction = "    call " + functionName;
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Call function " << functionName << std::endl;
+        std::string instrCall = "\tcall " + functionName;
+        f << std::left << std::setw(COMMENT_COLUMN) << instrCall << ";; Call function " << functionName << std::endl;
 
         // Clean up the stack (remove arguments beyond first 6 + any alignment padding)
         int totalCleanup = bytesToPush + alignmentNeeded;
         if (totalCleanup > 0)
         {
-            instruction = "    add rsp, " + std::to_string(totalCleanup);
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Clean up stack" << std::endl;
+            std::string instrCleanup = "\tadd rsp, " + std::to_string(totalCleanup);
+            f << std::left << std::setw(COMMENT_COLUMN) << instrCleanup << ";; Clean up stack" << std::endl;
         }
     }
 };
@@ -1000,8 +1201,8 @@ struct FunctionNode : ASTNode
 
         // Emit function prologue
         f << std::endl << name << ":" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    push rbp" << ";; Save base pointer" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rbp, rsp" << ";; Set stack frame\n" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rbp" << ";; Save base pointer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rbp, rsp" << ";; Set stack frame\n" << std::endl;
 
         // Calculate space needed:
         // - parameters (up to 6 are in registers, rest on stack)
@@ -1011,51 +1212,73 @@ struct FunctionNode : ASTNode
         // We need sub rsp amount to be a multiple of 16
         size_t totalParams = std::min(parameters.size(), (size_t)6);
         
-        // Conservative estimate: count each body statement as potentially needing 8 bytes
-        // This covers non-array locals but is not accurate for arrays.
-        size_t estimatedLocalVars = body.size();
 
         // Compute additional space required for all local arrays in this function
-        size_t totalArraySpace = 0;
+        size_t totalLocalSpace = 0;
         for (const auto& stmt : body)
-            totalArraySpace += stmt->getArraySpaceNeeded();
-
-        size_t totalLocalSpace = (totalParams + estimatedLocalVars) * 8 + totalArraySpace;
+            totalLocalSpace += stmt->getArraySpaceNeeded();
+        // also reserve space to store register parameters (first 6)
+        totalLocalSpace += totalParams * 8;
         
         // Align to multiple of 16: round up to next 16-byte boundary
         size_t alignedSpace = ((totalLocalSpace + 15) / 16) * 16;
         
-        std::string instruction = "    sub rsp, " + std::to_string(alignedSpace);
+        std::string instruction = "\tsub rsp, " + std::to_string(alignedSpace);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Allocate space for parameters and local variables (16-byte aligned)" << std::endl;
 
         // Save parameter registers to stack AFTER allocation
-        // System V AMD64 ABI: first 6 args in rdi, rsi, rdx, rcx, r8, r9
-        // Parameters 7+ come on the stack (passed by caller) at [rbp+16], [rbp+24], etc.
+        // System V AMD64 ABI: first 6 args in rdi, rsi, rdx, rcx, r8, r9 for integer/pointer args
+        // floating-point args come in xmm0..xmm5.  We must save the appropriate
+        // register depending on the declared parameter type.
         std::vector<std::string> paramRegisters = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        int intRegIdx = 0;
+        int floatRegIdx = 0;
         for (size_t i = 0; i < parameters.size() && i < 6; ++i)
         {
-            std::string instr = "    mov [rbp - " + std::to_string((i + 1) * 8) + "], " + paramRegisters[i];
-            f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Save parameter " << i << " from " << paramRegisters[i] << std::endl;
+            Type pt = parameters[i].first;
+            bool isFloatParam = (pt.pointerLevel == 0 && (pt.base == Type::FLOAT || pt.base == Type::DOUBLE));
+            size_t offset = (i + 1) * 8;
+            if (isFloatParam) {
+                std::string reg = "xmm" + std::to_string(floatRegIdx);
+                if (pt.base == Type::FLOAT) {
+                    // store 32‑bit float, zero‑extend upper bits
+                    std::string instruction = "\tmovd [rbp - " + std::to_string(offset) + "], " + reg;
+                    f << std::left << std::setw(COMMENT_COLUMN)
+                      << instruction << ";; Save float parameter " << i << " from " << reg << std::endl;
+                } else {
+                    // double occupies full 8 bytes
+                    std::string instruction = "\tmovq [rbp - " + std::to_string(offset) + "], " + reg;
+                    f << std::left << std::setw(COMMENT_COLUMN)
+                      <<  instruction << ";; Save double parameter " << i << " from " << reg << std::endl;
+                }
+                floatRegIdx++;
+            } else {
+                std::string instr = "\tmov [rbp - " + std::to_string(offset) + "], " + paramRegisters[intRegIdx];
+                f << std::left << std::setw(COMMENT_COLUMN) << instr
+                  << ";; Save parameter " << i << " from " << paramRegisters[intRegIdx] << std::endl;
+                intRegIdx++;
+            }
         }
 
-        // Store function parameters in the current scope
+        // Store function parameters in the current scope.  We compute their
+        // byte offsets manually rather than using `functionVariableIndex`, since
+        // the latter is meant for locals and was previously producing tiny values
+        // (1,2,3) which led to incorrect loads at offsets -1,-2 etc.
         for (size_t i = 0; i < parameters.size(); i++)
         {
             std::string paramName = parameters[i].second;
             std::string uniqueName = generateUniqueName(paramName);
 
-            functionVariableIndex++;  // Allocate index for parameter
             size_t index;
             if (i < 6)
             {
-                // Parameters 0-5: stored at [rbp - functionVariableIndex * 8]
-                index = functionVariableIndex;
+                // register parameters saved at (i+1)*8 bytes below rbp
+                index = (i + 1) * 8;
             }
             else
             {
-                // Parameters 6+: passed on stack at [rbp + (i - 5) * 8]
-                // Store as a negative index for IdentifierNode to handle specially
-                // Use 1000 + offset to distinguish from regular parameters
+                // stack parameters: positive offset from rbp, tag with 1000 to
+                // distinguish when generating code later
                 index = 1000 + (i - 6) * 8;
             }
 
@@ -1074,9 +1297,9 @@ struct FunctionNode : ASTNode
         if (returnType.base == Type::VOID && returnType.pointerLevel == 0)
         {
             f << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rsp, rbp " << ";; Restore stack pointer" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    pop rbp " << ";; Restore base pointer" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    ret " << ";; Return to caller" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rsp, rbp " << ";; Restore stack pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rbp " << ";; Restore base pointer" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tret " << ";; Return to caller" << std::endl;
         }
 
         // Pop the scope from the stack
@@ -1120,9 +1343,9 @@ struct ReturnNode : ASTNode
         }
         // Emit function epilogue for all returns
         f << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rsp, rbp " << ";; Restore stack pointer" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rbp " << ";; Restore base pointer" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "    ret " << ";; Return to caller" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rsp, rbp " << ";; Restore stack pointer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rbp " << ";; Restore base pointer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tret " << ";; Return to caller" << std::endl;
     }
 };
 
@@ -1143,9 +1366,15 @@ struct DeclarationNode : ASTNode
     std::string identifier;
     std::unique_ptr<ASTNode> initializer;
     Type varType;        // includes base and pointer levels
+    Type initType = {Type::INT,0}; // type of initializer expression, filled during semantic analysis
 
     DeclarationNode(const std::string& id, Type t, std::unique_ptr<ASTNode> init = nullptr)
         : identifier(id), initializer(std::move(init)), varType(t) {}
+
+    // report stack space required for this declaration (scalar)
+    size_t getArraySpaceNeeded() const override {
+        return sizeOfType(varType);
+    }
 
     void emitData(std::ofstream& f) const override
     {
@@ -1158,16 +1387,63 @@ struct DeclarationNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         std::string uniqueName = generateUniqueName(identifier);
-        functionVariableIndex++;  // Allocate next index
-        size_t index = functionVariableIndex;
-        scopes.top()[identifier] = {uniqueName, index, varType};
+        // compute byte offset for this variable
+        size_t varSize = sizeOfType(varType);
+        // align the slot properly based on the type's natural alignment.  pointers
+        // and 8‑byte types should be 8‑byte aligned; smaller types align to their
+        // size.  this prevents later variables (e.g. a double) from starting in
+        // the middle of a preceding float.
+        size_t align = (varType.pointerLevel > 0) ? 8 : varSize;
+        if (align == 0) align = 1;
+        if (align > 8) align = 8;
+        // round up current index to the alignment boundary
+        functionVariableIndex = ((functionVariableIndex + align - 1) / align) * align;
 
-        // f << std::left << std::setw(COMMENT_COLUMN) << "    sub rsp, 8" << ";; Allocate space for " << uniqueName << std::endl;
+        size_t offset = functionVariableIndex;
+        functionVariableIndex += varSize; // advance by its size
+        scopes.top()[identifier] = {uniqueName, offset, varType};
 
         if (initializer)
         {
             initializer->emitCode(f);
-            std::string instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
+            // perform any necessary conversion based on variable type and initializer type
+            if (varType.pointerLevel == 0 && (varType.base == Type::FLOAT || varType.base == Type::DOUBLE)) {
+                // compute initializer type if available
+                Type itype = initType;
+                // convert rax accordingly only when types differ or conversion required
+                if (varType.base == Type::DOUBLE) {
+                    if (itype.base == Type::FLOAT) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; prepare for float->double" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd xmm0, xmm0" << ";; float->double" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
+                    } else if (itype.base == Type::INT || itype.base == Type::CHAR) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm0, rax" << ";; int->double" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
+                    }
+                    // double->double nothing
+                } else { // target float
+                    if (itype.base == Type::DOUBLE) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; prepare for double->float" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << ";; double->float" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << ";; move float bits into eax" << std::endl;
+                    } else if (itype.base == Type::INT || itype.base == Type::CHAR) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm0, rax" << ";; int->float" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << ";; move float bits into eax" << std::endl;
+                    }
+                    // float->float nothing
+                }
+            }
+            // use size-specific store so we don't accidentally write extra garbage bytes
+            std::string instruction;
+            if (varSize == 1) {
+                instruction = "\tmov byte [rbp - " + std::to_string(offset) + "], al";
+            } else if (varSize == 2) {
+                instruction = "\tmov word [rbp - " + std::to_string(offset) + "], ax";
+            } else if (varSize == 4) {
+                instruction = "\tmov dword [rbp - " + std::to_string(offset) + "], eax";
+            } else {
+                instruction = "\tmov [rbp - " + std::to_string(offset) + "], rax";
+            }
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Initialize " << uniqueName << std::endl;
         }
     }
@@ -1223,7 +1499,7 @@ struct DereferenceNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         operand->emitCode(f); // Get the pointer value into rax
-        f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rax]" << ";; Dereference pointer" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rax]" << ";; Dereference pointer" << std::endl;
     }
 };
 
@@ -1260,17 +1536,17 @@ struct AddressOfNode : ASTNode
             std::string uniqueName = info.uniqueName;
             size_t index = info.index;
             // All variables (parameters and locals) are now on the stack relative to rbp
-            std::string instruction = "    lea rax, [rbp - " + std::to_string(index * 8) + "]";
+            std::string instruction = "\tlea rax, [rbp - " + std::to_string(index) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of variable " << uniqueName << std::endl;
         }
         else if (isGlobal)
         {
-            std::string instruction = "    mov rax, " + Identifier;
+            std::string instruction = "\tmov rax, " + Identifier;
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of global variable " << Identifier << std::endl; 
         }
         else
         {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << ";; undefined address fallback" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; undefined address fallback" << std::endl;
         }
     }
 };
@@ -1312,7 +1588,8 @@ struct ArrayDeclarationNode : ASTNode
         size_t totalElements = 1;
         for (size_t dim : dimsCopy)
             totalElements *= (dim == 0 ? 1 : dim);
-        return totalElements * 8;
+        size_t elemSize = sizeOfType(varType);
+        return totalElements * elemSize;
     }
 
     void emitData(std::ofstream& f) const override
@@ -1402,11 +1679,18 @@ struct ArrayDeclarationNode : ASTNode
         // compute total number of elements from the dimensions copy
         size_t totalElements = 1;
         for (size_t dim : dims) totalElements *= dim;
-        size_t totalSize = totalElements * 8; // bytes
+        size_t elemSize = sizeOfType(varType);
+        size_t totalSize = totalElements * elemSize; // bytes
 
-        functionVariableIndex++;  // Allocate index for array base
-        size_t baseIndex = functionVariableIndex;
-        VarInfo info{uniqueName, baseIndex, varType};
+        // align the array's start to its element size (or 8 for pointers)
+        size_t elemAlign = (varType.pointerLevel > 0) ? 8 : elemSize;
+        if (elemAlign == 0) elemAlign = 1;
+        if (elemAlign > 8) elemAlign = 8;
+        functionVariableIndex = ((functionVariableIndex + elemAlign - 1) / elemAlign) * elemAlign;
+
+        size_t baseOffset = functionVariableIndex;
+        functionVariableIndex += totalSize; // allocate entire block
+        VarInfo info{uniqueName, baseOffset, varType};
         info.dimensions = dims; // record dims
         scopes.top()[identifier] = info;
 
@@ -1419,7 +1703,7 @@ struct ArrayDeclarationNode : ASTNode
         
         // NOTE: we keep the instruction comment for documentation purposes, but
         // do not actually emit a sub rsp.
-        f << std::left << std::setw(COMMENT_COLUMN) << "    ;; [stack already allocated in prologue for array " << uniqueName << "]" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\t;; [stack already allocated in prologue for array " << uniqueName << "]" << std::endl;
         std::string instruction;  // used later when generating initializer stores
 
         if (initializer)
@@ -1435,24 +1719,18 @@ struct ArrayDeclarationNode : ASTNode
             for (size_t i = 0; i < flat.size(); ++i)
             {
                 flat[i]->emitCode(f);
-                instruction = "    mov [rbp - " + std::to_string(baseIndex * 8 + i * 8) + "], rax";
+                instruction = "\tmov [rbp - " + std::to_string(baseOffset + i * elemSize) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Initialize " << uniqueName << "[" << i << "]" << std::endl;
             }
             // zero remaining elements
             for (size_t i = flat.size(); i < totalElements; ++i)
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov qword [rbp - " + std::to_string(baseIndex * 8 + i * 8) + "], 0" << ";; Zero initialize " << uniqueName << "[" << i << "]" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rbp - " + std::to_string(baseOffset + i * elemSize) + "], 0" << ";; Zero initialize " << uniqueName << "[" << i << "]" << std::endl;
             }
         }
 
-        // Reserve space in the scope for the entire array (rest of the elements)
-        for (size_t i = 1; i < totalElements; ++i)
-        {
-            functionVariableIndex++;
-            VarInfo reserve{uniqueName, baseIndex + i, varType};
-            reserve.dimensions.clear();
-            scopes.top()["__reserved_" + uniqueName + "_" + std::to_string(i)] = reserve;
-        }
+        // no need to reserve each slot, offset already accounts for full array
+        (void)totalElements; // silence unused warning when initializer is null
     }
 };
 
@@ -1488,12 +1766,14 @@ struct ArrayAccessNode : ASTNode
         std::string uniqueName;
         size_t baseIndex = 0;
         size_t baseOffset = 0;
+        size_t elemSize = 1;
         if (found)
         {
             VarInfo infoAA = lookupResult.second;
             uniqueName = infoAA.uniqueName;
             baseIndex = infoAA.index;
-            baseOffset = baseIndex * 8; // Base offset from rbp in bytes
+            baseOffset = baseIndex; // already stored in bytes
+            elemSize = pointeeSize(infoAA.type);
         }
 
         // Check if all indices are constants
@@ -1533,19 +1813,19 @@ struct ArrayAccessNode : ASTNode
                     linear = linear * dimSize + constantIndices[k];
                 }
             }
-            size_t totalOffset = baseOffset + linear * 8;
+            size_t totalOffset = baseOffset + linear * elemSize;
 
             if (isGlobal)
             {
                 // Global array: use symbol + offset
-                std::string instruction = "    mov rax, [" + identifier;
+                std::string instruction = "\tmov rax, [" + identifier;
                 if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
                 instruction += "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
             }
             else
             {
-                std::string instruction = "    mov rax, [rbp - " + std::to_string(totalOffset) + "]";
+                std::string instruction = "\tmov rax, [rbp - " + std::to_string(totalOffset) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
             }
             for (size_t i = 0; i < constantIndices.size(); ++i)
@@ -1557,7 +1837,7 @@ struct ArrayAccessNode : ASTNode
             // Dynamic indices: compute linear offset at runtime
             if (indices.empty())
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << ";; no index, treat as base" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; no index, treat as base" << std::endl;
             }
             else
             {
@@ -1566,28 +1846,34 @@ struct ArrayAccessNode : ASTNode
                 for (size_t i = 1; i < indices.size(); ++i)
                 {
                     // save rax (current linear) in rcx
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rax" << ";; save linear so far" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; save linear so far" << std::endl;
                     indices[i]->emitCode(f); // rax = idx_i
                     size_t dimSize = (i < dims.size() ? dims[i] : 1);
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    imul rcx, " + std::to_string(dimSize) << ";; multiply by dimension size" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, rcx" << ";; add previous linear*dim" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\timul rcx, " + std::to_string(dimSize) << ";; multiply by dimension size" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; add previous linear*dim" << std::endl;
                 }
             }
 
-            f << std::left << std::setw(COMMENT_COLUMN) << "    shl rax, 3" << ";; Scale offset by 8 (sizeof(int64))" << std::endl;
+            // scale linear index by element size
+            if (elemSize == 1) {
+                // no change
+            } else {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, " + std::to_string(elemSize)
+                  << " ;; scale offset by element size" << std::endl;
+            }
             if (isGlobal)
             {
                 // global base is label
-                f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, " + identifier << " ;; add base address" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, " + identifier << " ;; add base address" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
             }
             else
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
-                std::string instruction = "    sub rcx, " + std::to_string(baseOffset);
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
+                std::string instruction = "\tsub rcx, " + std::to_string(baseOffset);
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Adjust to array base" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << ";; Subtract scaled index" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rcx]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsub rcx, rax" << ";; Subtract scaled index" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rcx]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
             }
         }
     }
@@ -1604,6 +1890,11 @@ struct ArrayAccessNode : ASTNode
  *                                                                                          *
  ********************************************************************************************/
 
+
+
+
+// forward declaration for expression type computation used by codegen
+static Type computeExprType(const ASTNode*, const std::stack<std::map<std::string, VarInfo>>&, const FunctionNode*);
 
 struct AssignmentNode : ASTNode
 {
@@ -1659,22 +1950,22 @@ struct AssignmentNode : ASTNode
                     uniqueName = infoA.uniqueName;
                     index = infoA.index;
                 }
-                f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Save the value" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save the value" << std::endl;
                 if (found)
                 {
-                    std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+                    std::string instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
                     f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load pointer " << uniqueName << std::endl;
                 }
                 else
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << identifier << "]" << ";; Load global pointer " << identifier << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << identifier << "]" << ";; Load global pointer " << identifier << std::endl;
                 }
                 for (int i = 1; i < dereferenceLevel; i++)
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [rax]" << ";; Dereference level " << i << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rax]" << ";; Dereference level " << i << std::endl;
                 }
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Restore the value" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [rax], rcx" << ";; Store value at final address" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore the value" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rax], rcx" << ";; Store value at final address" << std::endl;
             }
         }
         else if (!indices.empty())
@@ -1698,9 +1989,10 @@ struct AssignmentNode : ASTNode
 
             std::string uniqueName = infoB.uniqueName;
             size_t baseIndex = infoB.index;
-            size_t baseOffset = baseIndex * 8;
+            size_t baseOffset = baseIndex; // already a byte offset
+            size_t elemSize = pointeeSize(infoB.type);
 
-            f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Save the value to assign" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save the value to assign" << std::endl;
 
             // gather constant indices
             bool allConstant = true;
@@ -1737,21 +2029,21 @@ struct AssignmentNode : ASTNode
                         linear = linear * dimSize + constantIndices[k];
                     }
                 }
-                size_t offsetBytes = linear * 8;
+                size_t offsetBytes = linear * elemSize;
                 if (!isGlobal)
                     offsetBytes += baseOffset;
 
-                f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Restore the value" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Restore the value" << std::endl;
                 if (isGlobal)
                 {
-                    std::string instr = "    mov [" + identifier;
+                    std::string instr = "\tmov [" + identifier;
                     if (offsetBytes > 0) instr += " + " + std::to_string(offsetBytes);
                     instr += "], rax";
                     f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store global element" << std::endl;
                 }
                 else
                 {
-                    std::string instr = "    mov [rbp - " + std::to_string(offsetBytes) + "], rax";
+                    std::string instr = "\tmov [rbp - " + std::to_string(offsetBytes) + "], rax";
                     f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store in " << uniqueName << "[";
                     for (size_t i = 0; i < constantIndices.size(); ++i)
                         f << (i > 0 ? "," : "") << constantIndices[i];
@@ -1764,43 +2056,48 @@ struct AssignmentNode : ASTNode
                 for (size_t i = 0; i < indices.size(); ++i)
                 {
                     indices[i]->emitCode(f);
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Push index " << i << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push index " << i << std::endl;
                     if (i > 0)
                     {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Pop current index" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Pop accumulated offset" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    imul rax, rcx" << ";; Multiply by previous dimension" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Push updated offset" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Pop current index" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Pop accumulated offset" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, rcx" << ";; Multiply by previous dimension" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push updated offset" << std::endl;
                     }
                 }
                 if (indices.size() > 1)
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Pop final index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Pop final index" << std::endl;
                     for (size_t i = 1; i < indices.size(); ++i)
                     {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Pop next index" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, rcx" << ";; Add to offset" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Pop next index" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; Add to offset" << std::endl;
                     }
                 }
                 else
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rax" << ";; Pop single index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Pop single index" << std::endl;
                 }
-                f << std::left << std::setw(COMMENT_COLUMN) << "    shl rax, 3" << ";; Scale offset by 8 (sizeof(int64))" << std::endl;
+                if (elemSize == 1) {
+                    // nothing to do
+                } else {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, " + std::to_string(elemSize)
+                      << " ;; scale offset by element size" << std::endl;
+                }
                 if (isGlobal)
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, " + identifier << " ;; add base address" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Restore value" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov [rax], rcx" << ";; Store global element" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, " + identifier << " ;; add base address" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore value" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rax], rcx" << ";; Store global element" << std::endl;
                 }
                 else
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
-                    std::string inst2 = "    sub rcx, " + std::to_string(baseOffset);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
+                    std::string inst2 = "\tsub rcx, " + std::to_string(baseOffset);
                     f << std::left << std::setw(COMMENT_COLUMN) << inst2 << ";; Adjust to array base" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << ";; Subtract scaled index" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Restore value" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    mov [rcx], rcx" << ";; Store value" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tsub rcx, rax" << ";; Subtract scaled index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore value" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rcx], rcx" << ";; Store value" << std::endl;
                 }
             }
         }
@@ -1812,13 +2109,54 @@ struct AssignmentNode : ASTNode
             {
                 VarInfo infoC = lookupResult.second;
                 std::string uniqueName = infoC.uniqueName;
-                size_t index = infoC.index;
-                std::string instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
+                size_t offset = infoC.index;
+                size_t varSize = sizeOfType(infoC.type);
+                // convert result in rax to target type if needed
+                if (infoC.type.pointerLevel==0 && (infoC.type.base == Type::FLOAT || infoC.type.base == Type::DOUBLE)) {
+                    Type exprType = computeExprType(expression.get(), scopes, nullptr);
+                    // use rax value from expression and convert
+                    if (infoC.type.base == Type::DOUBLE) {
+                        if (exprType.pointerLevel==0) {
+                            if (exprType.base == Type::FLOAT) {
+                                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; prepare float->double conv" << std::endl;
+                                f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd xmm0, xmm0" << std::endl;
+                                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
+                            } else if (exprType.base == Type::INT || exprType.base == Type::CHAR) {
+                                f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm0, rax" << std::endl;
+                                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
+                            }
+                        }
+                    } else {
+                        // target float
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; prepare for float conv" << std::endl;
+                        if (exprType.pointerLevel==0) {
+                            if (exprType.base == Type::DOUBLE) {
+                                f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << std::endl;
+                            } else if (exprType.base == Type::FLOAT) {
+                                f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << std::endl;
+                            } else if (exprType.base == Type::INT || exprType.base == Type::CHAR) {
+                                f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm0, rax" << std::endl;
+                            }
+                        }
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << std::endl;
+                    }
+                }
+                // store to local variable using correct width
+                std::string instruction;
+                if (varSize == 1) {
+                    instruction = "\tmov byte [rbp - " + std::to_string(offset) + "], al";
+                } else if (varSize == 2) {
+                    instruction = "\tmov word [rbp - " + std::to_string(offset) + "], ax";
+                } else if (varSize == 4) {
+                    instruction = "\tmov dword [rbp - " + std::to_string(offset) + "], eax";
+                } else {
+                    instruction = "\tmov [rbp - " + std::to_string(offset) + "], rax";
+                }
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in local variable " << uniqueName << std::endl;
             }
             else
             {
-                std::string instruction = "    mov [" + identifier + "], rax";
+                std::string instruction = "\tmov [" + identifier + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in global variable " << identifier << std::endl;
             }
         }
@@ -1880,22 +2218,22 @@ struct AssignmentNode : ASTNode
         std::string endLabel = functionName + ".endif_" + std::to_string(labelID);
 
         condition->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << ";; Compare condition result with 0" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare condition result with 0" << std::endl;
 
         std::string instruction;
         if (!elseIfBlocks.empty())
         {
-            instruction = "    je " + functionName + ".else_if_0_" + std::to_string(labelID);
+            instruction = "\tje " + functionName + ".else_if_0_" + std::to_string(labelID);
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to first else_if block if condition is false" << std::endl;
         }
         else if (!elseBody.empty())
         {
-            instruction = "    je " + functionName + ".else_" + std::to_string(labelID);
+            instruction = "\tje " + functionName + ".else_" + std::to_string(labelID);
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to else block if condition is false" << std::endl;
         }
         else
         {
-            instruction = "    je " + endLabel;
+            instruction = "\tje " + endLabel;
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
         }
 
@@ -1906,7 +2244,7 @@ struct AssignmentNode : ASTNode
             stmt->emitCode(f);
         }
         scopes.pop();
-        instruction = "    jmp " + endLabel;
+        instruction = "\tjmp " + endLabel;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end to skip all else-if and else blocks" << std::endl;
 
         // Emit 'else if' blocks
@@ -1914,21 +2252,21 @@ struct AssignmentNode : ASTNode
         {
             f << std::endl << functionName << ".else_if_" << i << "_" << labelID << ":" << std::endl;
             elseIfBlocks[i].first->emitCode(f);
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << ";; Compare condition result with 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare condition result with 0" << std::endl;
 
             if (i + 1 < elseIfBlocks.size())
             {
-                instruction = "    je " + functionName + ".else_if_" + std::to_string(i + 1) + "_" + std::to_string(labelID);
+                instruction = "\tje " + functionName + ".else_if_" + std::to_string(i + 1) + "_" + std::to_string(labelID);
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to next else-if block if condition is false" << std::endl;
             }
             else if (!elseBody.empty())
             {
-                instruction = "    je " + functionName + ".else_" + std::to_string(labelID);
+                instruction = "\tje " + functionName + ".else_" + std::to_string(labelID);
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to else block if condition is false" << std::endl;
             }
             else
             {
-                instruction = "    je " + endLabel;
+                instruction = "\tje " + endLabel;
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
             }
 
@@ -1939,7 +2277,7 @@ struct AssignmentNode : ASTNode
             }
             scopes.pop();
 
-            instruction = "    jmp " + endLabel;
+            instruction = "\tjmp " + endLabel;
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end to skip remaining blocks" << std::endl;
         }
 
@@ -1984,8 +2322,8 @@ struct WhileLoopNode : ASTNode
         f << std::endl << functionName << ".loop_start_" << loopStartLabel << ":" << std::endl;
         condition->emitCode(f); // Evaluate the condition
         
-        std::string instruction = "    je " + functionName + ".loop_end_" + std::to_string(loopEndLabel);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << ";; Compare condition result with 0" << std::endl;
+        std::string instruction = "\tje " + functionName + ".loop_end_" + std::to_string(loopEndLabel);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare condition result with 0" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
 
         // Emit the loop body (with its own scope)
@@ -1996,7 +2334,7 @@ struct WhileLoopNode : ASTNode
         }
         scopes.pop();
         
-        instruction = "    jmp " + functionName + ".loop_start_" + std::to_string(loopStartLabel);
+        instruction = "\tjmp " + functionName + ".loop_start_" + std::to_string(loopStartLabel);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump back to start of loop" << std::endl;
         f << std::endl << functionName << ".loop_end_" << loopEndLabel << ":" << std::endl;
     }
@@ -2050,8 +2388,8 @@ struct ForLoopNode : ASTNode
         if (condition)
         {
             condition->emitCode(f); // e.g., i < 5
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rax, 0" << ";; Compare condition result with 0" << std::endl;
-            std::string instruction = "    je " + fullEndLabel;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare condition result with 0" << std::endl;
+            std::string instruction = "\tje " + fullEndLabel;
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
         }
 
@@ -2064,7 +2402,7 @@ struct ForLoopNode : ASTNode
         {
             iteration->emitCode(f); // e.g., i++
         }
-        std::string instruction = "    jmp " + fullStartLabel;
+        std::string instruction = "\tjmp " + fullStartLabel;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump back to start of loop" << std::endl;
         f << std::endl << fullEndLabel << ":" << std::endl;
 
@@ -2090,6 +2428,10 @@ struct BinaryOpNode : ASTNode
     std::string op;
     std::unique_ptr<ASTNode> left;
     std::unique_ptr<ASTNode> right;
+    // during semantic analysis we record the types of the operands
+    Type leftType{Type::INT,0};
+    Type rightType{Type::INT,0};
+    Type resultType{Type::INT,0};
 
     BinaryOpNode(const std::string& op, std::unique_ptr<ASTNode> l, std::unique_ptr<ASTNode> r)
         : op(op), left(std::move(l)), right(std::move(r)) {}
@@ -2101,104 +2443,226 @@ struct BinaryOpNode : ASTNode
     }
     void emitCode(std::ofstream& f) const override
     {
+        // For floating-point results, use SSE instructions rather than integer arithmetic.
+        bool isFloatResult = (resultType.pointerLevel == 0) &&
+                             (resultType.base == Type::FLOAT || resultType.base == Type::DOUBLE);
+        if (isFloatResult) {
+            // evaluate left operand first
+            left->emitCode(f);
+            // convert left operand into xmm0 according to its type and the desired result
+            if (resultType.base == Type::DOUBLE) {
+                if (leftType.pointerLevel==0) {
+                    if (leftType.base == Type::INT || leftType.base == Type::CHAR) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm0, rax" << ";; int->double" << std::endl;
+                    } else if (leftType.base == Type::FLOAT) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd xmm0, xmm0" << ";; float->double" << std::endl;
+                    } else {
+                        // left is already double
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << std::endl;
+                    }
+                }
+            } else {
+                // target float precision
+                if (leftType.pointerLevel==0) {
+                    if (leftType.base == Type::INT || leftType.base == Type::CHAR) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm0, rax" << ";; int->float" << std::endl;
+                    } else if (leftType.base == Type::DOUBLE) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << ";; double->float" << std::endl;
+                    } else if (leftType.base == Type::FLOAT) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << std::endl;
+                    }
+                }
+            }
+
+            // evaluate right operand
+            right->emitCode(f);
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm1, rax" << ";; move right into xmm1" << std::endl;
+
+            // convert right operand into correct precision
+            if (resultType.base == Type::DOUBLE) {
+                if (rightType.pointerLevel==0) {
+                    if (rightType.base == Type::INT || rightType.base == Type::CHAR) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm1, rax" << ";; int->double" << std::endl;
+                    } else if (rightType.base == Type::FLOAT) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd xmm1, xmm1" << ";; float->double" << std::endl;
+                    }
+                }
+                // perform operation
+                if (op == "+") f << std::left << std::setw(COMMENT_COLUMN) << "\taddsd xmm0, xmm1" << ";; double add" << std::endl;
+                else if (op == "-") f << std::left << std::setw(COMMENT_COLUMN) << "\tsubsd xmm0, xmm1" << ";; double sub" << std::endl;
+                else if (op == "*") f << std::left << std::setw(COMMENT_COLUMN) << "\tmulsd xmm0, xmm1" << ";; double mul" << std::endl;
+                else if (op == "/") f << std::left << std::setw(COMMENT_COLUMN) << "\tdivsd xmm0, xmm1" << ";; double div" << std::endl;
+                // convert result back to rax
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << ";; move double result to rax" << std::endl;
+            } else {
+                // target float precision
+                if (rightType.pointerLevel==0) {
+                    if (rightType.base == Type::INT || rightType.base == Type::CHAR) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm1, rax" << ";; int->float" << std::endl;
+                    } else if (rightType.base == Type::DOUBLE) {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm1, xmm1" << ";; double->float" << std::endl;
+                    }
+                }
+                if (op == "+") f << std::left << std::setw(COMMENT_COLUMN) << "\taddss xmm0, xmm1" << ";; float add" << std::endl;
+                else if (op == "-") f << std::left << std::setw(COMMENT_COLUMN) << "\tsubss xmm0, xmm1" << ";; float sub" << std::endl;
+                else if (op == "*") f << std::left << std::setw(COMMENT_COLUMN) << "\tmulss xmm0, xmm1" << ";; float mul" << std::endl;
+                else if (op == "/") f << std::left << std::setw(COMMENT_COLUMN) << "\tdivss xmm0, xmm1" << ";; float div" << std::endl;
+                // move lower 32 bits into rax and clear high bits
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << ";; move float result to eax (upper bits zeroed)" << std::endl;
+            }
+            return;
+        }
+
         left->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    push rax" << ";; Push left operand onto stack" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push left operand onto stack" << std::endl;
         right->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "    pop rcx" << ";; Pop left operand into rcx" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Pop left operand into rcx" << std::endl;
+
+        // helper lambdas to query pointer/integer nature
+        auto leftPtr = leftType.pointerLevel > 0;
+        auto rightPtr = rightType.pointerLevel > 0;
+        auto leftInt = !leftPtr;
+        auto rightInt = !rightPtr;
 
         if (op == "+")
 	    {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    add rax, rcx" << ";; Add rcx to rax" << std::endl;
+            if (leftPtr && rightInt) {
+                // pointer + integer
+                size_t scale = pointeeSize(leftType);
+                if (scale != 1) {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, " + std::to_string(scale)
+                      << ";; scale integer operand by element size" << std::endl;
+                }
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, rax" << ";; ptr + scaled int" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; result into rax" << std::endl;
+            } else if (leftInt && rightPtr) {
+                // integer + pointer
+                size_t scale = pointeeSize(rightType);
+                if (scale != 1) {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\timul rcx, " + std::to_string(scale)
+                      << ";; scale integer operand by element size" << std::endl;
+                }
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; scaled int + ptr" << std::endl;
+            } else {
+                // plain integer addition
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; Add rcx to rax" << std::endl;
+            }
         }
 
         else if (op == "-")
 	    {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    sub rcx, rax" << ";; Subtract rax from rcx" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, rcx" << ";; Put in rax value of rcx" << std::endl;
+            if (leftPtr && rightInt) {
+                // pointer - integer
+                size_t scale = pointeeSize(leftType);
+                if (scale != 1) {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, " + std::to_string(scale)
+                      << ";; scale integer operand by element size" << std::endl;
+                }
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsub rcx, rax" << ";; ptr - scaled int" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; result into rax" << std::endl;
+            } else if (leftPtr && rightPtr) {
+                // pointer - pointer -> integer number of elements
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsub rcx, rax" << ";; subtract pointer values" << std::endl;
+                size_t scale = pointeeSize(leftType); // same as rightType by semantic rules
+                if (scale != 1) {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; move byte-difference to rax" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tcqo" << ";; sign-extend rax into rdx" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, " + std::to_string(scale) << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rcx" << ";; divide by element size" << std::endl;
+                } else {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; result into rax (no scaling)" << std::endl;
+                }
+            } else {
+                // plain integer subtraction
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsub rcx, rax" << ";; Subtract rax from rcx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Put in rax value of rcx" << std::endl;
+            }
         }
 
         else if (op == "&")
         {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    and rax, rcx" << ";; Perform AND on rax by rcx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tand rax, rcx" << ";; Perform AND on rax by rcx" << std::endl;
         }
 
         else if (op == "|")
         {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    or rax, rcx" << ";; Perform OR on rax by rcx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tor rax, rcx" << ";; Perform OR on rax by rcx" << std::endl;
         }
 
         else if (op == "^")
         {
-            f << std::left << std::setw(COMMENT_COLUMN) << "    xor rax, rcx" << ";; Perform XOR on rax by rcx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rcx" << ";; Perform XOR on rax by rcx" << std::endl;
         }
 
         else if (op == "<<")
         {
-            f << "    ; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
+            f << "\t; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
             f << "\t\t\t\txor rax, rcx\n\t\t\t\txor rcx, rax\n\t\t\t\txor rax, rcx" << std::endl;
-            f << "    ; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    shl rax, cl" << ";; Perform SHL on rax by cl" << std::endl;
+            f << "\t; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tshl rax, cl" << ";; Perform SHL on rax by cl" << std::endl;
         }
 
         else if (op == ">>")
         {
-            f << "    ; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
+            f << "\t; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
             f << "\t\t\t\txor rax, rcx\n\t\t\t\txor rcx, rax\n\t\t\t\txor rax, rcx" << std::endl;
-            f << "    ; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    shr rax, cl" << ";; Perform SHR on rax by cl" << std::endl;
+            f << "\t; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tshr rax, cl" << ";; Perform SHR on rax by cl" << std::endl;
         }
 
         else if (op == "*")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    imul rax, rcx" << ";; Multiply rax by rcx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, rcx" << ";; Multiply rax by rcx" << std::endl;
         }
 
         else if (op == "/")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cqo" << ";; Sign-extend rax into rdx" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    idiv rcx" << ";; Divide rdx:rax by rcx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcqo" << ";; Sign-extend rax into rdx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rcx" << ";; Divide rdx:rax by rcx" << std::endl;
         }
 
         else if (op == "==")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    sete al" << ";; Set al to 1 if equal, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << ";; Zero-extend al to rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsete al" << ";; Set al to 1 if equal, else 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == "!=") 
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    setne al" << ";; Set al to 1 if not equal, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << ";; Zero-extend al to rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetne al" << ";; Set al to 1 if not equal, else 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == "<")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    setl al" << ";; Set al to 1 if less, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << ";; Zero-extend al to rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetl al" << ";; Set al to 1 if less, else 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == ">")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    setg al" << ";; Set al to 1 if greater, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << ";; Zero-extend al to rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetg al" << ";; Set al to 1 if greater, else 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == "<=")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    setle al" << ";; Set al to 1 if less or equal, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << ";; Zero-extend al to rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetle al" << ";; Set al to 1 if less or equal, else 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == ">=")
     	{
-            f << std::left << std::setw(COMMENT_COLUMN) << "    cmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    setge al" << ";; Set al to 1 if greater or equal, else 0" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "    movzx rax, al" << ";; Zero-extend al to rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetge al" << ";; Set al to 1 if greater or equal, else 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
     }
 };
@@ -2230,33 +2694,33 @@ struct UnaryOpNode : ASTNode
             {
                 VarInfo infoD = lookupResult.second;
                 std::string uniqueName = infoD.uniqueName;
-                size_t index = infoD.index;
-                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+                size_t offset = infoD.index;
+                std::string instruction = "\tmov rax, [rbp - " + std::to_string(offset) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax" << std::endl;
                 if (op == "++")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Increment" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Increment" << std::endl;
                 }
                 else if (op == "--")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << ";; Decrement" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Decrement" << std::endl;
                 }
-                instruction = "    mov [rbp - " + std::to_string(index * 8) + "], rax";
+                instruction = "\tmov [rbp - " + std::to_string(offset) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result back in " << uniqueName << std::endl;
             }
             else
             {
                 // Global variable
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
                 if (op == "++")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    inc rax" << ";; Increment" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Increment" << std::endl;
                 }
                 else if (op == "--")
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "    dec rax" << ";; Decrement" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Decrement" << std::endl;
                 }
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov [" << name << "], rax" << ";; Store result back in " << name << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [" << name << "], rax" << ";; Store result back in " << name << std::endl;
             }
         }
         else
@@ -2267,9 +2731,9 @@ struct UnaryOpNode : ASTNode
             {
                 VarInfo info = lookupResult.second;
                 std::string uniqueName = info.uniqueName;
-                size_t index = info.index;
+                size_t offset = info.index;
                 // Load the current value and save it
-                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
+                std::string instruction = "\tmov rax, [rbp - " + std::to_string(offset) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax (postfix value)" << std::endl;
                 // Don't apply the operation yet - defer it for later
                 deferredPostfixOps.push_back({op, name});
@@ -2277,7 +2741,7 @@ struct UnaryOpNode : ASTNode
             else
             {
                 // Global variable
-                f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
                 deferredPostfixOps.push_back({op, name});
             }
         }
@@ -2296,6 +2760,8 @@ struct UnaryOpNode : ASTNode
  **********************************************************/
 
 
+// forward declarations used by AST nodes
+
 struct NumberNode : ASTNode
 {
     int value;
@@ -2305,12 +2771,117 @@ struct NumberNode : ASTNode
     void emitData(std::ofstream& f) const override {}
     void emitCode(std::ofstream& f) const override
     {
-        std::string instruction = "    mov rax, " + std::to_string(value);
+        std::string instruction = "\tmov rax, " + std::to_string(value);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load constant " << value << " into rax" << std::endl;
     }
 
     bool isConstant() const override { return true; }
     int getConstantValue() const override { return value; }
+};
+
+// floating-point literal (parsed as double)
+struct FloatLiteralNode : ASTNode
+{
+    double value;
+    FloatLiteralNode(double v) : value(v) {}
+
+    void emitData(std::ofstream& f) const override {}
+    void emitCode(std::ofstream& f) const override
+    {
+        // move the bit pattern of the double into rax via hex immediate
+        uint64_t bits;
+        static_assert(sizeof(bits) == sizeof(value), "size mismatch");
+        std::memcpy(&bits, &value, sizeof(bits));
+        std::stringstream ss;
+        ss << "0x" << std::hex << bits;
+        std::string hexbits = ss.str();
+        std::string instruction = "\tmov rax, " + hexbits;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load float constant " << value << " into rax" << std::endl;
+    }
+
+    bool isConstant() const override { return true; }
+    int getConstantValue() const override { return (int)value; }
+};
+
+// sizeof node: either stores a type or an expression.  Result is always an int constant.
+struct SizeofNode : ASTNode
+{
+    Type typeOperand;                  // valid when isType == true
+    std::unique_ptr<ASTNode> expr;     // valid when isType == false
+    bool isType;
+    const FunctionNode* currentFunction;
+
+    // type-based constructor
+    SizeofNode(const Type &t, const FunctionNode* cf)
+        : typeOperand(t), expr(nullptr), isType(true), currentFunction(cf) {}
+    // expression-based constructor
+    SizeofNode(std::unique_ptr<ASTNode> e, const FunctionNode* cf)
+        : typeOperand({Type::INT,0}), expr(std::move(e)), isType(false), currentFunction(cf) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        if (expr) expr->emitData(f);
+    }
+    // helper used by both emitCode and getConstantValue to compute the
+    // size of an expression operand.  Arrays with compile‑time dimensions are
+    // handled specially; otherwise we fall back to normal type sizing.
+    size_t computeExprSize() const
+    {
+        if (isType) {
+            return sizeOfType(typeOperand);
+        }
+        // expression-based sizeof; if the operand is an identifier we can
+        // potentially inspect its dimensions without RTTI.
+        if (expr) {
+            const std::string *nm = expr->getIdentifierName();
+            if (nm) {
+                // look for a local definition first
+                std::stack<std::map<std::string, VarInfo>> tmp = scopes;
+                while (!tmp.empty()) {
+                    auto &m = tmp.top();
+                    if (m.find(*nm) != m.end()) {
+                        const VarInfo &info = m.at(*nm);
+                        if (!info.dimensions.empty()) {
+                            // varType is stored as a pointer-to-element, so drop one
+                            // level to obtain the true element size.
+                            Type elemType = info.type;
+                            if (elemType.pointerLevel > 0) elemType.pointerLevel--;
+                            size_t elemSize = sizeOfType(elemType);
+                            size_t total = elemSize;
+                            for (size_t d : info.dimensions) total *= d;
+                            return total;
+                        }
+                        break;
+                    }
+                    tmp.pop();
+                }
+                // check globals
+                if (globalArrayDimensions.count(*nm)) {
+                    Type gt = globalVariables[*nm];
+                    if (gt.pointerLevel > 0) gt.pointerLevel--;
+                    size_t elemSize = sizeOfType(gt);
+                    size_t total = elemSize;
+                    for (size_t d : globalArrayDimensions[*nm]) total *= d;
+                    return total;
+                }
+            }
+        }
+        Type t = computeExprType(expr.get(), scopes, currentFunction);
+        return sizeOfType(t);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        size_t sz = computeExprSize();
+        std::string instruction = "\tmov rax, " + std::to_string(sz);
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; sizeof => " << sz << std::endl;
+    }
+
+    bool isConstant() const override { return true; }
+    int getConstantValue() const override
+    {
+        return (int)computeExprSize();
+    }
 };
 
 
@@ -2338,7 +2909,7 @@ struct CharLiteralNode : ASTNode
             case '\0':  ascii_value = 0;  the_value = "\\0";  break;
             default:    ascii_value = (static_cast<int>(value));
         }
-        std::string instruction = "    mov rax, " + std::to_string(ascii_value);
+        std::string instruction = "\tmov rax, " + std::to_string(ascii_value);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load char literal '" << the_value << "' into rax" << std::endl;
     }
 
@@ -2372,8 +2943,8 @@ struct StringLiteralNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        f << "    ; \"" << updatedValue << "\"" << std::endl;
-        f << "    " << label << " db ";
+        f << "\t; \"" << updatedValue << "\"" << std::endl;
+        f << "\t" << label << " db ";
         for (char c : value)
         {
             switch (c)
@@ -2392,7 +2963,7 @@ struct StringLiteralNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        std::string instruction = "    lea rax, [" + label + "]";
+        std::string instruction = "\tlea rax, [" + label + "]";
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load address of string '" << updatedValue << "' into rax" << std::endl; 
     }
 };
@@ -2445,34 +3016,61 @@ struct IdentifierNode : ASTNode
         {
             std::string uniqueName = infoResult.uniqueName;
             size_t index = infoResult.index;
+            bool isArray = !infoResult.dimensions.empty();
 
-            // Check if this is a stack parameter (index >= 1000)
+            // Compute correct code depending on storage and array/pointer nature
             if (index >= 1000)
             {
                 // Stack parameters: accessed with positive offset from rbp
                 size_t offset = index - 1000;
-                std::string instruction = "    mov rax, [rbp + " + std::to_string(offset + 16) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load stack parameter " << uniqueName << std::endl;
+                if (isArray)
+                {
+                    // parameter declared as array behaves like pointer variable already (addr in stack)
+                    std::string instruction = "\tmov rax, [rbp + " + std::to_string(offset + 16) + "]";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load pointer parameter " << uniqueName << std::endl;
+                }
+                else
+                {
+                    std::string instruction = "\tmov rax, [rbp + " + std::to_string(offset + 16) + "]";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load stack parameter " << uniqueName << std::endl;
+                }
             }
             else
             {
-                // Regular local variables and register parameters: accessed with negative offset from rbp
-                std::string instruction = "    mov rax, [rbp - " + std::to_string(index * 8) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load variable " << uniqueName << std::endl;
+                if (isArray)
+                {
+                    // for a local array, we need the address of its first element, not its value
+                    std::string instruction = "\tlea rax, [rbp - " + std::to_string(index) + "]";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load address of array " << uniqueName << std::endl;
+                }
+                else
+                {
+                    // Regular local variables and register parameters: accessed with negative offset from rbp
+                    std::string instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load variable " << uniqueName << std::endl;
+                }
             }
         }
         else if (isGlobal)
         {
-            // The variable is global (in the .data section)
-            std::string instruction = "    mov rax, [" + name + "]";
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load global variable " << name << std::endl;
+            // The variable is global (in the .data section).  If it's an array we want
+            // its base address; otherwise load the stored value.
+            if (globalArrayDimensions.count(name)) {
+                std::string instruction = "\tmov rax, " + name;
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load address of global array " << name << std::endl;
+            } else {
+                std::string instruction = "\tmov rax, [" + name + "]";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load global variable " << name << std::endl;
+            }
         }
         else
         {
             // Already reported error; emit dummy zero
-            f << std::left << std::setw(COMMENT_COLUMN) << "    mov rax, 0" << ";; undefined variable fallback" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; undefined variable fallback" << std::endl;
         }
     }
+
+    const std::string* getIdentifierName() const override { return &name; }
 };
 
 
@@ -2572,10 +3170,66 @@ class Parser
             return std::make_unique<UnaryOpNode>(token.value, identifier, true, idToken.line, idToken.col); // true for prefix
         }
 
-        else if (token.type == TOKEN_NUMBER)
-	    {
-            eat(TOKEN_NUMBER);
-            return std::make_unique<NumberNode>(std::stoi(token.value));
+        // sizeof operator
+        else if (token.type == TOKEN_SIZEOF)
+        {
+            eat(TOKEN_SIZEOF);
+            if (currentToken.type == TOKEN_LPAREN)
+            {
+                eat(TOKEN_LPAREN);
+                // attempt to parse a type-name sequence as for declarations
+                TokenType tt = TOKEN_INT;
+                bool sawType = false;
+                bool sawUnsigned = false;
+                while (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR ||
+                       currentToken.type == TOKEN_VOID || currentToken.type == TOKEN_SHORT ||
+                       currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT ||
+                       currentToken.type == TOKEN_DOUBLE || currentToken.type == TOKEN_UNSIGNED ||
+                       currentToken.type == TOKEN_SIGNED)
+                {
+                    sawType = true;
+                    if (currentToken.type == TOKEN_UNSIGNED) sawUnsigned = true;
+                    else if (currentToken.type == TOKEN_SHORT) tt = TOKEN_SHORT;
+                    else if (currentToken.type == TOKEN_LONG) tt = TOKEN_LONG;
+                    else if (currentToken.type == TOKEN_FLOAT) tt = TOKEN_FLOAT;
+                    else if (currentToken.type == TOKEN_DOUBLE) tt = TOKEN_DOUBLE;
+                    else if (currentToken.type == TOKEN_CHAR) tt = TOKEN_CHAR;
+                    else if (currentToken.type == TOKEN_VOID) tt = TOKEN_VOID;
+                    else if (currentToken.type == TOKEN_INT) tt = TOKEN_INT;
+                    eat(currentToken.type);
+                }
+                if (sawType)
+                {
+                    int ptrLevel = 0;
+                    while (currentToken.type == TOKEN_MUL) { ptrLevel++; eat(TOKEN_MUL); }
+                    Type t = makeType(tt, ptrLevel, sawUnsigned);
+                    eat(TOKEN_RPAREN);
+                    return std::make_unique<SizeofNode>(t, currentFunction);
+                }
+                else
+                {
+                    auto exprNode = logicalOr(currentFunction);
+                    eat(TOKEN_RPAREN);
+                    return std::make_unique<SizeofNode>(std::move(exprNode), currentFunction);
+                }
+            }
+            else
+            {
+                // treat sizeof X as sizeof (X)
+                auto exprNode = factor(currentFunction);
+                return std::make_unique<SizeofNode>(std::move(exprNode), currentFunction);
+            }
+        }
+
+else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
+        {
+            if (token.type == TOKEN_NUMBER) {
+                eat(TOKEN_NUMBER);
+                return std::make_unique<NumberNode>(std::stoi(token.value));
+            } else {
+                eat(TOKEN_FLOAT_LITERAL);
+                return std::make_unique<FloatLiteralNode>(std::stod(token.value));
+            }
         }
 
         else if (token.type == TOKEN_MUL) // Dereference
@@ -2779,10 +3433,28 @@ class Parser
             return std::make_unique<BlockNode>(std::move(stmts));
         }
 
-        if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID)
-	    {
-            TokenType typeTok = token.type;
-            eat(typeTok);
+// declaration begins with a type keyword
+        if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID ||
+            token.type == TOKEN_SHORT || token.type == TOKEN_LONG || token.type == TOKEN_FLOAT ||
+            token.type == TOKEN_DOUBLE || token.type == TOKEN_UNSIGNED || token.type == TOKEN_SIGNED)
+        {
+            // consume sequence of type specifiers (signed/unsigned, short, long, etc.)
+            TokenType typeTok = TOKEN_INT;
+            bool seenUnsigned = false;
+            while (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
+                   currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT ||
+                   currentToken.type == TOKEN_DOUBLE || currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED)
+            {
+                if (currentToken.type == TOKEN_UNSIGNED) seenUnsigned = true;
+                else if (currentToken.type == TOKEN_SHORT) typeTok = TOKEN_SHORT;
+                else if (currentToken.type == TOKEN_LONG) typeTok = TOKEN_LONG;
+                else if (currentToken.type == TOKEN_FLOAT) typeTok = TOKEN_FLOAT;
+                else if (currentToken.type == TOKEN_DOUBLE) typeTok = TOKEN_DOUBLE;
+                else if (currentToken.type == TOKEN_CHAR) typeTok = TOKEN_CHAR;
+                else if (currentToken.type == TOKEN_VOID) typeTok = TOKEN_VOID;
+                else if (currentToken.type == TOKEN_INT) typeTok = TOKEN_INT;
+                eat(currentToken.type);
+            }
             int pointerLevel = 0;
 
             // Check for pointer qualification
@@ -2831,7 +3503,9 @@ class Parser
                 eat(TOKEN_RBRACKET);
             }
 
-            Type baseType = makeType(typeTok, pointerLevel);
+// determine unsigned qualifier
+                bool isUns = seenUnsigned; // qualifiers already popped earlier if any
+                Type baseType = makeType(typeTok, pointerLevel, isUns);
 
             if (!dimensions.empty())
             {
@@ -3201,14 +3875,23 @@ class Parser
             }
         }
 
-        // Parse the return type (int, char or void)
-        TokenType returnType = currentToken.type;
-        if (returnType != TOKEN_INT && returnType != TOKEN_CHAR && returnType != TOKEN_VOID)
+        // Parse the return type (int, char, void, etc.)
+        TokenType returnType = TOKEN_INT;
+        bool returnUns = false;
+        while (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
+               currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT ||
+               currentToken.type == TOKEN_DOUBLE || currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED)
         {
-            reportError(currentToken.line, currentToken.col, "Expected return type (int, char of void)");
-            hadError = true;
+            if (currentToken.type == TOKEN_UNSIGNED) returnUns = true;
+            else if (currentToken.type == TOKEN_SHORT) returnType = TOKEN_SHORT;
+            else if (currentToken.type == TOKEN_LONG) returnType = TOKEN_LONG;
+            else if (currentToken.type == TOKEN_FLOAT) returnType = TOKEN_FLOAT;
+            else if (currentToken.type == TOKEN_DOUBLE) returnType = TOKEN_DOUBLE;
+            else if (currentToken.type == TOKEN_CHAR) returnType = TOKEN_CHAR;
+            else if (currentToken.type == TOKEN_VOID) returnType = TOKEN_VOID;
+            else if (currentToken.type == TOKEN_INT) returnType = TOKEN_INT;
+            eat(currentToken.type);
         }
-        eat(returnType);
         
         // Parse the function/variable name
         std::string name = currentToken.value;
@@ -3266,12 +3949,12 @@ class Parser
             eat(TOKEN_SEMICOLON);
             if (dimensions.empty())
             {
-                return std::make_unique<GlobalDeclarationNode>(name, makeType(returnType, ptrLevel), std::move(init), isExternal);
+                return std::make_unique<GlobalDeclarationNode>(name, makeType(returnType, ptrLevel, returnUns), std::move(init), isExternal);
             }
             else
             {
                 // create a temporary ArrayDeclarationNode to hold dimension info, then wrap in GlobalDeclaration
-                auto arrType = makeType(returnType, ptrLevel+1);
+                auto arrType = makeType(returnType, ptrLevel+1, returnUns);
                 auto arrDecl = std::make_unique<ArrayDeclarationNode>(name, arrType, std::move(dimensions), std::move(arrayInit), true);
                 // general global handling will later pick up type and dims via semantic pass
                 return arrDecl;
@@ -3291,14 +3974,23 @@ class Parser
                 eat(TOKEN_ELLIPSIS);
                 break;
             }
-            // Parse the parameter type (int, char or void)
-            TokenType paramType = currentToken.type;
-            if (paramType != TOKEN_INT && paramType != TOKEN_CHAR && paramType != TOKEN_VOID)
+            // Parse the parameter type (allow extended integer/float keywords)
+            TokenType paramType = TOKEN_INT;
+            bool paramUns = false;
+            while (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
+                   currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT ||
+                   currentToken.type == TOKEN_DOUBLE || currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED)
             {
-                reportError(currentToken.line, currentToken.col, "Expected parameter type (int, char or void)");
-                hadError = true;
+                if (currentToken.type == TOKEN_UNSIGNED) paramUns = true;
+                else if (currentToken.type == TOKEN_SHORT) paramType = TOKEN_SHORT;
+                else if (currentToken.type == TOKEN_LONG) paramType = TOKEN_LONG;
+                else if (currentToken.type == TOKEN_FLOAT) paramType = TOKEN_FLOAT;
+                else if (currentToken.type == TOKEN_DOUBLE) paramType = TOKEN_DOUBLE;
+                else if (currentToken.type == TOKEN_CHAR) paramType = TOKEN_CHAR;
+                else if (currentToken.type == TOKEN_VOID) paramType = TOKEN_VOID;
+                else if (currentToken.type == TOKEN_INT) paramType = TOKEN_INT;
+                eat(currentToken.type);
             }
-            eat(paramType);
             int ptrLevel = 0;
             while (currentToken.type == TOKEN_MUL)
             {
@@ -3311,7 +4003,7 @@ class Parser
             eat(TOKEN_IDENTIFIER);
 
             // Add the parameter to the list
-            parameters.push_back({ makeType(paramType, ptrLevel), name });
+            parameters.push_back({ makeType(paramType, ptrLevel,paramUns), name });
             if (currentToken.type == TOKEN_COMMA)
             {
                 // consume comma and continue parsing next parameter or ellipsis
@@ -3333,13 +4025,13 @@ class Parser
         if (currentToken.type == TOKEN_SEMICOLON)
         {
             // create node with empty body and return
-            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic);
+            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,0,returnUns), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic);
             eat(TOKEN_SEMICOLON);
             return functionNode;
         }
 
         // Create the FunctionNode; body will be filled in below
-        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic);
+        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,0,returnUns), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic);
 
         if (isExternal)
         {
@@ -3445,7 +4137,10 @@ public:
 
         while (currentToken.type != TOKEN_EOF)
 	    {
-            if (currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID)
+            // allow any of the basic type specifiers or 'extern' at file scope
+            if (currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
+                currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT || currentToken.type == TOKEN_DOUBLE ||
+                currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED)
             {
                 auto node = function();
                 // if (auto gd = dynamic_cast<GlobalDeclarationNode*>(node.get()))
@@ -3620,12 +4315,26 @@ static bool localLookupName(const std::stack<std::map<std::string, VarInfo>>& s,
 // Forward declaration
 static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, VarInfo>> &scopes, const FunctionNode* currentFunction);
 
-// simple compatibility predicate (allow integer-to-integer conversions, pointer == pointer).
+// simple compatibility predicate.  We accept the following cases:
+//   * exact type match
+//   * any two integer-like types (char, short, int, long) are interchangeable
+//   * any arithmetic types (integers or floats) convert to one another
+//   * assigning integer 0 to a pointer
+//   * pointers with identical level/qualifiers (handled by dest==src above)
 static bool typesCompatible(const Type& dest, const Type& src)
 {
     if (dest == src) return true;
-    auto isIntLike = [&](const Type& t){ return t.pointerLevel == 0 && (t.base == Type::INT || t.base == Type::CHAR); };
-    if (isIntLike(dest) && isIntLike(src)) return true;
+    auto isIntLike = [&](const Type& t){
+        return t.pointerLevel == 0 && (t.base == Type::INT || t.base == Type::CHAR || t.base == Type::SHORT || t.base == Type::LONG);
+    };
+    auto isFloatLike = [&](const Type& t){
+        return t.pointerLevel == 0 && (t.base == Type::FLOAT || t.base == Type::DOUBLE);
+    };
+    auto isArithmetic = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
+
+    if (isArithmetic(dest) && isArithmetic(src))
+        return true;
+
     // allow assigning 0 to any pointer
     if (isIntLike(src) && src.pointerLevel == 0 && dest.pointerLevel > 0)
         return true;
@@ -3672,13 +4381,32 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     if (!node) return {Type::INT,0};
     if (auto idn = dynamic_cast<const IdentifierNode*>(node))
     {
+        // normal variable lookup; if the identifier refers to an array it decays to
+        // a pointer to the first element when used in an expression.
         auto lookupResult = lookupInScopes(scopes, idn->name);
-        if (lookupResult.first) return lookupResult.second.type;
+        if (lookupResult.first) {
+            Type t = lookupResult.second.type;
+            if (!lookupResult.second.dimensions.empty()) {
+                // array -> pointer to element; the declared type for local arrays
+                // already has pointerLevel==1 (parser treats arrays as pointer), so
+                // only bump if it isn't already a pointer.
+                if (t.pointerLevel == 0)
+                    t.pointerLevel++;
+            }
+            return t;
+        }
         auto git = globalVariables.find(idn->name);
-        if (git != globalVariables.end()) return git->second;
+        if (git != globalVariables.end()) {
+            Type t = git->second;
+            if (globalArrayDimensions.count(idn->name)) {
+                t.pointerLevel++;
+            }
+            return t;
+        }
         return {Type::INT,0};
     }
     if (dynamic_cast<const NumberNode*>(node)) return {Type::INT,0};
+    if (dynamic_cast<const FloatLiteralNode*>(node)) return {Type::DOUBLE,0};
     if (dynamic_cast<const CharLiteralNode*>(node)) return {Type::CHAR,0};
     if (dynamic_cast<const StringLiteralNode*>(node)) { Type t; t.base=Type::CHAR; t.pointerLevel=1; return t; }
     if (auto un = dynamic_cast<const UnaryOpNode*>(node))
@@ -3707,15 +4435,55 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
         if (pt.pointerLevel > 0) pt.pointerLevel--;
         return pt;
     }
+    if (dynamic_cast<const SizeofNode*>(node))
+    {
+        // sizeof always produces an integer
+        return {Type::INT,0};
+    }
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
     {
+        // compute operand types recursively first
         Type lt = computeExprType(bin->left.get(), scopes, currentFunction);
         Type rt = computeExprType(bin->right.get(), scopes, currentFunction);
+        // record them for later code generation
+        if (auto mutableBin = dynamic_cast<BinaryOpNode*>(const_cast<ASTNode*>(node))) {
+            mutableBin->leftType = lt;
+            mutableBin->rightType = rt;
+        }
+
         auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT||t.base==Type::CHAR); };
-        if (isIntLike(lt) && isIntLike(rt)) return {Type::INT,0};
-        if (lt.pointerLevel>0 && isIntLike(rt) && (bin->op=="+"||bin->op=="-")) return lt;
-        if (rt.pointerLevel>0 && isIntLike(lt) && bin->op=="+") return rt;
-        return lt;
+        auto isFloatLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::FLOAT||t.base==Type::DOUBLE); };
+        auto isNumeric = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
+        Type result;
+        if (isNumeric(lt) && isNumeric(rt)) {
+            // arithmetic promotion: double > float > int
+            if (lt.base == Type::DOUBLE || rt.base == Type::DOUBLE)
+                result = {Type::DOUBLE,0};
+            else if (lt.base == Type::FLOAT || rt.base == Type::FLOAT)
+                result = {Type::FLOAT,0};
+            else
+                result = {Type::INT,0};
+        }
+        else if (lt.pointerLevel>0 && rt.pointerLevel>0 && bin->op=="-") {
+            // pointer - pointer => integer (difference in elements)
+            result = {Type::INT,0};
+        }
+        else if (lt.pointerLevel>0 && isIntLike(rt) && (bin->op=="+"||bin->op=="-")) {
+            // pointer +/- integer -> pointer
+            result = lt;
+        }
+        else if (rt.pointerLevel>0 && isIntLike(lt) && bin->op=="+") {
+            // integer + pointer -> pointer
+            result = rt;
+        }
+        else {
+            // fall back to left type (should not happen after semantic check)
+            result = lt;
+        }
+        if (auto mutableBin = dynamic_cast<BinaryOpNode*>(const_cast<ASTNode*>(node))) {
+            mutableBin->resultType = result;
+        }
+        return result;
     }
     if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
     {
@@ -3749,12 +4517,21 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         return;
     }
 
+    // Sizeof operator
+    if (auto s = dynamic_cast<const SizeofNode*>(node))
+    {
+        if (!s->isType && s->expr)
+            semanticCheckExpression(s->expr.get(), scopes, currentFunction);
+        return;
+    }
+
     // Binary op
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
     {
         semanticCheckExpression(bin->left.get(), scopes, currentFunction);
         semanticCheckExpression(bin->right.get(), scopes, currentFunction);
-        // type check
+        // compute types of the operands (and populate the node fields via computeExprType)
+        computeExprType(bin, scopes, currentFunction);
         Type lt = computeExprType(bin->left.get(), scopes, currentFunction);
         Type rt = computeExprType(bin->right.get(), scopes, currentFunction);
         bool ok = true;
@@ -3762,17 +4539,24 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         if (bin->op == "<" || bin->op == ">" || bin->op == "<=" || bin->op == ">=" ||
             bin->op == "==" || bin->op == "!=" )
         {
-            if (lt.pointerLevel != rt.pointerLevel || lt.base != rt.base)
-                ok = false;
+            // pointer comparisons require identical pointer types
+            if (lt.pointerLevel > 0 || rt.pointerLevel > 0) {
+                if (lt.pointerLevel != rt.pointerLevel || lt.base != rt.base)
+                    ok = false;
+            }
+            // numeric combinations are fine regardless of base
         }
         else if (bin->op == "+" || bin->op == "-" || bin->op == "*" || bin->op == "/" ||
                  bin->op == "&" || bin->op == "|" || bin->op == "^" || bin->op == "<<" || bin->op == ">>")
         {
-            // arithmetic: at least one must be integer-like; pointer arithmetic only + or -
+            // arithmetic: integer or float; pointer arithmetic only + or - with integer
             auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT || t.base==Type::CHAR); };
-            if (!( (isIntLike(lt) && isIntLike(rt)) ||
+            auto isFloatLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::FLOAT || t.base==Type::DOUBLE); };
+            auto isNumeric = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
+            if (!( (isNumeric(lt) && isNumeric(rt)) ||
                    (lt.pointerLevel>0 && isIntLike(rt) && (bin->op=="+"||bin->op=="-")) ||
-                   (rt.pointerLevel>0 && isIntLike(lt) && bin->op=="+") ))
+                   (rt.pointerLevel>0 && isIntLike(lt) && bin->op=="+") ||
+                   (lt.pointerLevel>0 && rt.pointerLevel>0 && bin->op=="-") ))
             {
                 ok = false;
             }
@@ -3799,8 +4583,15 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
     // Function call
     if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
     {
-        for (const auto& arg : fc->arguments)
+        // record argument types so codegen can position float/double args correctly
+        FunctionCallNode* mut = const_cast<FunctionCallNode*>(fc);
+        mut->argTypes.clear();
+
+        for (const auto& arg : fc->arguments) {
             semanticCheckExpression(arg.get(), scopes, currentFunction);
+            Type t = computeExprType(arg.get(), scopes, currentFunction);
+            mut->argTypes.push_back(t);
+        }
         // check against known signature if available
         auto it = functionParamTypes.find(fc->functionName);
         if (it != functionParamTypes.end())
@@ -3853,13 +4644,18 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
 {
     if (!node) return;
 
-    if (auto decl = dynamic_cast<const DeclarationNode*>(node))
+    if (auto declc = dynamic_cast<const DeclarationNode*>(node))
     {
+        // allow updating initType
+        DeclarationNode* decl = const_cast<DeclarationNode*>(declc);
         // Add to current scope
         std::string name = decl->identifier;
         size_t index = scopes.top().size() + 1;
         scopes.top()[name] = {generateUniqueName(name), index, decl->varType};
-        if (decl->initializer) semanticCheckExpression(decl->initializer.get(), scopes, currentFunction);
+        if (decl->initializer) {
+            semanticCheckExpression(decl->initializer.get(), scopes, currentFunction);
+            decl->initType = computeExprType(decl->initializer.get(), scopes, currentFunction);
+        }
         return;
     }
 
