@@ -334,7 +334,16 @@ void emitDeferredPostfixOps(std::ofstream& f)
             VarInfo info = lookupResult.second;
             std::string uniqueName = info.uniqueName;
             size_t index = info.index; // byte offset
-            std::string instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
+            size_t varSize = sizeOfType(info.type);
+            std::string instruction;
+            if (varSize == 1)
+                instruction = "\tmovsx rax, byte [rbp - " + std::to_string(index) + "]";
+            else if (varSize == 2)
+                instruction = "\tmovsx rax, word [rbp - " + std::to_string(index) + "]";
+            else if (varSize == 4)
+                instruction = "\tmovsxd rax, dword [rbp - " + std::to_string(index) + "]";
+            else
+                instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " for deferred postfix" << std::endl;
             if (deferredOp.op == "++")
             {
@@ -344,13 +353,32 @@ void emitDeferredPostfixOps(std::ofstream& f)
             {
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Deferred decrement" << std::endl;
             }
-            instruction = "\tmov [rbp - " + std::to_string(index) + "], rax";
+            if (varSize == 1)
+                instruction = "\tmov byte [rbp - " + std::to_string(index) + "], al";
+            else if (varSize == 2)
+                instruction = "\tmov word [rbp - " + std::to_string(index) + "], ax";
+            else if (varSize == 4)
+                instruction = "\tmov dword [rbp - " + std::to_string(index) + "], eax";
+            else
+                instruction = "\tmov qword [rbp - " + std::to_string(index) + "], rax";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store deferred result in " << uniqueName << std::endl;
         }
         else
         {
             // Global variable
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
+            Type globalType = {Type::INT, 0};
+            auto it = globalVariables.find(deferredOp.varName);
+            if (it != globalVariables.end())
+                globalType = it->second;
+            size_t varSize = sizeOfType(globalType);
+            if (varSize == 1)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
+            else if (varSize == 2)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
+            else if (varSize == 4)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
             if (deferredOp.op == "++")
             {
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Deferred increment" << std::endl;
@@ -359,7 +387,14 @@ void emitDeferredPostfixOps(std::ofstream& f)
             {
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Deferred decrement" << std::endl;
             }
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [" << deferredOp.varName << "], rax" << ";; Store deferred result in " << deferredOp.varName << std::endl;
+            if (varSize == 1)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov byte [" << deferredOp.varName << "], al" << ";; Store deferred result in " << deferredOp.varName << std::endl;
+            else if (varSize == 2)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov word [" << deferredOp.varName << "], ax" << ";; Store deferred result in " << deferredOp.varName << std::endl;
+            else if (varSize == 4)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov dword [" << deferredOp.varName << "], eax" << ";; Store deferred result in " << deferredOp.varName << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [" << deferredOp.varName << "], rax" << ";; Store deferred result in " << deferredOp.varName << std::endl;
         }
     }
     deferredPostfixOps.clear();
@@ -2385,16 +2420,26 @@ struct AssignmentNode : ASTNode
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, " + identifier << " ;; add base address" << std::endl;
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore value" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rax], rcx" << ";; Store global element" << std::endl;
+                    std::string instr;
+                    if (elemSize == 1) instr = "\tmov byte [rax], cl";
+                    else if (elemSize == 2) instr = "\tmov word [rax], cx";
+                    else if (elemSize == 4) instr = "\tmov dword [rax], ecx";
+                    else instr = "\tmov qword [rax], rcx";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store global element" << std::endl;
                 }
                 else
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
                     std::string inst2 = "\tsub rcx, " + std::to_string(baseOffset);
                     f << std::left << std::setw(COMMENT_COLUMN) << inst2 << ";; Adjust to array base" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tsub rcx, rax" << ";; Subtract scaled index" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore value" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rcx], rcx" << ";; Store value" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, rax" << ";; Add scaled index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rdx" << ";; Restore value" << std::endl;
+                    std::string instr;
+                    if (elemSize == 1) instr = "\tmov byte [rcx], dl";
+                    else if (elemSize == 2) instr = "\tmov word [rcx], dx";
+                    else if (elemSize == 4) instr = "\tmov dword [rcx], edx";
+                    else instr = "\tmov qword [rcx], rdx";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store value" << std::endl;
                 }
             }
         }
@@ -2592,6 +2637,19 @@ struct AssignmentNode : ASTNode
 
         f << std::endl << endLabel << ":" << std::endl;
     }
+
+    size_t getArraySpaceNeeded() const override
+    {
+        size_t total = 0;
+        for (const auto& stmt : body)
+            total += stmt->getArraySpaceNeeded();
+        for (const auto& condBodyPair : elseIfBlocks)
+            for (const auto& stmt : condBodyPair.second)
+                total += stmt->getArraySpaceNeeded();
+        for (const auto& stmt : elseBody)
+            total += stmt->getArraySpaceNeeded();
+        return total;
+    }
  };
 
 
@@ -2634,6 +2692,14 @@ struct WhileLoopNode : ASTNode
         instruction = "\tjmp " + functionName + ".loop_start_" + std::to_string(loopStartLabel);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump back to start of loop" << std::endl;
         f << std::endl << functionName << ".loop_end_" << loopEndLabel << ":" << std::endl;
+    }
+
+    size_t getArraySpaceNeeded() const override
+    {
+        size_t total = 0;
+        for (const auto& stmt : body)
+            total += stmt->getArraySpaceNeeded();
+        return total;
     }
 };
 
@@ -2705,6 +2771,18 @@ struct ForLoopNode : ASTNode
 
         // Pop the loop scope
         scopes.pop();
+    }
+
+    size_t getArraySpaceNeeded() const override
+    {
+        size_t total = 0;
+        if (initialization)
+            total += initialization->getArraySpaceNeeded();
+        if (iteration)
+            total += iteration->getArraySpaceNeeded();
+        for (const auto& stmt : body)
+            total += stmt->getArraySpaceNeeded();
+        return total;
     }
 };
 
@@ -3028,7 +3106,16 @@ struct UnaryOpNode : ASTNode
                 VarInfo infoD = lookupResult.second;
                 std::string uniqueName = infoD.uniqueName;
                 size_t offset = infoD.index;
-                std::string instruction = "\tmov rax, [rbp - " + std::to_string(offset) + "]";
+                size_t varSize = sizeOfType(infoD.type);
+                std::string instruction;
+                if (varSize == 1)
+                    instruction = "\tmovsx rax, byte [rbp - " + std::to_string(offset) + "]";
+                else if (varSize == 2)
+                    instruction = "\tmovsx rax, word [rbp - " + std::to_string(offset) + "]";
+                else if (varSize == 4)
+                    instruction = "\tmovsxd rax, dword [rbp - " + std::to_string(offset) + "]";
+                else
+                    instruction = "\tmov rax, [rbp - " + std::to_string(offset) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax" << std::endl;
                 if (op == "++")
                 {
@@ -3038,13 +3125,32 @@ struct UnaryOpNode : ASTNode
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Decrement" << std::endl;
                 }
-                instruction = "\tmov [rbp - " + std::to_string(offset) + "], rax";
+                if (varSize == 1)
+                    instruction = "\tmov byte [rbp - " + std::to_string(offset) + "], al";
+                else if (varSize == 2)
+                    instruction = "\tmov word [rbp - " + std::to_string(offset) + "], ax";
+                else if (varSize == 4)
+                    instruction = "\tmov dword [rbp - " + std::to_string(offset) + "], eax";
+                else
+                    instruction = "\tmov qword [rbp - " + std::to_string(offset) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result back in " << uniqueName << std::endl;
             }
             else
             {
                 // Global variable
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
+                Type globalType = {Type::INT, 0};
+                auto it = globalVariables.find(name);
+                if (it != globalVariables.end())
+                    globalType = it->second;
+                size_t varSize = sizeOfType(globalType);
+                if (varSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
+                else if (varSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
+                else if (varSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
                 if (op == "++")
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Increment" << std::endl;
@@ -3053,7 +3159,14 @@ struct UnaryOpNode : ASTNode
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Decrement" << std::endl;
                 }
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [" << name << "], rax" << ";; Store result back in " << name << std::endl;
+                if (varSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov byte [" << name << "], al" << ";; Store result back in " << name << std::endl;
+                else if (varSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov word [" << name << "], ax" << ";; Store result back in " << name << std::endl;
+                else if (varSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov dword [" << name << "], eax" << ";; Store result back in " << name << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [" << name << "], rax" << ";; Store result back in " << name << std::endl;
             }
         }
         else
@@ -3066,7 +3179,16 @@ struct UnaryOpNode : ASTNode
                 std::string uniqueName = info.uniqueName;
                 size_t offset = info.index;
                 // Load the current value and save it
-                std::string instruction = "\tmov rax, [rbp - " + std::to_string(offset) + "]";
+                size_t varSize = sizeOfType(info.type);
+                std::string instruction;
+                if (varSize == 1)
+                    instruction = "\tmovsx rax, byte [rbp - " + std::to_string(offset) + "]";
+                else if (varSize == 2)
+                    instruction = "\tmovsx rax, word [rbp - " + std::to_string(offset) + "]";
+                else if (varSize == 4)
+                    instruction = "\tmovsxd rax, dword [rbp - " + std::to_string(offset) + "]";
+                else
+                    instruction = "\tmov rax, [rbp - " + std::to_string(offset) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax (postfix value)" << std::endl;
                 // Don't apply the operation yet - defer it for later
                 deferredPostfixOps.push_back({op, name});
@@ -3074,7 +3196,19 @@ struct UnaryOpNode : ASTNode
             else
             {
                 // Global variable
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
+                Type globalType = {Type::INT, 0};
+                auto it = globalVariables.find(name);
+                if (it != globalVariables.end())
+                    globalType = it->second;
+                size_t varSize = sizeOfType(globalType);
+                if (varSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
+                else if (varSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
+                else if (varSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
                 deferredPostfixOps.push_back({op, name});
             }
         }
