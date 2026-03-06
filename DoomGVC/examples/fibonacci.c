@@ -1,6 +1,6 @@
-extern printf;
-extern putchar;
-extern scanf;
+extern int printf(char* s, ...);
+extern void putchar(int c);
+extern int scanf(char* s, ...);
 
 void printFib(int n)
 {

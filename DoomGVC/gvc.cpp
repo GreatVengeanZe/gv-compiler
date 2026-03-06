@@ -1,7 +1,10 @@
 #include <unordered_map>
+#include <functional>
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
+#include <cstring>
+#include <cstdint>
 #include <sstream>
 #include <cstdlib>
 #include <fstream>
@@ -14,9 +17,6 @@
 #include <regex>
 #include <set>
 #include <map>
-#include <functional>
-#include <cstdint>
-#include <cstring>
 
 // Define fixed column position for comments
 #define COMMENT_COLUMN 32
@@ -100,6 +100,8 @@ struct VarInfo {
     size_t index;
     Type type;
     std::vector<size_t> dimensions; // for arrays: size of each dimension, empty for scalars/pointers
+    size_t knownObjectSize = 0;     // compile-time object size when explicitly tracked
+    bool isArrayObject = false;     // true only for actual array storage objects
 };
 
 // Global stack to track scopes
@@ -109,6 +111,8 @@ static std::stack<std::map<std::string, VarInfo>> scopes;
 static std::unordered_map<std::string, Type> globalVariables;
 // For globals that are arrays, remember their dimensions so indexing works
 static std::unordered_map<std::string, std::vector<size_t>> globalArrayDimensions;
+// For globals that were lowered from array forms but should retain array-size sizeof semantics
+static std::unordered_map<std::string, size_t> globalKnownObjectSizes;
 // Track which globals were declared with "extern" so we avoid emitting storage
 static std::set<std::string> externGlobals;
 
@@ -819,7 +823,7 @@ struct ASTNode
 
     // Methods for constant checking
     virtual bool isConstant() const { return false; }
-    virtual int getConstantValue() const { reportError(0, 0, "Not a constant node"); return 0; }
+    virtual int getConstantValue() const { throw std::logic_error("Not a constant node"); }
 
     // How many bytes of stack space this node requires for array declarations
     // (used when computing total frame size in function prologue)
@@ -828,6 +832,10 @@ struct ASTNode
     // helper used by sizeof: return identifier name if this node is an
     // IdentifierNode, or nullptr otherwise.  Avoids RTTI requirements.
     virtual const std::string* getIdentifierName() const { return nullptr; }
+
+    // optional compile-time size for object represented by this expression
+    // (used for string-literal-backed pointers in sizeof handling)
+    virtual size_t getKnownObjectSize() const { return 0; }
 };
 
 // initializer tree node used for array initialization
@@ -982,9 +990,11 @@ struct FunctionCallNode : ASTNode
     std::vector<std::unique_ptr<ASTNode>> arguments;
     // filled during semantic analysis
     std::vector<Type> argTypes;
+    int line = 0;
+    int col = 0;
 
-    FunctionCallNode(const std::string& name, std::vector<std::unique_ptr<ASTNode>> args)
-        : functionName(name), arguments(std::move(args)) {}
+    FunctionCallNode(const std::string& name, std::vector<std::unique_ptr<ASTNode>> args, int l = 0, int c = 0)
+        : functionName(name), arguments(std::move(args)), line(l), col(c) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1169,17 +1179,22 @@ struct FunctionCallNode : ASTNode
 struct FunctionNode : ASTNode
 {
     std::string name;
+    int line = 0;
+    int col = 0;
     Type returnType; // Store the return type (with possible pointer levels)
     std::vector<std::pair<Type, std::string>> parameters; // (type, name) pairs
+    std::vector<std::vector<size_t>> parameterDimensions; // per-parameter array dims (if declared with [])
     std::vector<std::unique_ptr<ASTNode>> body;
     bool isExternal;
+    bool isPrototype; // true for declaration-only forward declarations (no body)
     bool isVariadic;  // true if declared with ...
 
-    FunctionNode(const std::string& name, Type rtype, std::vector<std::pair<Type, std::string>> params, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern, bool variadic = false)
-        : name(name), returnType(rtype), parameters(std::move(params)), body(std::move(body)), isExternal(isExtern), isVariadic(variadic) {}
+    FunctionNode(const std::string& name, Type rtype, std::vector<std::pair<Type, std::string>> params, std::vector<std::vector<size_t>> paramDims, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern, bool variadic = false, bool prototype = false, int l = 0, int c = 0)
+        : name(name), line(l), col(c), returnType(rtype), parameters(std::move(params)), parameterDimensions(std::move(paramDims)), body(std::move(body)), isExternal(isExtern), isPrototype(prototype), isVariadic(variadic) {}
 
     void emitData(std::ofstream& f) const override
     {
+        if (isPrototype) return;
         for (const auto& stmt : body)
         {
             stmt->emitData(f);
@@ -1188,6 +1203,7 @@ struct FunctionNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
+        if (isPrototype) return;
         if (isExternal)
         {
             f << std::endl << "extrn '" << name << "' as _" << name << std::endl;
@@ -1211,14 +1227,19 @@ struct FunctionNode : ASTNode
         // After push rbp, rsp is 16-byte aligned
         // We need sub rsp amount to be a multiple of 16
         size_t totalParams = std::min(parameters.size(), (size_t)6);
+
+        // Locals are addressed as [rbp - offset].  Start below rbp and below
+        // any register-parameter spill slots to avoid overlap at [rbp - 0].
+        functionVariableIndex = (totalParams + 1) * 8;
         
 
         // Compute additional space required for all local arrays in this function
         size_t totalLocalSpace = 0;
         for (const auto& stmt : body)
             totalLocalSpace += stmt->getArraySpaceNeeded();
-        // also reserve space to store register parameters (first 6)
-        totalLocalSpace += totalParams * 8;
+        // reserve space for register-parameter spill slots plus one guard slot
+        // because locals begin at offset (totalParams + 1) * 8.
+        totalLocalSpace += (totalParams + 1) * 8;
         
         // Align to multiple of 16: round up to next 16-byte boundary
         size_t alignedSpace = ((totalLocalSpace + 15) / 16) * 16;
@@ -1284,6 +1305,8 @@ struct FunctionNode : ASTNode
 
             // Add the parameter to the current scope (record its type as well)
             scopes.top()[paramName] = {uniqueName, index, parameters[i].first};
+            if (i < parameterDimensions.size())
+                scopes.top()[paramName].dimensions = parameterDimensions[i];
         }
 
         // Emit the function body
@@ -1323,9 +1346,11 @@ struct ReturnNode : ASTNode
 {
     std::unique_ptr<ASTNode> expression; // Can be nullptr for void returns
     const FunctionNode* currentFunction; // Track the current function context
+    int line = 0;
+    int col = 0;
 
-    ReturnNode(std::unique_ptr<ASTNode> expr, const FunctionNode* currentFunction)
-        : expression(std::move(expr)), currentFunction(currentFunction) {}
+    ReturnNode(std::unique_ptr<ASTNode> expr, const FunctionNode* currentFunction, int returnLine = 0, int returnCol = 0)
+        : expression(std::move(expr)), currentFunction(currentFunction), line(returnLine), col(returnCol) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1367,6 +1392,7 @@ struct DeclarationNode : ASTNode
     std::unique_ptr<ASTNode> initializer;
     Type varType;        // includes base and pointer levels
     Type initType = {Type::INT,0}; // type of initializer expression, filled during semantic analysis
+    size_t knownObjectSize = 0;    // when set, sizeof(identifier) should use this value
 
     DeclarationNode(const std::string& id, Type t, std::unique_ptr<ASTNode> init = nullptr)
         : identifier(id), initializer(std::move(init)), varType(t) {}
@@ -1402,6 +1428,7 @@ struct DeclarationNode : ASTNode
         size_t offset = functionVariableIndex;
         functionVariableIndex += varSize; // advance by its size
         scopes.top()[identifier] = {uniqueName, offset, varType};
+        scopes.top()[identifier].knownObjectSize = knownObjectSize;
 
         if (initializer)
         {
@@ -1457,13 +1484,18 @@ struct GlobalDeclarationNode : ASTNode
     std::unique_ptr<ASTNode> initializer;
     Type varType;
     bool isExternal;
+    size_t knownObjectSize = 0; // when set, sizeof(identifier) should use this value
+        int line = 0;
+        int col = 0;
 
     GlobalDeclarationNode(const std::string& id,
                           Type t,
                           std::unique_ptr<ASTNode> init = nullptr,
-                          bool isExtern = false)
+                                                    bool isExtern = false,
+                                                    int declLine = 0,
+                                                    int declCol = 0)
         : identifier(id), initializer(std::move(init)), varType(t),
-          isExternal(isExtern) {}
+                    isExternal(isExtern), line(declLine), col(declCol) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1508,9 +1540,11 @@ struct AddressOfNode : ASTNode
 {
     std::string Identifier;
     const FunctionNode* currentFunction;
+    int line = 0;
+    int col = 0;
 
-    AddressOfNode(const std::string& id, const FunctionNode* func)
-        : Identifier(id), currentFunction(func) {}
+    AddressOfNode(const std::string& id, const FunctionNode* func, int addrLine = 0, int addrCol = 0)
+        : Identifier(id), currentFunction(func), line(addrLine), col(addrCol) {}
 
     void emitData(std::ofstream& f) const override {}
 
@@ -1525,7 +1559,7 @@ struct AddressOfNode : ASTNode
             if (!isGlobal)
             {
                 // not declared anywhere
-                reportError(0, 0, "Use of undefined variable '" + Identifier + "'");
+                reportError(line, col, "Use of undefined variable '" + Identifier + "'");
                 hadError = true;
             }
         }
@@ -1559,10 +1593,13 @@ struct ArrayDeclarationNode : ASTNode
     std::vector<size_t> dimensions; // Array dimensions ({5} for arr[5], {2,3} for arr[2][3])
     std::unique_ptr<InitNode> initializer; // optional nested initializer tree
     bool isGlobal = false;          // true if this declaration appears at file scope
+    int line = 0;
+    int col = 0;
 
     ArrayDeclarationNode(const std::string& id, Type t, std::vector<size_t> dims,
-                         std::unique_ptr<InitNode> init = nullptr, bool global = false)
-        : identifier(id), varType(t), dimensions(std::move(dims)), initializer(std::move(init)), isGlobal(global) {}
+                         std::unique_ptr<InitNode> init = nullptr, bool global = false,
+                         int declLine = 0, int declCol = 0)
+        : identifier(id), varType(t), dimensions(std::move(dims)), initializer(std::move(init)), isGlobal(global), line(declLine), col(declCol) {}
 
     size_t getArraySpaceNeeded() const override
     {
@@ -1588,7 +1625,9 @@ struct ArrayDeclarationNode : ASTNode
         size_t totalElements = 1;
         for (size_t dim : dimsCopy)
             totalElements *= (dim == 0 ? 1 : dim);
-        size_t elemSize = sizeOfType(varType);
+        Type elemType = varType;
+        if (elemType.pointerLevel > 0) elemType.pointerLevel--;
+        size_t elemSize = sizeOfType(elemType);
         return totalElements * elemSize;
     }
 
@@ -1615,6 +1654,14 @@ struct ArrayDeclarationNode : ASTNode
         }
         size_t totalElements = 1;
         for (size_t dim : dims) totalElements *= dim;
+        Type elemType = varType;
+        if (elemType.pointerLevel > 0) elemType.pointerLevel--;
+        size_t elemSize = sizeOfType(elemType);
+        std::string dataDirective = "dq";
+        std::string reserveDirective = "rq";
+        if (elemSize == 1) { dataDirective = "db"; reserveDirective = "rb"; }
+        else if (elemSize == 2) { dataDirective = "dw"; reserveDirective = "rw"; }
+        else if (elemSize == 4) { dataDirective = "dd"; reserveDirective = "rd"; }
         // Prepare flat list of initializer values
         std::vector<ASTNode*> flat;
         if (initializer)
@@ -1624,7 +1671,7 @@ struct ArrayDeclarationNode : ASTNode
         f << "\t" << identifier << ":" << std::endl;
         if (!flat.empty())
         {
-            f << "\t" << "dq ";
+            f << "\t" << dataDirective << " ";
             for (size_t i = 0; i < flat.size(); ++i)
             {
                 if (i) f << ", ";
@@ -1642,7 +1689,7 @@ struct ArrayDeclarationNode : ASTNode
         else
         {
             // no initializer: reserve space (indent to avoid being treated as instruction)
-            f << "\trq " << totalElements;
+            f << "\t" << reserveDirective << " " << totalElements;
         }
         f << "\n";
     }
@@ -1662,7 +1709,7 @@ struct ArrayDeclarationNode : ASTNode
         {
             if (!initializer)
             {
-                reportError(0, 0, "Cannot infer array size without initializer for " + identifier);
+                reportError(line, col, "Cannot infer array size without initializer for " + identifier);
                 hadError = true;
             }
             else
@@ -1679,19 +1726,24 @@ struct ArrayDeclarationNode : ASTNode
         // compute total number of elements from the dimensions copy
         size_t totalElements = 1;
         for (size_t dim : dims) totalElements *= dim;
-        size_t elemSize = sizeOfType(varType);
+        Type elemType = varType;
+        if (elemType.pointerLevel > 0) elemType.pointerLevel--;
+        size_t elemSize = sizeOfType(elemType);
         size_t totalSize = totalElements * elemSize; // bytes
 
-        // align the array's start to its element size (or 8 for pointers)
-        size_t elemAlign = (varType.pointerLevel > 0) ? 8 : elemSize;
+        // align the array's start to its element size
+        size_t elemAlign = elemSize;
         if (elemAlign == 0) elemAlign = 1;
         if (elemAlign > 8) elemAlign = 8;
         functionVariableIndex = ((functionVariableIndex + elemAlign - 1) / elemAlign) * elemAlign;
 
-        size_t baseOffset = functionVariableIndex;
+        // Keep baseOffset as the first element address (lowest address in the
+        // allocated block), so element i lives at [base + i*elemSize].
+        size_t baseOffset = functionVariableIndex + totalSize - elemSize;
         functionVariableIndex += totalSize; // allocate entire block
         VarInfo info{uniqueName, baseOffset, varType};
         info.dimensions = dims; // record dims
+        info.isArrayObject = true;
         scopes.top()[identifier] = info;
 
         // We reserved space for all local arrays in the function prologue, so
@@ -1711,7 +1763,7 @@ struct ArrayDeclarationNode : ASTNode
             size_t flatCount = initializer->countLeaves();
             if (flatCount > totalElements)
             {
-                reportError(0, 0, "Too many initializers for array " + identifier);
+                reportError(line, col, "Too many initializers for array " + identifier);
                 hadError = true;
             }
             std::vector<ASTNode*> flat;
@@ -1719,13 +1771,30 @@ struct ArrayDeclarationNode : ASTNode
             for (size_t i = 0; i < flat.size(); ++i)
             {
                 flat[i]->emitCode(f);
-                instruction = "\tmov [rbp - " + std::to_string(baseOffset + i * elemSize) + "], rax";
+                size_t slot = baseOffset - i * elemSize;
+                if (elemSize == 1)
+                    instruction = "\tmov byte [rbp - " + std::to_string(slot) + "], al";
+                else if (elemSize == 2)
+                    instruction = "\tmov word [rbp - " + std::to_string(slot) + "], ax";
+                else if (elemSize == 4)
+                    instruction = "\tmov dword [rbp - " + std::to_string(slot) + "], eax";
+                else
+                    instruction = "\tmov qword [rbp - " + std::to_string(slot) + "], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Initialize " << uniqueName << "[" << i << "]" << std::endl;
             }
             // zero remaining elements
             for (size_t i = flat.size(); i < totalElements; ++i)
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rbp - " + std::to_string(baseOffset + i * elemSize) + "], 0" << ";; Zero initialize " << uniqueName << "[" << i << "]" << std::endl;
+                size_t slot = baseOffset - i * elemSize;
+                if (elemSize == 1)
+                    instruction = "\tmov byte [rbp - " + std::to_string(slot) + "], 0";
+                else if (elemSize == 2)
+                    instruction = "\tmov word [rbp - " + std::to_string(slot) + "], 0";
+                else if (elemSize == 4)
+                    instruction = "\tmov dword [rbp - " + std::to_string(slot) + "], 0";
+                else
+                    instruction = "\tmov qword [rbp - " + std::to_string(slot) + "], 0";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Zero initialize " << uniqueName << "[" << i << "]" << std::endl;
             }
         }
 
@@ -1767,6 +1836,7 @@ struct ArrayAccessNode : ASTNode
         size_t baseIndex = 0;
         size_t baseOffset = 0;
         size_t elemSize = 1;
+        bool pointerBase = false;
         if (found)
         {
             VarInfo infoAA = lookupResult.second;
@@ -1774,6 +1844,14 @@ struct ArrayAccessNode : ASTNode
             baseIndex = infoAA.index;
             baseOffset = baseIndex; // already stored in bytes
             elemSize = pointeeSize(infoAA.type);
+            pointerBase = (!infoAA.isArrayObject && infoAA.type.pointerLevel > 0);
+        }
+        else if (isGlobal && globalVariables.count(identifier))
+        {
+            Type gt = globalVariables[identifier];
+            if (gt.pointerLevel > 0)
+                elemSize = pointeeSize(gt);
+            pointerBase = (!globalArrayDimensions.count(identifier) && gt.pointerLevel > 0);
         }
 
         // Check if all indices are constants
@@ -1813,20 +1891,88 @@ struct ArrayAccessNode : ASTNode
                     linear = linear * dimSize + constantIndices[k];
                 }
             }
-            size_t totalOffset = baseOffset + linear * elemSize;
-
-            if (isGlobal)
+            size_t offsetBytes = linear * elemSize;
+            if (pointerBase)
             {
-                // Global array: use symbol + offset
-                std::string instruction = "\tmov rax, [" + identifier;
-                if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
-                instruction += "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+                // Base expression is a pointer value stored in a variable.
+                if (isGlobal)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [" + identifier + "]" << ";; Load pointer base" << std::endl;
+                }
+                else
+                {
+                    if (baseIndex >= 1000)
+                    {
+                        size_t poff = baseIndex - 1000;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rbp + " + std::to_string(poff + 16) + "]" << ";; Load pointer parameter base" << std::endl;
+                    }
+                    else
+                    {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rbp - " + std::to_string(baseOffset) + "]" << ";; Load pointer local base" << std::endl;
+                    }
+                }
+                if (offsetBytes > 0)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, " + std::to_string(offsetBytes) << ";; Add scaled constant offset" << std::endl;
+                if (elemSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [rcx]" << ";; Load byte element";
+                else if (elemSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [rcx]" << ";; Load word element";
+                else if (elemSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [rcx]" << ";; Load dword element";
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rcx]" << ";; Load qword element";
+                f << " " << uniqueName << "[";
             }
             else
             {
-                std::string instruction = "\tmov rax, [rbp - " + std::to_string(totalOffset) + "]";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+                size_t totalOffset = baseOffset;
+                if (!isGlobal) totalOffset -= offsetBytes;
+                else totalOffset += offsetBytes;
+
+                if (isGlobal)
+                {
+                    if (elemSize == 1)
+                    {
+                        std::string instruction = "\tmovsx rax, byte [" + identifier;
+                        if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
+                        instruction += "]";
+                        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+                    }
+                    else if (elemSize == 2)
+                    {
+                        std::string instruction = "\tmovsx rax, word [" + identifier;
+                        if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
+                        instruction += "]";
+                        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+                    }
+                    else if (elemSize == 4)
+                    {
+                        std::string instruction = "\tmovsxd rax, dword [" + identifier;
+                        if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
+                        instruction += "]";
+                        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+                    }
+                    else
+                    {
+                        std::string instruction = "\tmov rax, [" + identifier;
+                        if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
+                        instruction += "]";
+                        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+                    }
+                }
+                else
+                {
+                    std::string instruction;
+                    if (elemSize == 1)
+                        instruction = "\tmovsx rax, byte [rbp - " + std::to_string(totalOffset) + "]";
+                    else if (elemSize == 2)
+                        instruction = "\tmovsx rax, word [rbp - " + std::to_string(totalOffset) + "]";
+                    else if (elemSize == 4)
+                        instruction = "\tmovsxd rax, dword [rbp - " + std::to_string(totalOffset) + "]";
+                    else
+                        instruction = "\tmov rax, [rbp - " + std::to_string(totalOffset) + "]";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
+                }
             }
             for (size_t i = 0; i < constantIndices.size(); ++i)
                 f << (i > 0 ? "," : "") << constantIndices[i];
@@ -1861,19 +2007,54 @@ struct ArrayAccessNode : ASTNode
                 f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, " + std::to_string(elemSize)
                   << " ;; scale offset by element size" << std::endl;
             }
-            if (isGlobal)
+            if (pointerBase)
+            {
+                if (isGlobal)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [" + identifier + "]" << ";; Load pointer base" << std::endl;
+                else if (baseIndex >= 1000)
+                {
+                    size_t poff = baseIndex - 1000;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rbp + " + std::to_string(poff + 16) + "]" << ";; Load pointer parameter base" << std::endl;
+                }
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rbp - " + std::to_string(baseOffset) + "]" << ";; Load pointer local base" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, rax" << ";; Add scaled index" << std::endl;
+                if (elemSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [rcx]" << ";; Load byte element" << std::endl;
+                else if (elemSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [rcx]" << ";; Load word element" << std::endl;
+                else if (elemSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [rcx]" << ";; Load dword element" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rcx]" << ";; Load qword element" << std::endl;
+            }
+            else if (isGlobal)
             {
                 // global base is label
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, " + identifier << " ;; add base address" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                if (elemSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                else if (elemSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                else if (elemSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
             }
             else
             {
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rbp" << ";; Copy rbp to rcx" << std::endl;
                 std::string instruction = "\tsub rcx, " + std::to_string(baseOffset);
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Adjust to array base" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tsub rcx, rax" << ";; Subtract scaled index" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rcx]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, rax" << ";; Add scaled index" << std::endl;
+                if (elemSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [rcx]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                else if (elemSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [rcx]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                else if (elemSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [rcx]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rcx]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
             }
         }
     }
@@ -1990,7 +2171,20 @@ struct AssignmentNode : ASTNode
             std::string uniqueName = infoB.uniqueName;
             size_t baseIndex = infoB.index;
             size_t baseOffset = baseIndex; // already a byte offset
-            size_t elemSize = pointeeSize(infoB.type);
+            size_t elemSize = 1;
+            bool pointerBase = false;
+            if (found)
+            {
+                elemSize = pointeeSize(infoB.type);
+                pointerBase = (!infoB.isArrayObject && infoB.type.pointerLevel > 0);
+            }
+            else if (isGlobal && globalVariables.count(identifier))
+            {
+                Type gt = globalVariables[identifier];
+                if (gt.pointerLevel > 0)
+                    elemSize = pointeeSize(gt);
+                pointerBase = (!globalArrayDimensions.count(identifier) && gt.pointerLevel > 0);
+            }
 
             f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save the value to assign" << std::endl;
 
@@ -2031,19 +2225,57 @@ struct AssignmentNode : ASTNode
                 }
                 size_t offsetBytes = linear * elemSize;
                 if (!isGlobal)
-                    offsetBytes += baseOffset;
+                    offsetBytes = baseOffset - offsetBytes;
 
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Restore the value" << std::endl;
-                if (isGlobal)
+                if (pointerBase)
                 {
-                    std::string instr = "\tmov [" + identifier;
+                    if (isGlobal)
+                    {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [" + identifier + "]" << ";; Load pointer base" << std::endl;
+                    }
+                    else
+                    {
+                        if (baseIndex >= 1000)
+                        {
+                            size_t poff = baseIndex - 1000;
+                            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rbp + " + std::to_string(poff + 16) + "]" << ";; Load pointer parameter base" << std::endl;
+                        }
+                        else
+                        {
+                            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rbp - " + std::to_string(baseOffset) + "]" << ";; Load pointer local base" << std::endl;
+                        }
+                    }
+                    if (linear * elemSize > 0)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, " + std::to_string(linear * elemSize) << ";; Add scaled constant offset" << std::endl;
+                    std::string instr;
+                    if (elemSize == 1) instr = "\tmov byte [rcx], al";
+                    else if (elemSize == 2) instr = "\tmov word [rcx], ax";
+                    else if (elemSize == 4) instr = "\tmov dword [rcx], eax";
+                    else instr = "\tmov qword [rcx], rax";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store pointed element" << std::endl;
+                }
+                else if (isGlobal)
+                {
+                    std::string instr;
+                    if (elemSize == 1) instr = "\tmov byte [" + identifier;
+                    else if (elemSize == 2) instr = "\tmov word [" + identifier;
+                    else if (elemSize == 4) instr = "\tmov dword [" + identifier;
+                    else instr = "\tmov qword [" + identifier;
                     if (offsetBytes > 0) instr += " + " + std::to_string(offsetBytes);
-                    instr += "], rax";
+                    if (elemSize == 1) instr += "], al";
+                    else if (elemSize == 2) instr += "], ax";
+                    else if (elemSize == 4) instr += "], eax";
+                    else instr += "], rax";
                     f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store global element" << std::endl;
                 }
                 else
                 {
-                    std::string instr = "\tmov [rbp - " + std::to_string(offsetBytes) + "], rax";
+                    std::string instr;
+                    if (elemSize == 1) instr = "\tmov byte [rbp - " + std::to_string(offsetBytes) + "], al";
+                    else if (elemSize == 2) instr = "\tmov word [rbp - " + std::to_string(offsetBytes) + "], ax";
+                    else if (elemSize == 4) instr = "\tmov dword [rbp - " + std::to_string(offsetBytes) + "], eax";
+                    else instr = "\tmov qword [rbp - " + std::to_string(offsetBytes) + "], rax";
                     f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store in " << uniqueName << "[";
                     for (size_t i = 0; i < constantIndices.size(); ++i)
                         f << (i > 0 ? "," : "") << constantIndices[i];
@@ -2598,18 +2830,22 @@ struct BinaryOpNode : ASTNode
 
         else if (op == "<<")
         {
-            f << "\t; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
-            f << "\t\t\t\txor rax, rcx\n\t\t\t\txor rcx, rax\n\t\t\t\txor rax, rcx" << std::endl;
-            f << "\t; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tshl rax, cl" << ";; Perform SHL on rax by cl" << std::endl;
+            // operands are currently: rcx = left, rax = right
+            // shift count must be in CL, value to shift in RAX.
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, rcx" << ";; Preserve left operand" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov cl, al" << ";; Load shift count (right operand low 8 bits)" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rdx" << ";; Move left operand into rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tshl rax, cl" << ";; Perform SHL on left by right" << std::endl;
         }
 
         else if (op == ">>")
         {
-            f << "\t; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
-            f << "\t\t\t\txor rax, rcx\n\t\t\t\txor rcx, rax\n\t\t\t\txor rax, rcx" << std::endl;
-            f << "\t; SWAPPING THE VALUES OF RAX AND RCX" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tshr rax, cl" << ";; Perform SHR on rax by cl" << std::endl;
+            // operands are currently: rcx = left, rax = right
+            // shift count must be in CL, value to shift in RAX.
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, rcx" << ";; Preserve left operand" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov cl, al" << ";; Load shift count (right operand low 8 bits)" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rdx" << ";; Move left operand into rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tshr rax, cl" << ";; Perform SHR on left by right" << std::endl;
         }
 
         else if (op == "*")
@@ -2619,8 +2855,12 @@ struct BinaryOpNode : ASTNode
 
         else if (op == "/")
     	{
+            // operands are currently: rcx = left, rax = right
+            // signed division expects dividend in rax and divisor as operand.
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rbx, rax" << ";; Save right operand (divisor)" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Move left operand (dividend) into rax" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "\tcqo" << ";; Sign-extend rax into rdx" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rcx" << ";; Divide rdx:rax by rcx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rbx" << ";; Divide rdx:rax by rbx" << std::endl;
         }
 
         else if (op == "==")
@@ -2830,6 +3070,11 @@ struct SizeofNode : ASTNode
         if (isType) {
             return sizeOfType(typeOperand);
         }
+        if (expr) {
+            size_t known = expr->getKnownObjectSize();
+            if (known > 0)
+                return known;
+        }
         // expression-based sizeof; if the operand is an identifier we can
         // potentially inspect its dimensions without RTTI.
         if (expr) {
@@ -2841,6 +3086,8 @@ struct SizeofNode : ASTNode
                     auto &m = tmp.top();
                     if (m.find(*nm) != m.end()) {
                         const VarInfo &info = m.at(*nm);
+                        if (info.knownObjectSize > 0)
+                            return info.knownObjectSize;
                         if (!info.dimensions.empty()) {
                             // varType is stored as a pointer-to-element, so drop one
                             // level to obtain the true element size.
@@ -2856,6 +3103,8 @@ struct SizeofNode : ASTNode
                     tmp.pop();
                 }
                 // check globals
+                if (globalKnownObjectSizes.count(*nm))
+                    return globalKnownObjectSizes[*nm];
                 if (globalArrayDimensions.count(*nm)) {
                     Type gt = globalVariables[*nm];
                     if (gt.pointerLevel > 0) gt.pointerLevel--;
@@ -2966,6 +3215,8 @@ struct StringLiteralNode : ASTNode
         std::string instruction = "\tlea rax, [" + label + "]";
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load address of string '" << updatedValue << "' into rax" << std::endl; 
     }
+
+    size_t getKnownObjectSize() const override { return value.size() + 1; }
 };
 
 
@@ -3016,7 +3267,7 @@ struct IdentifierNode : ASTNode
         {
             std::string uniqueName = infoResult.uniqueName;
             size_t index = infoResult.index;
-            bool isArray = !infoResult.dimensions.empty();
+            bool isArray = infoResult.isArrayObject;
 
             // Compute correct code depending on storage and array/pointer nature
             if (index >= 1000)
@@ -3241,6 +3492,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
         else if (token.type == TOKEN_AND)
         {
+            Token andToken = token;
             eat(TOKEN_AND);
             if (currentToken.type != TOKEN_IDENTIFIER)
             {
@@ -3249,7 +3501,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             }
             std::string Identifier = currentToken.value;
             eat(TOKEN_IDENTIFIER);
-            return std::make_unique<AddressOfNode>(Identifier, currentFunction);
+            return std::make_unique<AddressOfNode>(Identifier, currentFunction, andToken.line, andToken.col);
         }
 
         else if (token.type == TOKEN_CHAR_LITERAL)
@@ -3302,7 +3554,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             // Check if this is a function call
             if (currentToken.type == TOKEN_LPAREN)
             {
-                return functionCall(identifier);
+                return functionCall(identifier, token.line, token.col);
             }
 
             // Otherwise it's a variable or parameter
@@ -3509,6 +3761,38 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
             if (!dimensions.empty())
             {
+                // Simplification: treat char arrays initialized from string literals
+                // as pointer declarations (char*), e.g.:
+                //   char s[] = "abc";  ==>  char* s = "abc";
+                if (typeTok == TOKEN_CHAR && pointerLevel == 0 &&
+                    currentToken.type == TOKEN_ASSIGN)
+                {
+                    eat(TOKEN_ASSIGN);
+                    if (currentToken.type == TOKEN_STRING_LITERAL)
+                    {
+                        Type ptrType = baseType;
+                        ptrType.pointerLevel = 1;
+                        auto initExpr = expression(currentFunction);
+                        size_t knownSize = initExpr ? initExpr->getKnownObjectSize() : 0;
+                        eat(TOKEN_SEMICOLON);
+                        auto decl = std::make_unique<DeclarationNode>(identifier, ptrType, std::move(initExpr));
+                        decl->knownObjectSize = knownSize;
+                        return decl;
+                    }
+                    // not a string literal: fall through to normal array initializer
+                    // parsing below (the '=' token is already consumed)
+                    Type arrayType = baseType;
+                    arrayType.pointerLevel += 1;
+                    std::unique_ptr<InitNode> initializer = nullptr;
+                    if (currentToken.type == TOKEN_STRING_LITERAL && typeTok == TOKEN_CHAR && pointerLevel == 0)
+                        initializer = std::make_unique<InitNode>(parseStringInitializerList());
+                    else
+                        initializer = std::make_unique<InitNode>(parseInitializerList());
+                    eat(TOKEN_SEMICOLON);
+                    auto node = std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer), false, idToken.line, idToken.col);
+                    return node;
+                }
+
                 // Array declaration - treat as pointer to element
                 Type arrayType = baseType;
                 arrayType.pointerLevel += 1;
@@ -3516,11 +3800,13 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 if (currentToken.type == TOKEN_ASSIGN)
                 {
                     eat(TOKEN_ASSIGN);
-                    // parse nested initializer tree
-                    initializer = std::make_unique<InitNode>(parseInitializerList());
+                    if (currentToken.type == TOKEN_STRING_LITERAL && typeTok == TOKEN_CHAR && pointerLevel == 0)
+                        initializer = std::make_unique<InitNode>(parseStringInitializerList());
+                    else
+                        initializer = std::make_unique<InitNode>(parseInitializerList());
                 }
                 eat(TOKEN_SEMICOLON);
-                auto node = std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer));
+                auto node = std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer), false, idToken.line, idToken.col);
                 return node;
             }
             else
@@ -3602,7 +3888,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             else if (currentToken.type == TOKEN_LPAREN)
             {
                 // Parse the function call
-                auto stmt = functionCall(identifier);
+                auto stmt = functionCall(identifier, idToken.line, idToken.col);
                 eat(TOKEN_SEMICOLON);
                 return stmt;
             }
@@ -3803,6 +4089,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
         else if (token.type == TOKEN_RETURN)
 	    {
+            Token returnToken = token;
             eat(TOKEN_RETURN);
             std::unique_ptr<ASTNode> expr = nullptr;
             if (currentToken.type != TOKEN_SEMICOLON)
@@ -3810,7 +4097,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 expr = expression(currentFunction); // Parse the expression if present
             }
             eat(TOKEN_SEMICOLON);
-            return std::make_unique<ReturnNode>(std::move(expr), currentFunction);
+            return std::make_unique<ReturnNode>(std::move(expr), currentFunction, returnToken.line, returnToken.col);
         }
 
         reportError(token.line, token.col, "Unexpected token in statement " + token.value);
@@ -3843,6 +4130,30 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         return InitNode(std::move(elements));
     }
 
+    // Parse a string literal initializer for a char array.
+    // Adjacent string literals are concatenated and a terminating '\0' is added.
+    InitNode parseStringInitializerList() {
+        std::string combined;
+        if (currentToken.type != TOKEN_STRING_LITERAL) {
+            reportError(currentToken.line, currentToken.col, "Expected string literal in array initializer");
+            hadError = true;
+            return InitNode(std::vector<InitNode>{});
+        }
+
+        combined += currentToken.value;
+        eat(TOKEN_STRING_LITERAL);
+        while (currentToken.type == TOKEN_STRING_LITERAL) {
+            combined += currentToken.value;
+            eat(TOKEN_STRING_LITERAL);
+        }
+
+        std::vector<InitNode> elements;
+        for (char ch : combined)
+            elements.emplace_back(std::make_unique<CharLiteralNode>(ch));
+        elements.emplace_back(std::make_unique<CharLiteralNode>('\0'));
+        return InitNode(std::move(elements));
+    }
+
 
     /***********************************************************************************
     *      ______  _    _  _   _   _____  _______  _____  ____   _   _    __  __       *
@@ -3867,10 +4178,11 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             if (currentToken.type == TOKEN_IDENTIFIER)
             {
                 // Parse the function name
+                Token nameToken = currentToken;
                 std::string name = currentToken.value;
                 eat(TOKEN_IDENTIFIER);
                 eat(TOKEN_SEMICOLON);
-                auto functionNode = std::make_unique<FunctionNode>(name, makeType(TOKEN_VOID), std::vector<std::pair<Type, std::string>>(), std::vector<std::unique_ptr<ASTNode>>(), isExternal);
+                auto functionNode = std::make_unique<FunctionNode>(name, makeType(TOKEN_VOID), std::vector<std::pair<Type, std::string>>(), std::vector<std::vector<size_t>>(), std::vector<std::unique_ptr<ASTNode>>(), isExternal, false, false, nameToken.line, nameToken.col);
                 return functionNode;
             }
         }
@@ -3894,6 +4206,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         }
         
         // Parse the function/variable name
+        Token nameToken = currentToken;
         std::string name = currentToken.value;
         eat(TOKEN_IDENTIFIER);
 
@@ -3938,24 +4251,43 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
             std::unique_ptr<ASTNode> init = nullptr;
             std::unique_ptr<InitNode> arrayInit = nullptr;
+            bool charArrayToPointer = false;
             if (currentToken.type == TOKEN_ASSIGN)
             {
                 eat(TOKEN_ASSIGN);
+                // Same simplification for globals:
+                //   char s[] = "abc";  ==> global char* s = "abc";
+                if (!dimensions.empty() && returnType == TOKEN_CHAR && ptrLevel == 0 &&
+                    currentToken.type == TOKEN_STRING_LITERAL)
+                {
+                    charArrayToPointer = true;
+                    init = expression();
+                }
+                else
                 if (!dimensions.empty())
-                    arrayInit = std::make_unique<InitNode>(parseInitializerList());
+                {
+                    if (currentToken.type == TOKEN_STRING_LITERAL && returnType == TOKEN_CHAR && ptrLevel == 0)
+                        arrayInit = std::make_unique<InitNode>(parseStringInitializerList());
+                    else
+                        arrayInit = std::make_unique<InitNode>(parseInitializerList());
+                }
                 else
                     init = expression();
             }
             eat(TOKEN_SEMICOLON);
-            if (dimensions.empty())
+            if (dimensions.empty() || charArrayToPointer)
             {
-                return std::make_unique<GlobalDeclarationNode>(name, makeType(returnType, ptrLevel, returnUns), std::move(init), isExternal);
+                int globalPtrLevel = ptrLevel + (charArrayToPointer ? 1 : 0);
+                auto gd = std::make_unique<GlobalDeclarationNode>(name, makeType(returnType, globalPtrLevel, returnUns), std::move(init), isExternal, nameToken.line, nameToken.col);
+                if (charArrayToPointer && gd->initializer)
+                    gd->knownObjectSize = gd->initializer->getKnownObjectSize();
+                return gd;
             }
             else
             {
                 // create a temporary ArrayDeclarationNode to hold dimension info, then wrap in GlobalDeclaration
                 auto arrType = makeType(returnType, ptrLevel+1, returnUns);
-                auto arrDecl = std::make_unique<ArrayDeclarationNode>(name, arrType, std::move(dimensions), std::move(arrayInit), true);
+                auto arrDecl = std::make_unique<ArrayDeclarationNode>(name, arrType, std::move(dimensions), std::move(arrayInit), true, nameToken.line, nameToken.col);
                 // general global handling will later pick up type and dims via semantic pass
                 return arrDecl;
             }
@@ -3964,6 +4296,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         // Parse the parameters list for a function
         eat(TOKEN_LPAREN);
         std::vector<std::pair<Type, std::string>> parameters; // Store (type, name) pairs
+        std::vector<std::vector<size_t>> parameterDimensions; // array dimensions per parameter
         bool isVariadic = false;
         while (currentToken.type != TOKEN_RPAREN)
         {
@@ -4002,8 +4335,38 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             std::string name = currentToken.value;
             eat(TOKEN_IDENTIFIER);
 
+            // Optional array declarators in parameters (e.g. int a[][3]).
+            // In C, array parameters decay to pointers, but dimensions are still
+            // useful for multi-index access calculations inside the function.
+            std::vector<size_t> paramDims;
+            while (currentToken.type == TOKEN_LBRACKET)
+            {
+                eat(TOKEN_LBRACKET);
+                if (currentToken.type == TOKEN_NUMBER)
+                {
+                    paramDims.push_back(std::stoul(currentToken.value));
+                    eat(TOKEN_NUMBER);
+                }
+                else if (currentToken.type == TOKEN_RBRACKET)
+                {
+                    paramDims.push_back(0);
+                }
+                else
+                {
+                    reportError(currentToken.line, currentToken.col,
+                                "Expected array size or ']' in parameter declaration");
+                    hadError = true;
+                }
+                eat(TOKEN_RBRACKET);
+            }
+
+            Type ptype = makeType(paramType, ptrLevel,paramUns);
+            if (!paramDims.empty())
+                ptype.pointerLevel += 1;
+
             // Add the parameter to the list
-            parameters.push_back({ makeType(paramType, ptrLevel,paramUns), name });
+            parameters.push_back({ ptype, name });
+            parameterDimensions.push_back(paramDims);
             if (currentToken.type == TOKEN_COMMA)
             {
                 // consume comma and continue parsing next parameter or ellipsis
@@ -4025,13 +4388,13 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         if (currentToken.type == TOKEN_SEMICOLON)
         {
             // create node with empty body and return
-            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,0,returnUns), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic);
+            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,0,returnUns), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, true, nameToken.line, nameToken.col);
             eat(TOKEN_SEMICOLON);
             return functionNode;
         }
 
         // Create the FunctionNode; body will be filled in below
-        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,0,returnUns), parameters, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic);
+        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,0,returnUns), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, false, nameToken.line, nameToken.col);
 
         if (isExternal)
         {
@@ -4064,7 +4427,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
     ***********************************************************************************************************************/
 
 
-    std::unique_ptr<ASTNode> functionCall(const std::string& functionName)
+    std::unique_ptr<ASTNode> functionCall(const std::string& functionName, int callLine = 0, int callCol = 0)
     {
         eat(TOKEN_LPAREN);
         std::vector<std::unique_ptr<ASTNode>> arguments;
@@ -4077,7 +4440,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             }
         }
         eat(TOKEN_RPAREN);
-        return std::make_unique<FunctionCallNode>(functionName, std::move(arguments));
+        return std::make_unique<FunctionCallNode>(functionName, std::move(arguments), callLine, callCol);
     }
 
     std::unique_ptr<ASTNode> equality(const FunctionNode* currentFunction = nullptr)
@@ -4170,11 +4533,11 @@ class Preprocessor
 {
 private:
 
-    std::string readFile(const std::string& fileName)
+    std::string readFile(const std::string& fileName, int includeLine = 0, int includeCol = 1)
     {
         std::ifstream file(fileName);
         if (!file.is_open()) {
-            reportError(0, 0, "Can't open file: " + fileName);
+            reportError(includeLine, includeCol, "Can't open file: " + fileName);
             hadError = true;
         }
 
@@ -4222,26 +4585,33 @@ public:
         std::istringstream stream(code);
         std::ostringstream processedCode;
         std::string line;
+        int lineNo = 0;
 
         while (std::getline(stream, line))
         {
-            if (line.find("#define") == 0)
+            lineNo++;
+            size_t firstNonWs = line.find_first_not_of(" \t");
+            bool isDefine = (firstNonWs != std::string::npos) && (line.compare(firstNonWs, 7, "#define") == 0);
+            bool isInclude = (firstNonWs != std::string::npos) && (line.compare(firstNonWs, 8, "#include") == 0);
+
+            if (isDefine)
                 parseDefine(line, defines);
 
-            else if (line.find("#include") == 0)
+            else if (isInclude)
             {
                 std::regex includeRegex("#include\\s+\"(.+?)\"");
                 std::smatch match;
+                int includeCol = static_cast<int>(firstNonWs) + 1;
 
                 if (std::regex_search(line, match, includeRegex))
                 {
                     std::string fileName = match[1].str();
-                    std::string includedContent = readFile(fileName);
+                    std::string includedContent = readFile(fileName, lineNo, includeCol);
                     processedCode << processCode(includedContent, defines) << '\n';
                 }
                 else
                 {
-                    reportError(0, 0, "Incorrect directory #include: " + line);
+                    reportError(lineNo, includeCol, "Incorrect directory #include: " + line);
                     hadError = true;
                 }
             }
@@ -4314,6 +4684,19 @@ static bool localLookupName(const std::stack<std::map<std::string, VarInfo>>& s,
 
 // Forward declaration
 static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, VarInfo>> &scopes, const FunctionNode* currentFunction);
+
+static std::pair<int,int> bestEffortNodeLocation(const ASTNode* node)
+{
+    if (!node) return {0,0};
+    if (auto id = dynamic_cast<const IdentifierNode*>(node)) return {id->line, id->col};
+    if (auto call = dynamic_cast<const FunctionCallNode*>(node)) return {call->line, call->col};
+    if (auto aa = dynamic_cast<const ArrayAccessNode*>(node)) return {aa->line, aa->col};
+    if (auto asg = dynamic_cast<const AssignmentNode*>(node)) return {asg->line, asg->col};
+    if (auto un = dynamic_cast<const UnaryOpNode*>(node)) return {un->line, un->col};
+    if (auto bin = dynamic_cast<const BinaryOpNode*>(node)) return bestEffortNodeLocation(bin->left.get());
+    if (auto ret = dynamic_cast<const ReturnNode*>(node)) return bestEffortNodeLocation(ret->expression.get());
+    return {0,0};
+}
 
 // simple compatibility predicate.  We accept the following cases:
 //   * exact type match
@@ -4451,7 +4834,7 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
             mutableBin->rightType = rt;
         }
 
-        auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT||t.base==Type::CHAR); };
+        auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT||t.base==Type::CHAR||t.base==Type::SHORT||t.base==Type::LONG); };
         auto isFloatLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::FLOAT||t.base==Type::DOUBLE); };
         auto isNumeric = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
         Type result;
@@ -4494,7 +4877,7 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     if (auto aa = dynamic_cast<const ArrayAccessNode*>(node))
     {
         Type baseType = {Type::INT,0};
-        auto lookupResult = lookupVariable(aa->identifier);
+        auto lookupResult = lookupInScopes(scopes, aa->identifier);
         if (lookupResult.first) baseType = lookupResult.second.type;
         else if (globalVariables.count(aa->identifier)) baseType = globalVariables[aa->identifier];
         if (baseType.pointerLevel>0) baseType.pointerLevel--;
@@ -4550,7 +4933,7 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
                  bin->op == "&" || bin->op == "|" || bin->op == "^" || bin->op == "<<" || bin->op == ">>")
         {
             // arithmetic: integer or float; pointer arithmetic only + or - with integer
-            auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT || t.base==Type::CHAR); };
+            auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT || t.base==Type::CHAR || t.base==Type::SHORT || t.base==Type::LONG); };
             auto isFloatLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::FLOAT || t.base==Type::DOUBLE); };
             auto isNumeric = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
             if (!( (isNumeric(lt) && isNumeric(rt)) ||
@@ -4563,7 +4946,8 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         }
         if (!ok)
         {
-            reportError(0, 0, "Incompatible operand types for operator '" + bin->op + "'");
+            auto loc = bestEffortNodeLocation(bin);
+            reportError(loc.first, loc.second, "Incompatible operand types for operator '" + bin->op + "'");
             hadError = true;
         }
         return;
@@ -4601,14 +4985,14 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             if (!variadic) {
                 if (params.size() != fc->arguments.size())
                 {
-                    reportError(0, 0, "Function '" + fc->functionName + "' called with wrong number of arguments");
+                    reportError(fc->line, fc->col, "Function '" + fc->functionName + "' called with wrong number of arguments");
                     hadError = true;
                 }
             } else {
                 // variadic: make sure we have at least the fixed parameters
                 if (fc->arguments.size() < params.size())
                 {
-                    reportError(0, 0, "Function '" + fc->functionName + "' called with too few arguments");
+                    reportError(fc->line, fc->col, "Function '" + fc->functionName + "' called with too few arguments");
                     hadError = true;
                 }
             }
@@ -4619,10 +5003,15 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
                 Type argType = computeExprType(fc->arguments[i].get(), scopes, currentFunction);
                 if (!typesCompatible(params[i], argType))
                 {
-                    reportError(0, 0, "Argument " + std::to_string(i) + " of '" + fc->functionName + "' has incompatible type");
+                    reportError(fc->line, fc->col, "Argument " + std::to_string(i) + " of '" + fc->functionName + "' has incompatible type");
                     hadError = true;
                 }
             }
+        }
+        else
+        {
+            reportError(fc->line, fc->col, "Call to undeclared function '" + fc->functionName + "'");
+            hadError = true;
         }
         return;
     }
@@ -4665,6 +5054,7 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
         size_t baseIndex = scopes.top().size() + 1;
         VarInfo vi{generateUniqueName(name), baseIndex, arrd->varType};
         vi.dimensions = arrd->dimensions;
+        vi.isArrayObject = true;
         // infer first dimension if omitted
         if (!vi.dimensions.empty() && vi.dimensions[0] == 0 && arrd->initializer)
         {
@@ -4688,7 +5078,7 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
             for (size_t d : vi.dimensions) totalEls *= d;
             if (flatCount > totalEls)
             {
-                reportError(0, 0, "Too many initializers for array " + name);
+                reportError(arrd->line, arrd->col, "Too many initializers for array " + name);
                 hadError = true;
             }
         }
@@ -4763,7 +5153,7 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
                 Type exprType = computeExprType(rn->expression.get(), scopes, currentFunction);
                 if (!typesCompatible(currentFunction->returnType, exprType))
                 {
-                    reportError(0, 0,
+                    reportError(rn->line, rn->col,
                                 "Return type mismatch: function '" + currentFunction->name + "' returns '" + currentFunction->returnType.toString() + "' but expression is '" + exprType.toString() + "'");
                     hadError = true;
                 }
@@ -4786,7 +5176,20 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
 // Perform semantic checks on the AST, including globals and functions
 static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
 {
-    // First pass: collect all globals, functions and validate initializers
+    // Reset semantic tables for a fresh translation unit pass.
+    globalVariables.clear();
+    globalArrayDimensions.clear();
+    globalKnownObjectSizes.clear();
+    externGlobals.clear();
+    functionReturnTypes.clear();
+    functionParamTypes.clear();
+    functionIsVariadic.clear();
+
+    // Track which functions have already been defined (as opposed to only declared).
+    std::unordered_map<std::string, bool> functionHasDefinition;
+
+    // Single ordered pass so function visibility matches C rules:
+    // a call can only see prior declarations/definitions and the current function itself.
     for (const auto& node : ast)
     {
         if (auto gd = dynamic_cast<const class GlobalDeclarationNode*>(node.get()))
@@ -4794,10 +5197,12 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
             const std::string& name = gd->identifier;
             if (globalVariables.find(name) != globalVariables.end())
             {
-                reportError(0, 0, "Redefinition of global variable '" + name + "'");
+                reportError(gd->line, gd->col, "Redefinition of global variable '" + name + "'");
                 hadError = true;
             }
             globalVariables[name] = gd->varType;
+            if (gd->knownObjectSize > 0)
+                globalKnownObjectSizes[name] = gd->knownObjectSize;
             if (gd->isExternal)
                 externGlobals.insert(name);
 
@@ -4810,7 +5215,7 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
                 }
                 if (!gd->initializer->isConstant())
                 {
-                    reportError(0, 0, "Global initializer for '" + name + "' must be a constant expression");
+                    reportError(gd->line, gd->col, "Global initializer for '" + name + "' must be a constant expression");
                     hadError = true;
                 }
             }
@@ -4820,7 +5225,7 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
             const std::string& name = ad->identifier;
             if (globalVariables.find(name) != globalVariables.end())
             {
-                reportError(0, 0, "Redefinition of global variable '" + name + "'");
+                reportError(ad->line, ad->col, "Redefinition of global variable '" + name + "'");
                 hadError = true;
             }
             globalVariables[name] = ad->varType;
@@ -4830,7 +5235,7 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
             {
                 if (!ad->initializer)
                 {
-                    reportError(0, 0, "Cannot infer size of global array '" + name + "' without initializer");
+                    reportError(ad->line, ad->col, "Cannot infer size of global array '" + name + "' without initializer");
                     hadError = true;
                 }
                 else
@@ -4856,7 +5261,7 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
                 {
                     if (!leaf->isConstant())
                     {
-                        reportError(0, 0, "Global array initializer for '" + name + "' must be constant");
+                        reportError(ad->line, ad->col, "Global array initializer for '" + name + "' must be constant");
                         hadError = true;
                         break;
                     }
@@ -4865,21 +5270,61 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
         }
         else if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
         {
-            // record function signature for later checks
-            functionReturnTypes[fn->name] = fn->returnType;
+            // Build signature of this declaration/definition
             std::vector<Type> paramTypes;
             for (const auto& p : fn->parameters)
                 paramTypes.push_back(p.first);
-            functionParamTypes[fn->name] = std::move(paramTypes);
-            functionIsVariadic[fn->name] = fn->isVariadic;
-        }
-    }
 
-    // Second pass: check functions (locals) with global names visible
-    for (const auto& node : ast)
-    {
-        if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
-        {
+            // If we've seen this function before, declaration/definition must match.
+            auto rit = functionReturnTypes.find(fn->name);
+            if (rit != functionReturnTypes.end())
+            {
+                bool mismatch = false;
+                if (!(rit->second == fn->returnType)) mismatch = true;
+                if (functionIsVariadic[fn->name] != fn->isVariadic) mismatch = true;
+
+                const auto& prevParams = functionParamTypes[fn->name];
+                if (prevParams.size() != paramTypes.size()) mismatch = true;
+                else
+                {
+                    for (size_t i = 0; i < prevParams.size(); ++i)
+                    {
+                        if (!(prevParams[i] == paramTypes[i]))
+                        {
+                            mismatch = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (mismatch)
+                {
+                    reportError(fn->line, fn->col, "Conflicting declarations for function '" + fn->name + "'");
+                    hadError = true;
+                }
+            }
+            else
+            {
+                functionReturnTypes[fn->name] = fn->returnType;
+                functionParamTypes[fn->name] = paramTypes;
+                functionIsVariadic[fn->name] = fn->isVariadic;
+            }
+
+            // Definition tracking/redefinition checks
+            bool isDefinition = !fn->isPrototype;
+            if (isDefinition)
+            {
+                if (functionHasDefinition[fn->name])
+                {
+                    reportError(fn->line, fn->col, "Redefinition of function '" + fn->name + "'");
+                    hadError = true;
+                }
+                functionHasDefinition[fn->name] = true;
+            }
+
+            // Check body immediately (order-sensitive visibility)
+            if (!fn->isPrototype)
+            {
             std::stack<std::map<std::string, VarInfo>> localScopes;
             localScopes.push({});
             for (size_t i = 0; i < fn->parameters.size(); ++i)
@@ -4888,8 +5333,11 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
                 const Type& ptype = fn->parameters[i].first;
                 size_t index = localScopes.top().size() + 1;
                 localScopes.top()[pname] = {generateUniqueName(pname), index, ptype};
+                if (i < fn->parameterDimensions.size())
+                    localScopes.top()[pname].dimensions = fn->parameterDimensions[i];
             }
             for (const auto& stmt : fn->body) semanticCheckStatement(stmt.get(), localScopes, fn);
+            }
         }
     }
 }
