@@ -113,6 +113,8 @@ static std::unordered_map<std::string, Type> globalVariables;
 static std::unordered_map<std::string, std::vector<size_t>> globalArrayDimensions;
 // For globals that were lowered from array forms but should retain array-size sizeof semantics
 static std::unordered_map<std::string, size_t> globalKnownObjectSizes;
+// Enum constants visible in the current translation unit
+static std::unordered_map<std::string, int> globalEnumConstants;
 // Track which globals were declared with "extern" so we avoid emitting storage
 static std::set<std::string> externGlobals;
 
@@ -156,6 +158,7 @@ enum TokenType
     TOKEN_INT,
     TOKEN_CHAR,
     TOKEN_VOID,
+    TOKEN_ENUM,
     TOKEN_EXTERN,
     TOKEN_ELLIPSIS,
     TOKEN_IDENTIFIER,
@@ -214,6 +217,7 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_INT: return "int";
         case TOKEN_CHAR: return "char";
         case TOKEN_VOID: return "void";
+        case TOKEN_ENUM: return "enum";
         case TOKEN_EXTERN: return "extern";
         case TOKEN_ELLIPSIS: return "...";
         case TOKEN_IDENTIFIER: return "identifier";
@@ -591,6 +595,7 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             if (ident == "for")     return Token{ TOKEN_FOR   , ident, tokenLine, tokenCol };
             if (ident == "char")    return Token{ TOKEN_CHAR  , ident, tokenLine, tokenCol };
             if (ident == "void")    return Token{ TOKEN_VOID  , ident, tokenLine, tokenCol };
+            if (ident == "enum")    return Token{ TOKEN_ENUM  , ident, tokenLine, tokenCol };
             if (ident == "else")    return Token{ TOKEN_ELSE  , ident, tokenLine, tokenCol };
             if (ident == "while")   return Token{ TOKEN_WHILE , ident, tokenLine, tokenCol };
             if (ident == "return")  return Token{ TOKEN_RETURN, ident, tokenLine, tokenCol };
@@ -996,6 +1001,17 @@ struct LogicalNotNode : ASTNode
         f << std::left << std::setw(COMMENT_COLUMN) << "\tsete al" << ";; Set al to 1 if operand is zero" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend bool result" << std::endl;
     }
+
+    bool isConstant() const override
+    {
+        return operand && operand->isConstant();
+    }
+
+    int getConstantValue() const override
+    {
+        int v = operand->getConstantValue();
+        return (v == 0) ? 1 : 0;
+    }
 };
 
 
@@ -1398,6 +1414,29 @@ struct ReturnNode : ASTNode
         f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rbp " << ";; Restore base pointer" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << "\tret " << ";; Return to caller" << std::endl;
     }
+};
+
+struct EnumDeclarationNode : ASTNode
+{
+    struct Enumerator
+    {
+        std::string name;
+        std::unique_ptr<ASTNode> valueExpr; // optional explicit value
+
+        Enumerator(const std::string& n, std::unique_ptr<ASTNode> expr = nullptr)
+            : name(n), valueExpr(std::move(expr)) {}
+    };
+
+    std::string enumTag;
+    std::vector<Enumerator> enumerators;
+    int line = 0;
+    int col = 0;
+
+    EnumDeclarationNode(const std::string& tag, std::vector<Enumerator> items, int l = 0, int c = 0)
+        : enumTag(tag), enumerators(std::move(items)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override {}
+    void emitCode(std::ofstream& f) const override {}
 };
 
 
@@ -2931,6 +2970,34 @@ struct BinaryOpNode : ASTNode
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
     }
+
+    bool isConstant() const override
+    {
+        return left && right && left->isConstant() && right->isConstant();
+    }
+
+    int getConstantValue() const override
+    {
+        int lv = left->getConstantValue();
+        int rv = right->getConstantValue();
+
+        if (op == "+") return lv + rv;
+        if (op == "-") return lv - rv;
+        if (op == "*") return lv * rv;
+        if (op == "/") return rv != 0 ? (lv / rv) : 0;
+        if (op == "&") return lv & rv;
+        if (op == "|") return lv | rv;
+        if (op == "^") return lv ^ rv;
+        if (op == "<<") return lv << rv;
+        if (op == ">>") return lv >> rv;
+        if (op == "==") return lv == rv;
+        if (op == "!=") return lv != rv;
+        if (op == "<") return lv < rv;
+        if (op == ">") return lv > rv;
+        if (op == "<=") return lv <= rv;
+        if (op == ">=") return lv >= rv;
+        throw std::logic_error("Binary operation is not a constant expression");
+    }
 };
 
 
@@ -3391,12 +3458,34 @@ struct IdentifierNode : ASTNode
         }
         else
         {
-            // Already reported error; emit dummy zero
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; undefined variable fallback" << std::endl;
+            auto enumIt = globalEnumConstants.find(name);
+            if (enumIt != globalEnumConstants.end())
+            {
+                std::string instruction = "\tmov rax, " + std::to_string(enumIt->second);
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load enum constant " << name << std::endl;
+            }
+            else
+            {
+                // Already reported error; emit dummy zero
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; undefined variable fallback" << std::endl;
+            }
         }
     }
 
     const std::string* getIdentifierName() const override { return &name; }
+
+    bool isConstant() const override
+    {
+        return globalEnumConstants.count(name) > 0;
+    }
+
+    int getConstantValue() const override
+    {
+        auto it = globalEnumConstants.find(name);
+        if (it != globalEnumConstants.end())
+            return it->second;
+        throw std::logic_error("Identifier is not a constant");
+    }
 };
 
 
@@ -3485,6 +3574,19 @@ class Parser
     std::unique_ptr<ASTNode> factor(const FunctionNode* currentFunction = nullptr)
     {
         Token token = currentToken;
+
+        if (token.type == TOKEN_SUB)
+        {
+            eat(TOKEN_SUB);
+            auto operand = factor(currentFunction);
+            return std::make_unique<BinaryOpNode>("-", std::make_unique<NumberNode>(0), std::move(operand));
+        }
+
+        if (token.type == TOKEN_ADD)
+        {
+            eat(TOKEN_ADD);
+            return factor(currentFunction);
+        }
 
         // Handle prefix ++ and --
         if (token.type == TOKEN_INCREMENT || token.type == TOKEN_DECREMENT)
@@ -3612,6 +3714,12 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             std::string identifier = token.value;
             eat(TOKEN_IDENTIFIER);
 
+            auto enumIt = globalEnumConstants.find(identifier);
+            if (enumIt != globalEnumConstants.end() && currentToken.type != TOKEN_LPAREN)
+            {
+                return std::make_unique<NumberNode>(enumIt->second);
+            }
+
             // Handle array indexing
             std::vector<std::unique_ptr<ASTNode>> indices;
             while(currentToken.type == TOKEN_LBRACKET)
@@ -3652,6 +3760,102 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         }
         reportError(token.line, token.col, "Unexpected token in factor " + token.value);
         // try to recover by advancing one token
+        currentToken = lexer.nextToken();
+        return std::make_unique<NumberNode>(0);
+    }
+
+    std::unique_ptr<ASTNode> parseEnumDeclarationOrVariable(const FunctionNode* currentFunction = nullptr)
+    {
+        Token enumToken = currentToken;
+        eat(TOKEN_ENUM);
+
+        std::string enumTag;
+        if (currentToken.type == TOKEN_IDENTIFIER)
+        {
+            enumTag = currentToken.value;
+            eat(TOKEN_IDENTIFIER);
+        }
+
+        if (currentToken.type == TOKEN_LBRACE)
+        {
+            eat(TOKEN_LBRACE);
+            std::vector<EnumDeclarationNode::Enumerator> items;
+            int nextValue = 0;
+
+            while (currentToken.type != TOKEN_RBRACE && currentToken.type != TOKEN_EOF)
+            {
+                if (currentToken.type != TOKEN_IDENTIFIER)
+                {
+                    reportError(currentToken.line, currentToken.col, "Expected enumerator name");
+                    hadError = true;
+                    break;
+                }
+
+                std::string name = currentToken.value;
+                eat(TOKEN_IDENTIFIER);
+
+                std::unique_ptr<ASTNode> valueExpr = nullptr;
+                if (currentToken.type == TOKEN_ASSIGN)
+                {
+                    eat(TOKEN_ASSIGN);
+                    valueExpr = condition(currentFunction);
+                }
+
+                int enumValue = nextValue;
+                if (valueExpr)
+                {
+                    if (!valueExpr->isConstant())
+                    {
+                        reportError(enumToken.line, enumToken.col, "Enumerator value for '" + name + "' must be a constant expression");
+                        hadError = true;
+                    }
+                    else
+                    {
+                        enumValue = valueExpr->getConstantValue();
+                    }
+                }
+                globalEnumConstants[name] = enumValue;
+                nextValue = enumValue + 1;
+
+                items.emplace_back(name, std::move(valueExpr));
+
+                if (currentToken.type == TOKEN_COMMA)
+                {
+                    eat(TOKEN_COMMA);
+                    if (currentToken.type == TOKEN_RBRACE)
+                        break;
+                    continue;
+                }
+                break;
+            }
+
+            eat(TOKEN_RBRACE);
+            eat(TOKEN_SEMICOLON);
+            return std::make_unique<EnumDeclarationNode>(enumTag, std::move(items), enumToken.line, enumToken.col);
+        }
+
+        if (currentToken.type == TOKEN_SEMICOLON)
+        {
+            eat(TOKEN_SEMICOLON);
+            return std::make_unique<EnumDeclarationNode>(enumTag, std::vector<EnumDeclarationNode::Enumerator>{}, enumToken.line, enumToken.col);
+        }
+
+        if (currentToken.type == TOKEN_IDENTIFIER)
+        {
+            std::string varName = currentToken.value;
+            eat(TOKEN_IDENTIFIER);
+            std::unique_ptr<ASTNode> init = nullptr;
+            if (currentToken.type == TOKEN_ASSIGN)
+            {
+                eat(TOKEN_ASSIGN);
+                init = condition(currentFunction);
+            }
+            eat(TOKEN_SEMICOLON);
+            return std::make_unique<DeclarationNode>(varName, makeType(TOKEN_INT), std::move(init));
+        }
+
+        reportError(currentToken.line, currentToken.col, "Expected '{', variable name, or ';' after enum");
+        hadError = true;
         currentToken = lexer.nextToken();
         return std::make_unique<NumberNode>(0);
     }
@@ -3767,6 +3971,11 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             return std::make_unique<BlockNode>(std::move(stmts));
         }
 
+        if (token.type == TOKEN_ENUM)
+        {
+            return parseEnumDeclarationOrVariable(currentFunction);
+        }
+
 // declaration begins with a type keyword
         if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID ||
             token.type == TOKEN_SHORT || token.type == TOKEN_LONG || token.type == TOKEN_FLOAT ||
@@ -3831,8 +4040,27 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 }
                 else
                 {
-                    reportError(currentToken.line, currentToken.col, "Expected array size or ']' after [");
-                    hadError = true;
+                    auto dimExpr = condition(currentFunction);
+                    if (!dimExpr || !dimExpr->isConstant())
+                    {
+                        reportError(currentToken.line, currentToken.col, "Expected constant array size or ']' after [");
+                        hadError = true;
+                        dimensions.push_back(1);
+                    }
+                    else
+                    {
+                        int dimValue = dimExpr->getConstantValue();
+                        if (dimValue <= 0)
+                        {
+                            reportError(currentToken.line, currentToken.col, "Array size must be positive");
+                            hadError = true;
+                            dimensions.push_back(1);
+                        }
+                        else
+                        {
+                            dimensions.push_back(static_cast<size_t>(dimValue));
+                        }
+                    }
                 }
                 eat(TOKEN_RBRACKET);
             }
@@ -4251,6 +4479,11 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
     // Parses a top‑level item which may be either a function or a global variable
     std::unique_ptr<ASTNode> function()
     {
+        if (currentToken.type == TOKEN_ENUM)
+        {
+            return parseEnumDeclarationOrVariable(nullptr);
+        }
+
         bool isExternal = false;
         // If the function is external - parse the extern token
         if (currentToken.type == TOKEN_EXTERN)
@@ -4324,9 +4557,29 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 }
                 else
                 {
-                    reportError(currentToken.line, currentToken.col,
-                                "Expected array size or ']' after [ in global declaration");
-                    hadError = true;
+                    auto dimExpr = condition(nullptr);
+                    if (!dimExpr || !dimExpr->isConstant())
+                    {
+                        reportError(currentToken.line, currentToken.col,
+                                    "Expected constant array size or ']' after [ in global declaration");
+                        hadError = true;
+                        dimensions.push_back(1);
+                    }
+                    else
+                    {
+                        int dimValue = dimExpr->getConstantValue();
+                        if (dimValue <= 0)
+                        {
+                            reportError(currentToken.line, currentToken.col,
+                                        "Array size must be positive in global declaration");
+                            hadError = true;
+                            dimensions.push_back(1);
+                        }
+                        else
+                        {
+                            dimensions.push_back(static_cast<size_t>(dimValue));
+                        }
+                    }
                 }
                 eat(TOKEN_RBRACKET);
             }
@@ -4583,7 +4836,7 @@ public:
         while (currentToken.type != TOKEN_EOF)
 	    {
             // allow any of the basic type specifiers or 'extern' at file scope
-            if (currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
+            if (currentToken.type == TOKEN_ENUM || currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
                 currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT || currentToken.type == TOKEN_DOUBLE ||
                 currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED)
             {
@@ -4761,6 +5014,9 @@ static bool localLookupName(const std::stack<std::map<std::string, VarInfo>>& s,
     if (globalVariables.find(name) != globalVariables.end())
         return true;
 
+    if (globalEnumConstants.find(name) != globalEnumConstants.end())
+        return true;
+
     return false;
 }
 
@@ -4869,6 +5125,8 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
             }
             return t;
         }
+        if (globalEnumConstants.count(idn->name))
+            return {Type::INT,0};
         return {Type::INT,0};
     }
     if (dynamic_cast<const NumberNode*>(node)) return {Type::INT,0};
@@ -5281,6 +5539,7 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
     globalVariables.clear();
     globalArrayDimensions.clear();
     globalKnownObjectSizes.clear();
+    globalEnumConstants.clear();
     externGlobals.clear();
     functionReturnTypes.clear();
     functionParamTypes.clear();
@@ -5293,7 +5552,38 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
     // a call can only see prior declarations/definitions and the current function itself.
     for (const auto& node : ast)
     {
-        if (auto gd = dynamic_cast<const class GlobalDeclarationNode*>(node.get()))
+        if (auto ed = dynamic_cast<const EnumDeclarationNode*>(node.get()))
+        {
+            int nextValue = 0;
+            for (const auto& item : ed->enumerators)
+            {
+                int value = nextValue;
+                if (item.valueExpr)
+                {
+                    std::stack<std::map<std::string, VarInfo>> emptyScopes;
+                    semanticCheckExpression(item.valueExpr.get(), emptyScopes, nullptr);
+                    if (!item.valueExpr->isConstant())
+                    {
+                        auto loc = bestEffortNodeLocation(item.valueExpr.get());
+                        reportError(loc.first, loc.second, "Enumerator value for '" + item.name + "' must be a constant expression");
+                        hadError = true;
+                    }
+                    else
+                    {
+                        value = item.valueExpr->getConstantValue();
+                    }
+                }
+
+                if (globalEnumConstants.count(item.name))
+                {
+                    reportError(ed->line, ed->col, "Redefinition of enumerator '" + item.name + "'");
+                    hadError = true;
+                }
+                globalEnumConstants[item.name] = value;
+                nextValue = value + 1;
+            }
+        }
+        else if (auto gd = dynamic_cast<const class GlobalDeclarationNode*>(node.get()))
         {
             const std::string& name = gd->identifier;
             if (globalVariables.find(name) != globalVariables.end())

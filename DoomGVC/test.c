@@ -1,61 +1,116 @@
 extern int printf(char* s, ...);
 
-int main()
-{
-    /* ===== Examples of the ! operator (logical NOT) ===== */
+/* Normal enum */
+enum Day {
+    MONDAY,
+    TUESDAY,
+    WEDNESDAY
+};
 
-    int number = 0;
-    int flag = 1;
+/* Enum with strange numbering */
+enum WeirdNumbers {
+    NEGATIVE = -100,
+    ZERO = 0,
+    HUGE = 999999,
+    ALSO_HUGE
+};
 
-    printf("Examples of ! operator:\n");
+/* Enum used as boolean replacement */
+enum Truth {
+    FALSE,
+    TRUE
+};
 
-    // !0 becomes 1 (true)
-    printf("!0 = %d\n", !0);
+enum myBool {
+    false = 0,
+    true = !false
+};
 
-    // !1 becomes 0 (false)
-    printf("!1 = %d\n", !1);
+/* Enum used as ASCII characters */
+enum Characters {
+    LETTER_A = 'A',
+    LETTER_B = 'B',
+    LETTER_C = 'C'
+};
 
-    // !number (number = 0)
-    printf("!number (number = 0) = %d\n", !number);
+/* Enum used as array indexes */
+enum ArrayIndex {
+    FIRST,
+    SECOND,
+    THIRD,
+    ARRAY_SIZE
+};
 
-    // !flag (flag = 1)
-    printf("!flag (flag = 1) = %d\n", !flag);
+/* Enum used as bit flags */
+enum SuperPowers {
+    FLYING      = 1 << 0,
+    INVISIBLE   = 1 << 1,
+    LASER_EYES  = 1 << 2,
+    EATING_PIZZA = 1 << 3
+};
 
-    // Using ! inside a condition
-    if (!number) {
-        printf("number is zero\n");
+/* Completely absurd enum values */
+enum Ridiculous {
+    BANANA = 1000000,
+    UNIVERSE = 42,
+    POTATO = -7,
+    TIME_TRAVEL = 123456789
+};
+
+int main() {
+
+    /* ===== Basic enum usage ===== */
+    enum Day today = WEDNESDAY;
+    printf("Today = %d\n", today);
+
+    /* ===== Weird numbering ===== */
+    printf("NEGATIVE = %d\n", NEGATIVE);
+    printf("HUGE = %d\n", HUGE);
+    printf("ALSO_HUGE = %d\n", ALSO_HUGE);
+
+    /* ===== Enum used as boolean ===== */
+    enum Truth computer_is_confused = TRUE;
+
+    if (computer_is_confused) {
+        printf("Computer is confused.\n");
     }
 
-
-    /* ===== Examples of the != operator (not equal) ===== */
-
-    int a = 5;
-    int b = 10;
-    int c = 5;
-
-    printf("\nExamples of != operator:\n");
-
-    // 5 != 10 → true
-    printf("a != b = %d\n", a != b);
-
-    // 5 != 5 → false
-    printf("a != c = %d\n", a != c);
-
-    // Using != inside a condition
-    if (a != b) {
-        printf("a and b are different\n");
-    }
-
-    if (a != c) {
-        printf("a and c are different\n");
-    } else {
-        printf("a and c are equal\n");
-    }
-
-    if (!(a == c && a != b))
+    enum myBool t = false;
+    if(t)
     {
-       printf("Yes, but no :D\n");
+       printf("Works.\n");
     }
+
+    /* ===== Enum used as characters ===== */
+    printf("Letters: %c %c %c\n", LETTER_A, LETTER_B, LETTER_C);
+
+    /* ===== Enum used as array size/index ===== */
+    int numbers[ARRAY_SIZE] = {10, 20, 30};
+
+    printf("numbers[FIRST] = %d\n", numbers[FIRST]);
+    printf("numbers[SECOND] = %d\n", numbers[SECOND]);
+    printf("numbers[THIRD] = %d\n", numbers[THIRD]);
+
+    /* ===== Enum used as bit flags ===== */
+    int hero = FLYING | LASER_EYES;
+
+    if (hero & FLYING) {
+        printf("Hero can fly\n");
+    }
+
+    if (hero & LASER_EYES) {
+        printf("Hero has laser eyes\n");
+    }
+
+    /* ===== Completely ridiculous values ===== */
+    printf("BANANA = %d\n", BANANA);
+    printf("UNIVERSE = %d\n", UNIVERSE);
+    printf("POTATO = %d\n", POTATO);
+    printf("TIME_TRAVEL = %d\n", TIME_TRAVEL);
+
+    /* ===== Assigning an invalid enum value (still legal in C) ===== */
+    enum Day strange_day = 999;   // perfectly allowed in C
+    printf("Strange day = %d\n", strange_day);
 
     return 0;
 }
