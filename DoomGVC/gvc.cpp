@@ -165,6 +165,7 @@ enum TokenType
     TOKEN_STRING_LITERAL,
     TOKEN_SEMICOLON,
     TOKEN_SIZEOF,
+    TOKEN_NOT,
     TOKEN_ASSIGN,
     TOKEN_SHORT,
     TOKEN_LONG,
@@ -222,6 +223,7 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_STRING_LITERAL: return "string literal";
         case TOKEN_SEMICOLON: return ";";
         case TOKEN_ASSIGN: return "=";
+        case TOKEN_NOT: return "!";
         case TOKEN_ADD: return "+";
         case TOKEN_INCREMENT: return "++";
         case TOKEN_SUB: return "-";
@@ -769,6 +771,7 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
                 advance();
                 return Token{ TOKEN_NE, "!=", tokenLine, tokenCol };
             }
+            return Token{ TOKEN_NOT, "!", tokenLine, tokenCol };
         }
 
         else if (ch == '&')
@@ -969,6 +972,29 @@ struct LogicalAndNode : ASTNode
         f << std::endl << ".logical_and_false_" << labelID << ":" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; Set result to false" << std::endl;
         f << std::endl << ".logical_and_end_" << labelID << ":" << std::endl;
+    }
+};
+
+struct LogicalNotNode : ASTNode
+{
+    std::unique_ptr<ASTNode> operand;
+    int line = 0;
+    int col = 0;
+
+    LogicalNotNode(std::unique_ptr<ASTNode> expr, int l = 0, int c = 0)
+        : operand(std::move(expr)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        operand->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        operand->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare operand with 0" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tsete al" << ";; Set al to 1 if operand is zero" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend bool result" << std::endl;
     }
 };
 
@@ -1194,7 +1220,7 @@ struct FunctionNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
-        if (isPrototype) return;
+        if (isPrototype && !isExternal) return;
         for (const auto& stmt : body)
         {
             stmt->emitData(f);
@@ -1203,13 +1229,13 @@ struct FunctionNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        if (isPrototype) return;
         if (isExternal)
         {
             f << std::endl << "extrn '" << name << "' as _" << name << std::endl;
             f << name << " = PLT _" << name << std::endl;
             return;
         }
+        if (isPrototype) return;
         // Reset function variable index for this function
         functionVariableIndex = 0;
         // Push a new scope onto the stack
@@ -3282,7 +3308,23 @@ struct IdentifierNode : ASTNode
                 }
                 else
                 {
-                    std::string instruction = "\tmov rax, [rbp + " + std::to_string(offset + 16) + "]";
+                    std::string instruction;
+                    if (infoResult.type.pointerLevel > 0 || infoResult.type.base == Type::DOUBLE)
+                        instruction = "\tmov rax, [rbp + " + std::to_string(offset + 16) + "]";
+                    else if (infoResult.type.base == Type::FLOAT || (infoResult.type.base == Type::INT && infoResult.type.isUnsigned))
+                        instruction = "\tmov eax, dword [rbp + " + std::to_string(offset + 16) + "]";
+                    else if (infoResult.type.base == Type::INT)
+                        instruction = "\tmovsxd rax, dword [rbp + " + std::to_string(offset + 16) + "]";
+                    else if (infoResult.type.base == Type::SHORT && infoResult.type.isUnsigned)
+                        instruction = "\tmovzx eax, word [rbp + " + std::to_string(offset + 16) + "]";
+                    else if (infoResult.type.base == Type::SHORT)
+                        instruction = "\tmovsx rax, word [rbp + " + std::to_string(offset + 16) + "]";
+                    else if (infoResult.type.base == Type::CHAR && infoResult.type.isUnsigned)
+                        instruction = "\tmovzx eax, byte [rbp + " + std::to_string(offset + 16) + "]";
+                    else if (infoResult.type.base == Type::CHAR)
+                        instruction = "\tmovsx rax, byte [rbp + " + std::to_string(offset + 16) + "]";
+                    else
+                        instruction = "\tmov rax, [rbp + " + std::to_string(offset + 16) + "]";
                     f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load stack parameter " << uniqueName << std::endl;
                 }
             }
@@ -3297,7 +3339,23 @@ struct IdentifierNode : ASTNode
                 else
                 {
                     // Regular local variables and register parameters: accessed with negative offset from rbp
-                    std::string instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
+                    std::string instruction;
+                    if (infoResult.type.pointerLevel > 0 || infoResult.type.base == Type::DOUBLE)
+                        instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
+                    else if (infoResult.type.base == Type::FLOAT || (infoResult.type.base == Type::INT && infoResult.type.isUnsigned))
+                        instruction = "\tmov eax, dword [rbp - " + std::to_string(index) + "]";
+                    else if (infoResult.type.base == Type::INT)
+                        instruction = "\tmovsxd rax, dword [rbp - " + std::to_string(index) + "]";
+                    else if (infoResult.type.base == Type::SHORT && infoResult.type.isUnsigned)
+                        instruction = "\tmovzx eax, word [rbp - " + std::to_string(index) + "]";
+                    else if (infoResult.type.base == Type::SHORT)
+                        instruction = "\tmovsx rax, word [rbp - " + std::to_string(index) + "]";
+                    else if (infoResult.type.base == Type::CHAR && infoResult.type.isUnsigned)
+                        instruction = "\tmovzx eax, byte [rbp - " + std::to_string(index) + "]";
+                    else if (infoResult.type.base == Type::CHAR)
+                        instruction = "\tmovsx rax, byte [rbp - " + std::to_string(index) + "]";
+                    else
+                        instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
                     f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load variable " << uniqueName << std::endl;
                 }
             }
@@ -3310,7 +3368,24 @@ struct IdentifierNode : ASTNode
                 std::string instruction = "\tmov rax, " + name;
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load address of global array " << name << std::endl;
             } else {
-                std::string instruction = "\tmov rax, [" + name + "]";
+                std::string instruction;
+                Type gt = globalVariables[name];
+                if (gt.pointerLevel > 0 || gt.base == Type::DOUBLE)
+                    instruction = "\tmov rax, [" + name + "]";
+                else if (gt.base == Type::FLOAT || (gt.base == Type::INT && gt.isUnsigned))
+                    instruction = "\tmov eax, dword [" + name + "]";
+                else if (gt.base == Type::INT)
+                    instruction = "\tmovsxd rax, dword [" + name + "]";
+                else if (gt.base == Type::SHORT && gt.isUnsigned)
+                    instruction = "\tmovzx eax, word [" + name + "]";
+                else if (gt.base == Type::SHORT)
+                    instruction = "\tmovsx rax, word [" + name + "]";
+                else if (gt.base == Type::CHAR && gt.isUnsigned)
+                    instruction = "\tmovzx eax, byte [" + name + "]";
+                else if (gt.base == Type::CHAR)
+                    instruction = "\tmovsx rax, byte [" + name + "]";
+                else
+                    instruction = "\tmov rax, [" + name + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load global variable " << name << std::endl;
             }
         }
@@ -3472,6 +3547,13 @@ class Parser
             }
         }
 
+        else if (token.type == TOKEN_NOT)
+        {
+            eat(TOKEN_NOT);
+            auto operand = factor(currentFunction);
+            return std::make_unique<LogicalNotNode>(std::move(operand), token.line, token.col);
+        }
+
 else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         {
             if (token.type == TOKEN_NUMBER) {
@@ -3535,7 +3617,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             while(currentToken.type == TOKEN_LBRACKET)
             {
                 eat(TOKEN_LBRACKET);
-                indices.push_back(expression(currentFunction));
+                indices.push_back(condition(currentFunction));
                 eat(TOKEN_RBRACKET);
             }
 
@@ -3554,7 +3636,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             // Check if this is a function call
             if (currentToken.type == TOKEN_LPAREN)
             {
-                return functionCall(identifier, token.line, token.col);
+                return functionCall(identifier, token.line, token.col, currentFunction);
             }
 
             // Otherwise it's a variable or parameter
@@ -3772,7 +3854,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     {
                         Type ptrType = baseType;
                         ptrType.pointerLevel = 1;
-                        auto initExpr = expression(currentFunction);
+                        auto initExpr = condition(currentFunction);
                         size_t knownSize = initExpr ? initExpr->getKnownObjectSize() : 0;
                         eat(TOKEN_SEMICOLON);
                         auto decl = std::make_unique<DeclarationNode>(identifier, ptrType, std::move(initExpr));
@@ -3816,7 +3898,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 if (currentToken.type == TOKEN_ASSIGN)
                 {
                     eat(TOKEN_ASSIGN);
-                    initializer = expression(currentFunction);
+                    initializer = condition(currentFunction);
                 }
                 eat(TOKEN_SEMICOLON);
                 return std::make_unique<DeclarationNode>(identifier, baseType, std::move(initializer));
@@ -3847,7 +3929,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             }
             eat(TOKEN_ASSIGN);
 
-            auto expr = expression(currentFunction);
+            auto expr = condition(currentFunction);
             eat(TOKEN_SEMICOLON);
             return std::make_unique<AssignmentNode>(identifier, std::move(expr), dereferenceLevel, std::vector<std::unique_ptr<ASTNode>>(), idToken.line, idToken.col); // true for dereference
         }
@@ -3863,7 +3945,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             while (currentToken.type == TOKEN_LBRACKET)
             {
                 eat(TOKEN_LBRACKET);
-                indices.push_back(expression(currentFunction));
+                indices.push_back(condition(currentFunction));
                 eat(TOKEN_RBRACKET);
             }
 
@@ -3872,7 +3954,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 if (currentToken.type == TOKEN_ASSIGN)
                 {
                     eat(TOKEN_ASSIGN);
-                    auto expr = expression(currentFunction);
+                    auto expr = condition(currentFunction);
                     eat(TOKEN_SEMICOLON);
                     return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::move(indices), idToken.line, idToken.col);
                 }
@@ -3888,7 +3970,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             else if (currentToken.type == TOKEN_LPAREN)
             {
                 // Parse the function call
-                auto stmt = functionCall(identifier, idToken.line, idToken.col);
+                auto stmt = functionCall(identifier, idToken.line, idToken.col, currentFunction);
                 eat(TOKEN_SEMICOLON);
                 return stmt;
             }
@@ -3897,7 +3979,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             if (currentToken.type == TOKEN_ASSIGN)
             {
                 eat(TOKEN_ASSIGN);
-                auto expr = expression(currentFunction); // Parse the right-hand side
+                auto expr = condition(currentFunction); // Parse the right-hand side
                 eat(TOKEN_SEMICOLON);
                 return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::vector<std::unique_ptr<ASTNode>>(), idToken.line, idToken.col);
             }
@@ -4094,7 +4176,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             std::unique_ptr<ASTNode> expr = nullptr;
             if (currentToken.type != TOKEN_SEMICOLON)
             {
-                expr = expression(currentFunction); // Parse the expression if present
+                expr = condition(currentFunction); // Parse the expression if present
             }
             eat(TOKEN_SEMICOLON);
             return std::make_unique<ReturnNode>(std::move(expr), currentFunction, returnToken.line, returnToken.col);
@@ -4119,7 +4201,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 elements.push_back(parseInitializerList());
             } else {
                 // single expression value
-                std::unique_ptr<ASTNode> val = expression();
+                std::unique_ptr<ASTNode> val = condition();
                 elements.emplace_back(std::move(val));
             }
             if (currentToken.type == TOKEN_COMMA) {
@@ -4427,13 +4509,13 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
     ***********************************************************************************************************************/
 
 
-    std::unique_ptr<ASTNode> functionCall(const std::string& functionName, int callLine = 0, int callCol = 0)
+    std::unique_ptr<ASTNode> functionCall(const std::string& functionName, int callLine = 0, int callCol = 0, const FunctionNode* currentFunction = nullptr)
     {
         eat(TOKEN_LPAREN);
         std::vector<std::unique_ptr<ASTNode>> arguments;
         while (currentToken.type != TOKEN_RPAREN)
         {
-            arguments.push_back(expression());
+            arguments.push_back(condition(currentFunction));
             if (currentToken.type == TOKEN_COMMA)
             {
                 eat(TOKEN_COMMA);
@@ -4693,6 +4775,7 @@ static std::pair<int,int> bestEffortNodeLocation(const ASTNode* node)
     if (auto aa = dynamic_cast<const ArrayAccessNode*>(node)) return {aa->line, aa->col};
     if (auto asg = dynamic_cast<const AssignmentNode*>(node)) return {asg->line, asg->col};
     if (auto un = dynamic_cast<const UnaryOpNode*>(node)) return {un->line, un->col};
+    if (auto ln = dynamic_cast<const LogicalNotNode*>(node)) return {ln->line, ln->col};
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node)) return bestEffortNodeLocation(bin->left.get());
     if (auto ret = dynamic_cast<const ReturnNode*>(node)) return bestEffortNodeLocation(ret->expression.get());
     return {0,0};
@@ -4821,6 +4904,10 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     if (dynamic_cast<const SizeofNode*>(node))
     {
         // sizeof always produces an integer
+        return {Type::INT,0};
+    }
+    if (dynamic_cast<const LogicalNotNode*>(node))
+    {
         return {Type::INT,0};
     }
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
@@ -4959,6 +5046,20 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         if (!localLookupName(scopes, un->name))
         {
             reportError(un->line, un->col, "Use of undefined variable '" + un->name + "'");
+            hadError = true;
+        }
+        return;
+    }
+
+    if (auto ln = dynamic_cast<const LogicalNotNode*>(node))
+    {
+        semanticCheckExpression(ln->operand.get(), scopes, currentFunction);
+        Type t = computeExprType(ln->operand.get(), scopes, currentFunction);
+        bool scalar = (t.pointerLevel > 0) ||
+                      (t.pointerLevel == 0 && (t.base == Type::INT || t.base == Type::CHAR || t.base == Type::SHORT || t.base == Type::LONG || t.base == Type::FLOAT || t.base == Type::DOUBLE));
+        if (!scalar)
+        {
+            reportError(ln->line, ln->col, "Operator '!' requires a scalar operand");
             hadError = true;
         }
         return;
