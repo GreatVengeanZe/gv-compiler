@@ -1,55 +1,27 @@
 extern int printf(char* s, ...);
+extern void putchar(int c);
+extern int getchar();
 
-int main()
-{
-    int grid[80];
-    int next[80];
-    int left;
-    int center;
-    int right;
-    int index;
-    
-    for (int i = 0; i < 80; i++) {
-        grid[i] = 0;
-    }
-    grid[40] = 1;
-    
-    for (int g = 0; g < 40; g++) {
-        for (int i = 0; i < 80; i++) {
-            if (grid[i]) {
-                printf("%c", 183);
-            }
-            else {
-                printf(" ");
-            }
-        }
-        printf("\n");
-        
-        for (int i = 0; i < 80; i++) {
-            if (i > 0) {
-                left = grid[i-1];
-            }
-            else {
-                left = 0;
-            }
-            
-            center = grid[i];
-            
-            if (i < 79) {
-                right = grid[i+1];
-            }
-            else {
-                right = 0;
-            }
-            
-            index = (left << 2) | (center << 1) | right;
-            next[i] = (110 >> index) & 1;
-        }
-        
-        for (int i = 0; i < 80; i++) {
-            grid[i] = next[i];
-        }
-    }
-    
-    return 0;
-}
+int main(){ unsigned
+char c='r';double x1,y,y1,t=0,q=78,r=22,x,
+x2,y2,a,b,v;do{(c=='r')?(y2=-(y1=-1.6),x1=
+-2.0f,x2=0.8):(c=='?')? c=0,   printf("%f\
+,%f:%f,%f",x1,y1,x2,y2):(c     <':'&&c>48)
+?x=x1,y=y1,*(c>'3'&&c<':'        ?&y1: &t)
++=(y2-y1)/3,*(c>'6'&&c<            ':'?&y1
+:&t)+=(y2-y1)/3, *((c               == '8'
+||c+3=='8'||c+3 +3==               '8'?&x1
+:&t))+=(x2-x1     )/                3,*((c
+=='9'||c+3==                        '9'||c
++6=='9'                          ?&x1: &t)
+)+=2*(x2-x1)                        /3,x2=
+x1+(x2-x)/3,      y2                 =y1+(
+y2-y)/3:(c=0);for(y=                y2;y>=
+y1&&c;c=1,y-=(y2-y1)/r,            putchar
+('\n')) for(x=x1;x<=x2;            x+=(x2-
+x1)/q){a=b=c=0; while  (        ++c&&(a=(t
+=a)*a)<4&&(v=b*b)<4)a-=v-x     ,b=y+b*2*t;
+putchar("#@XMW*N&KPBQYKG$R"   "STEEVxHOUV"
+"CT()[]%JL={}eou?/\\|Ili+~<>_-^\"!;:`,. "[
+c?c>>2:63]);}} while((c=getchar ())!='x');
+return 0;/* Mandelbrot - S.Goodwin.2001*/}

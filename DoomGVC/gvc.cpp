@@ -190,6 +190,7 @@ enum TokenType
     TOKEN_RBRACKET,
     TOKEN_IF,
     TOKEN_ELSE,
+    TOKEN_DO,
     TOKEN_WHILE,
     TOKEN_FOR,
     TOKEN_EQ,
@@ -250,6 +251,7 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_UNSIGNED: return "unsigned";
         case TOKEN_SIGNED: return "signed";
         case TOKEN_ELSE: return "else";
+        case TOKEN_DO: return "do";
         case TOKEN_WHILE: return "while";
         case TOKEN_FOR: return "for";
         case TOKEN_EQ: return "==";
@@ -632,6 +634,7 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             if (ident == "void")    return Token{ TOKEN_VOID  , ident, tokenLine, tokenCol };
             if (ident == "enum")    return Token{ TOKEN_ENUM  , ident, tokenLine, tokenCol };
             if (ident == "else")    return Token{ TOKEN_ELSE  , ident, tokenLine, tokenCol };
+            if (ident == "do")      return Token{ TOKEN_DO    , ident, tokenLine, tokenCol };
             if (ident == "while")   return Token{ TOKEN_WHILE , ident, tokenLine, tokenCol };
             if (ident == "return")  return Token{ TOKEN_RETURN, ident, tokenLine, tokenCol };
             if (ident == "extern")  return Token{ TOKEN_EXTERN, ident, tokenLine, tokenCol };
@@ -941,6 +944,36 @@ struct StatementWithDeferredOpsNode : ASTNode
     {
         statement->emitCode(f);
         emitDeferredPostfixOps(f);
+    }
+};
+
+// Represents multiple statements produced from a single parse construct
+// (e.g. comma-separated declarations) without introducing a new scope.
+struct StatementListNode : ASTNode
+{
+    std::vector<std::unique_ptr<ASTNode>> statements;
+
+    StatementListNode(std::vector<std::unique_ptr<ASTNode>> stmts)
+        : statements(std::move(stmts)) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        for (const auto& stmt : statements)
+            stmt->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        for (const auto& stmt : statements)
+            stmt->emitCode(f);
+    }
+
+    size_t getArraySpaceNeeded() const override
+    {
+        size_t sum = 0;
+        for (const auto& stmt : statements)
+            sum += stmt->getArraySpaceNeeded();
+        return sum;
     }
 };
 
@@ -2703,6 +2736,48 @@ struct WhileLoopNode : ASTNode
     }
 };
 
+struct DoWhileLoopNode : ASTNode
+{
+    std::unique_ptr<ASTNode> condition;
+    std::vector<std::unique_ptr<ASTNode>> body;
+    std::string functionName;
+
+    DoWhileLoopNode(std::unique_ptr<ASTNode> cond, std::vector<std::unique_ptr<ASTNode>> b, std::string funcName)
+        : condition(std::move(cond)), body(std::move(b)), functionName(funcName) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        for (const auto& stmt : body)
+            stmt->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        size_t loopStartLabel = labelCounter++;
+        size_t loopEndLabel = labelCounter++;
+        f << std::endl << functionName << ".do_loop_start_" << loopStartLabel << ":" << std::endl;
+
+        scopes.push({});
+        for (const auto& stmt : body)
+            stmt->emitCode(f);
+        scopes.pop();
+
+        condition->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare condition result with 0" << std::endl;
+        std::string instruction = "\tjne " + functionName + ".do_loop_start_" + std::to_string(loopStartLabel);
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump back to start if condition is true" << std::endl;
+        f << std::endl << functionName << ".do_loop_end_" << loopEndLabel << ":" << std::endl;
+    }
+
+    size_t getArraySpaceNeeded() const override
+    {
+        size_t total = 0;
+        for (const auto& stmt : body)
+            total += stmt->getArraySpaceNeeded();
+        return total;
+    }
+};
+
 
 struct ForLoopNode : ASTNode
 {
@@ -4132,139 +4207,143 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 else if (currentToken.type == TOKEN_INT) typeTok = TOKEN_INT;
                 eat(currentToken.type);
             }
-            int pointerLevel = 0;
+            bool isUns = seenUnsigned;
+            std::vector<std::unique_ptr<ASTNode>> declNodes;
 
-            // Check for pointer qualification
-            while (currentToken.type == TOKEN_MUL)
+            while (true)
             {
-                eat(TOKEN_MUL);
-                pointerLevel++;
-            }
-
-            if (currentToken.type != TOKEN_IDENTIFIER)
-            {
-                reportError(currentToken.line, currentToken.col, "Expected identifier after type specification");
-                hadError = true;
-            }
-
-            Token idToken = currentToken;
-            std::string identifier = idToken.value;
-            eat(TOKEN_IDENTIFIER);
-
-            // Handle array dimensions (e.g., int array[5][10] or int arr[][3])
-            std::vector<size_t> dimensions;
-            while (currentToken.type == TOKEN_LBRACKET)
-            {
-                eat(TOKEN_LBRACKET);
-                if (currentToken.type == TOKEN_NUMBER)
+                int pointerLevel = 0;
+                while (currentToken.type == TOKEN_MUL)
                 {
-                    dimensions.push_back(std::stoul(currentToken.value));
-                    eat(TOKEN_NUMBER);
+                    eat(TOKEN_MUL);
+                    pointerLevel++;
                 }
-                else if (currentToken.type == TOKEN_RBRACKET)
+
+                if (currentToken.type != TOKEN_IDENTIFIER)
                 {
-                    // omitted size; only allowed for first dimension
-                    if (!dimensions.empty())
+                    reportError(currentToken.line, currentToken.col, "Expected identifier after type specification");
+                    hadError = true;
+                    break;
+                }
+
+                Token idToken = currentToken;
+                std::string identifier = idToken.value;
+                eat(TOKEN_IDENTIFIER);
+
+                std::vector<size_t> dimensions;
+                while (currentToken.type == TOKEN_LBRACKET)
+                {
+                    eat(TOKEN_LBRACKET);
+                    if (currentToken.type == TOKEN_NUMBER)
                     {
-                        reportError(currentToken.line, currentToken.col,
-                                    "Only the first array dimension may be omitted");
-                        hadError = true;
+                        dimensions.push_back(std::stoul(currentToken.value));
+                        eat(TOKEN_NUMBER);
                     }
-                    dimensions.push_back(0); // placeholder, will be inferred later
-                }
-                else
-                {
-                    auto dimExpr = condition(currentFunction);
-                    if (!dimExpr || !dimExpr->isConstant())
+                    else if (currentToken.type == TOKEN_RBRACKET)
                     {
-                        reportError(currentToken.line, currentToken.col, "Expected constant array size or ']' after [");
-                        hadError = true;
-                        dimensions.push_back(1);
+                        if (!dimensions.empty())
+                        {
+                            reportError(currentToken.line, currentToken.col,
+                                        "Only the first array dimension may be omitted");
+                            hadError = true;
+                        }
+                        dimensions.push_back(0);
                     }
                     else
                     {
-                        int dimValue = dimExpr->getConstantValue();
-                        if (dimValue <= 0)
+                        auto dimExpr = condition(currentFunction);
+                        if (!dimExpr || !dimExpr->isConstant())
                         {
-                            reportError(currentToken.line, currentToken.col, "Array size must be positive");
+                            reportError(currentToken.line, currentToken.col, "Expected constant array size or ']' after [");
                             hadError = true;
                             dimensions.push_back(1);
                         }
                         else
                         {
-                            dimensions.push_back(static_cast<size_t>(dimValue));
+                            int dimValue = dimExpr->getConstantValue();
+                            if (dimValue <= 0)
+                            {
+                                reportError(currentToken.line, currentToken.col, "Array size must be positive");
+                                hadError = true;
+                                dimensions.push_back(1);
+                            }
+                            else
+                            {
+                                dimensions.push_back(static_cast<size_t>(dimValue));
+                            }
                         }
                     }
+                    eat(TOKEN_RBRACKET);
                 }
-                eat(TOKEN_RBRACKET);
-            }
 
-// determine unsigned qualifier
-                bool isUns = seenUnsigned; // qualifiers already popped earlier if any
                 Type baseType = makeType(typeTok, pointerLevel, isUns);
-
-            if (!dimensions.empty())
-            {
-                // Simplification: treat char arrays initialized from string literals
-                // as pointer declarations (char*), e.g.:
-                //   char s[] = "abc";  ==>  char* s = "abc";
-                if (typeTok == TOKEN_CHAR && pointerLevel == 0 &&
-                    currentToken.type == TOKEN_ASSIGN)
+                if (!dimensions.empty())
                 {
-                    eat(TOKEN_ASSIGN);
-                    if (currentToken.type == TOKEN_STRING_LITERAL)
+                    if (typeTok == TOKEN_CHAR && pointerLevel == 0 && currentToken.type == TOKEN_ASSIGN)
                     {
-                        Type ptrType = baseType;
-                        ptrType.pointerLevel = 1;
-                        auto initExpr = condition(currentFunction);
-                        size_t knownSize = initExpr ? initExpr->getKnownObjectSize() : 0;
-                        eat(TOKEN_SEMICOLON);
-                        auto decl = std::make_unique<DeclarationNode>(identifier, ptrType, std::move(initExpr));
-                        decl->knownObjectSize = knownSize;
-                        return decl;
+                        eat(TOKEN_ASSIGN);
+                        if (currentToken.type == TOKEN_STRING_LITERAL)
+                        {
+                            Type ptrType = baseType;
+                            ptrType.pointerLevel = 1;
+                            auto initExpr = condition(currentFunction);
+                            auto decl = std::make_unique<DeclarationNode>(identifier, ptrType, std::move(initExpr));
+                            decl->knownObjectSize = decl->initializer ? decl->initializer->getKnownObjectSize() : 0;
+                            declNodes.push_back(std::move(decl));
+                        }
+                        else
+                        {
+                            Type arrayType = baseType;
+                            arrayType.pointerLevel += 1;
+                            std::unique_ptr<InitNode> initializer = nullptr;
+                            if (currentToken.type == TOKEN_STRING_LITERAL && typeTok == TOKEN_CHAR && pointerLevel == 0)
+                                initializer = std::make_unique<InitNode>(parseStringInitializerList());
+                            else
+                                initializer = std::make_unique<InitNode>(parseInitializerList());
+                            declNodes.push_back(std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer), false, idToken.line, idToken.col));
+                        }
                     }
-                    // not a string literal: fall through to normal array initializer
-                    // parsing below (the '=' token is already consumed)
-                    Type arrayType = baseType;
-                    arrayType.pointerLevel += 1;
-                    std::unique_ptr<InitNode> initializer = nullptr;
-                    if (currentToken.type == TOKEN_STRING_LITERAL && typeTok == TOKEN_CHAR && pointerLevel == 0)
-                        initializer = std::make_unique<InitNode>(parseStringInitializerList());
                     else
-                        initializer = std::make_unique<InitNode>(parseInitializerList());
-                    eat(TOKEN_SEMICOLON);
-                    auto node = std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer), false, idToken.line, idToken.col);
-                    return node;
+                    {
+                        Type arrayType = baseType;
+                        arrayType.pointerLevel += 1;
+                        std::unique_ptr<InitNode> initializer = nullptr;
+                        if (currentToken.type == TOKEN_ASSIGN)
+                        {
+                            eat(TOKEN_ASSIGN);
+                            if (currentToken.type == TOKEN_STRING_LITERAL && typeTok == TOKEN_CHAR && pointerLevel == 0)
+                                initializer = std::make_unique<InitNode>(parseStringInitializerList());
+                            else
+                                initializer = std::make_unique<InitNode>(parseInitializerList());
+                        }
+                        declNodes.push_back(std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer), false, idToken.line, idToken.col));
+                    }
+                }
+                else
+                {
+                    std::unique_ptr<ASTNode> initializer = nullptr;
+                    if (currentToken.type == TOKEN_ASSIGN)
+                    {
+                        eat(TOKEN_ASSIGN);
+                        initializer = condition(currentFunction);
+                    }
+                    declNodes.push_back(std::make_unique<DeclarationNode>(identifier, baseType, std::move(initializer)));
                 }
 
-                // Array declaration - treat as pointer to element
-                Type arrayType = baseType;
-                arrayType.pointerLevel += 1;
-                std::unique_ptr<InitNode> initializer = nullptr;
-                if (currentToken.type == TOKEN_ASSIGN)
+                if (currentToken.type == TOKEN_COMMA)
                 {
-                    eat(TOKEN_ASSIGN);
-                    if (currentToken.type == TOKEN_STRING_LITERAL && typeTok == TOKEN_CHAR && pointerLevel == 0)
-                        initializer = std::make_unique<InitNode>(parseStringInitializerList());
-                    else
-                        initializer = std::make_unique<InitNode>(parseInitializerList());
+                    eat(TOKEN_COMMA);
+                    continue;
                 }
-                eat(TOKEN_SEMICOLON);
-                auto node = std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer), false, idToken.line, idToken.col);
-                return node;
+                break;
             }
-            else
-            {
-                // Pointer or variable declaration
-                std::unique_ptr<ASTNode> initializer = nullptr;
-                if (currentToken.type == TOKEN_ASSIGN)
-                {
-                    eat(TOKEN_ASSIGN);
-                    initializer = condition(currentFunction);
-                }
-                eat(TOKEN_SEMICOLON);
-                return std::make_unique<DeclarationNode>(identifier, baseType, std::move(initializer));
-            }
+
+            eat(TOKEN_SEMICOLON);
+            if (declNodes.empty())
+                return std::make_unique<NumberNode>(0);
+            if (declNodes.size() == 1)
+                return std::move(declNodes[0]);
+            return std::make_unique<StatementListNode>(std::move(declNodes));
         }
         else if (token.type == TOKEN_MUL) // Dereference assignment (e.g., *ptr = ...)
         {
@@ -4413,14 +4492,24 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             eat(TOKEN_LPAREN);
             auto cond = condition(currentFunction); // Pass the current function context
             eat(TOKEN_RPAREN);
-            eat(TOKEN_LBRACE);
-
             std::vector<std::unique_ptr<ASTNode>> body;
-            while (currentToken.type != TOKEN_RBRACE)
-	        {
-                body.push_back(statement(currentFunction)); // Pass the current function context
+            if (currentToken.type == TOKEN_LBRACE)
+            {
+                eat(TOKEN_LBRACE);
+                while (currentToken.type != TOKEN_RBRACE)
+	            {
+                    auto stmt = statement(currentFunction);
+                    if (stmt)
+                        body.push_back(std::move(stmt));
+                }
+                eat(TOKEN_RBRACE);
             }
-            eat(TOKEN_RBRACE);
+            else
+            {
+                auto stmt = statement(currentFunction);
+                if (stmt)
+                    body.push_back(std::move(stmt));
+            }
 
             // Parse 'else if' blocks
             std::vector<std::pair<std::unique_ptr<ASTNode>, std::vector<std::unique_ptr<ASTNode>>>> elseIfBlocks;
@@ -4434,14 +4523,24 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     eat(TOKEN_LPAREN);
                     auto elseIfCond = condition(currentFunction); // Pass the current function context
                     eat(TOKEN_RPAREN);
-                    eat(TOKEN_LBRACE);
-
                     std::vector<std::unique_ptr<ASTNode>> elseIfBody;
-                    while (currentToken.type != TOKEN_RBRACE)
+                    if (currentToken.type == TOKEN_LBRACE)
                     {
-                        elseIfBody.push_back(statement(currentFunction)); // Pass the current function context
+                        eat(TOKEN_LBRACE);
+                        while (currentToken.type != TOKEN_RBRACE)
+                        {
+                            auto stmt = statement(currentFunction);
+                            if (stmt)
+                                elseIfBody.push_back(std::move(stmt));
+                        }
+                        eat(TOKEN_RBRACE);
                     }
-                    eat(TOKEN_RBRACE);
+                    else
+                    {
+                        auto stmt = statement(currentFunction);
+                        if (stmt)
+                            elseIfBody.push_back(std::move(stmt));
+                    }
 
                     elseIfBlocks.push_back({std::move(elseIfCond), std::move(elseIfBody)});
                 }
@@ -4455,12 +4554,23 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             if (currentToken.type == TOKEN_ELSE)
             {
                 eat(TOKEN_ELSE);
-                eat(TOKEN_LBRACE);
-                while (currentToken.type != TOKEN_RBRACE)
+                if (currentToken.type == TOKEN_LBRACE)
                 {
-                    elseBody.push_back(statement(currentFunction)); // Pass the current fuction context
+                    eat(TOKEN_LBRACE);
+                    while (currentToken.type != TOKEN_RBRACE)
+                    {
+                        auto stmt = statement(currentFunction);
+                        if (stmt)
+                            elseBody.push_back(std::move(stmt)); // Pass the current fuction context
+                    }
+                    eat(TOKEN_RBRACE);
                 }
-                eat(TOKEN_RBRACE);
+                else
+                {
+                    auto stmt = statement(currentFunction);
+                    if (stmt)
+                        elseBody.push_back(std::move(stmt));
+                }
             }
 
             return std::make_unique<IfStatementNode>(std::move(cond), std::move(body), std::move(elseIfBlocks), std::move(elseBody), currentFunction->name);
@@ -4473,16 +4583,59 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             eat(TOKEN_LPAREN);
             auto cond = condition(currentFunction); // Parse the condition
             eat(TOKEN_RPAREN);
-            eat(TOKEN_LBRACE);
     
             std::vector<std::unique_ptr<ASTNode>> body;
-            while (currentToken.type != TOKEN_RBRACE)
+            if (currentToken.type == TOKEN_LBRACE)
             {
-                body.push_back(statement(currentFunction)); // Parse the body
+                eat(TOKEN_LBRACE);
+                while (currentToken.type != TOKEN_RBRACE)
+                {
+                    auto stmt = statement(currentFunction);
+                    if (stmt)
+                        body.push_back(std::move(stmt)); // Parse the body
+                }
+                eat(TOKEN_RBRACE);
             }
-            eat(TOKEN_RBRACE);
+            else
+            {
+                auto stmt = statement(currentFunction);
+                if (stmt)
+                    body.push_back(std::move(stmt));
+            }
     
             return std::make_unique<WhileLoopNode>(std::move(cond), std::move(body), currentFunction->name);
+        }
+
+        else if (token.type == TOKEN_DO)
+        {
+            eat(TOKEN_DO);
+
+            std::vector<std::unique_ptr<ASTNode>> body;
+            if (currentToken.type == TOKEN_LBRACE)
+            {
+                eat(TOKEN_LBRACE);
+                while (currentToken.type != TOKEN_RBRACE)
+                {
+                    auto stmt = statement(currentFunction);
+                    if (stmt)
+                        body.push_back(std::move(stmt));
+                }
+                eat(TOKEN_RBRACE);
+            }
+            else
+            {
+                auto stmt = statement(currentFunction);
+                if (stmt)
+                    body.push_back(std::move(stmt));
+            }
+
+            eat(TOKEN_WHILE);
+            eat(TOKEN_LPAREN);
+            auto cond = condition(currentFunction);
+            eat(TOKEN_RPAREN);
+            eat(TOKEN_SEMICOLON);
+
+            return std::make_unique<DoWhileLoopNode>(std::move(cond), std::move(body), currentFunction->name);
         }
 
         else if (token.type == TOKEN_FOR)
@@ -4520,13 +4673,24 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             eat(TOKEN_RPAREN); // Consume the closing parenthesis
 
             // Parse the loop body
-            eat(TOKEN_LBRACE);
             std::vector<std::unique_ptr<ASTNode>> body;
-            while (currentToken.type != TOKEN_RBRACE)
+            if (currentToken.type == TOKEN_LBRACE)
             {
-                body.push_back(statement(currentFunction)); // Parse the body
+                eat(TOKEN_LBRACE);
+                while (currentToken.type != TOKEN_RBRACE)
+                {
+                    auto stmt = statement(currentFunction);
+                    if (stmt)
+                        body.push_back(std::move(stmt)); // Parse the body
+                }
+                eat(TOKEN_RBRACE);
             }
-            eat(TOKEN_RBRACE);
+            else
+            {
+                auto stmt = statement(currentFunction);
+                if (stmt)
+                    body.push_back(std::move(stmt));
+            }
 
             return std::make_unique<ForLoopNode>(std::move(initialization), std::move(cond), std::move(iteration), std::move(body), currentFunction->name);
         }
@@ -5636,6 +5800,15 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
         return;
     }
 
+    if (auto dwn = dynamic_cast<const DoWhileLoopNode*>(node))
+    {
+        scopes.push({});
+        for (const auto& stmt : dwn->body) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+        scopes.pop();
+        semanticCheckExpression(dwn->condition.get(), scopes, currentFunction);
+        return;
+    }
+
     if (auto rn = dynamic_cast<const ReturnNode*>(node))
     {
         if (rn->expression)
@@ -5660,6 +5833,13 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
         scopes.push({});
         for (const auto& stmt : bn->statements) semanticCheckStatement(stmt.get(), scopes, currentFunction);
         scopes.pop();
+        return;
+    }
+
+    if (auto sn = dynamic_cast<const StatementListNode*>(node))
+    {
+        for (const auto& stmt : sn->statements)
+            semanticCheckStatement(stmt.get(), scopes, currentFunction);
         return;
     }
 
