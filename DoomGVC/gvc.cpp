@@ -177,11 +177,18 @@ enum TokenType
     TOKEN_UNSIGNED,
     TOKEN_SIGNED,
     TOKEN_ADD,
+    TOKEN_ADD_ASSIGN,
     TOKEN_INCREMENT,
     TOKEN_SUB,
+    TOKEN_SUB_ASSIGN,
     TOKEN_DECREMENT,TOKEN_MUL,
+    TOKEN_MUL_ASSIGN,
     TOKEN_DIV,
+    TOKEN_DIV_ASSIGN,
+    TOKEN_MOD,
+    TOKEN_MOD_ASSIGN,
     TOKEN_AND,
+    TOKEN_AND_ASSIGN,
     TOKEN_LPAREN,
     TOKEN_RPAREN,
     TOKEN_LBRACE,
@@ -203,9 +210,15 @@ enum TokenType
     TOKEN_LOGICAL_OR,
     TOKEN_OR,
     TOKEN_XOR,
+    TOKEN_XOR_ASSIGN,
     TOKEN_SHL,
+    TOKEN_SHL_ASSIGN,
     TOKEN_SHR,
+    TOKEN_SHR_ASSIGN,
+    TOKEN_OR_ASSIGN,
     TOKEN_RETURN,
+    TOKEN_QUESTION,
+    TOKEN_COLON,
     TOKEN_COMMA,
     TOKEN_EOF
 };
@@ -230,12 +243,19 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_ASSIGN: return "=";
         case TOKEN_NOT: return "!";
         case TOKEN_ADD: return "+";
+        case TOKEN_ADD_ASSIGN: return "+=";
         case TOKEN_INCREMENT: return "++";
         case TOKEN_SUB: return "-";
+        case TOKEN_SUB_ASSIGN: return "-=";
         case TOKEN_DECREMENT: return "--";
         case TOKEN_MUL: return "*";
+        case TOKEN_MUL_ASSIGN: return "*=";
         case TOKEN_DIV: return "/";
+        case TOKEN_DIV_ASSIGN: return "/=";
+        case TOKEN_MOD: return "%";
+        case TOKEN_MOD_ASSIGN: return "%=";
         case TOKEN_AND: return "&";
+        case TOKEN_AND_ASSIGN: return "&=";
         case TOKEN_LPAREN: return "(";
         case TOKEN_RPAREN: return ")";
         case TOKEN_LBRACE: return "{";
@@ -263,10 +283,16 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_LOGICAL_AND: return "&&";
         case TOKEN_LOGICAL_OR: return "||";
         case TOKEN_OR: return "|";
+        case TOKEN_OR_ASSIGN: return "|=";
         case TOKEN_XOR: return "^";
+        case TOKEN_XOR_ASSIGN: return "^=";
         case TOKEN_SHL: return "<<";
+        case TOKEN_SHL_ASSIGN: return "<<=";
         case TOKEN_SHR: return ">>";
+        case TOKEN_SHR_ASSIGN: return ">>=";
         case TOKEN_RETURN: return "return";
+        case TOKEN_QUESTION: return "?";
+        case TOKEN_COLON: return ":";
         case TOKEN_COMMA: return ",";
         case TOKEN_EOF: return "EOF";
         default: return "<unknown>";
@@ -500,7 +526,28 @@ public:
 
     void skipWhitespace()
     {
-        while (isspace(peek())) advance();
+        while (true)
+        {
+            if (peek() == '\\' && pos + 1 < source.size() && source[pos + 1] == '\n')
+            {
+                advance();
+                advance();
+                continue;
+            }
+            if (peek() == '\\' && pos + 2 < source.size() && source[pos + 1] == '\r' && source[pos + 2] == '\n')
+            {
+                advance();
+                advance();
+                advance();
+                continue;
+            }
+            if (isspace(peek()))
+            {
+                advance();
+                continue;
+            }
+            break;
+        }
     }
 
     Token peekToken()
@@ -550,6 +597,19 @@ public:
             std::string str;
             while (peek() != '"' && peek() != '\0')
             {
+                if (peek() == '\\' && pos + 1 < source.size() && source[pos + 1] == '\n')
+                {
+                    advance();
+                    advance();
+                    continue;
+                }
+                if (peek() == '\\' && pos + 2 < source.size() && source[pos + 1] == '\r' && source[pos + 2] == '\n')
+                {
+                    advance();
+                    advance();
+                    advance();
+                    continue;
+                }
                 if (peek() == '\\') // escape sequence
                 {
                     advance(); // consume '\'
@@ -611,6 +671,10 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
                 if (peek() == '+' || peek() == '-') num += advance();
                 while (isdigit(peek())) num += advance();
             }
+            if (peek() == 'f' || peek() == 'F' || peek() == 'l' || peek() == 'L') {
+                isFloat = true;
+                advance();
+            }
             if (isFloat)
                 return Token{ TOKEN_FLOAT_LITERAL, num, tokenLine, tokenCol };
             else
@@ -667,6 +731,11 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
                 advance();
                 return Token{ TOKEN_INCREMENT, "++", tokenLine, tokenCol };
             }
+            if (peek() == '=')
+            {
+                advance();
+                return Token{ TOKEN_ADD_ASSIGN, "+=", tokenLine, tokenCol };
+            }
             return Token{ TOKEN_ADD, "+", tokenLine, tokenCol };
         }
 
@@ -678,18 +747,33 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
                 advance();
                 return Token{ TOKEN_DECREMENT, "--", tokenLine, tokenCol };
             }
+            if (peek() == '=')
+            {
+                advance();
+                return Token{ TOKEN_SUB_ASSIGN, "-=", tokenLine, tokenCol };
+            }
             return Token{ TOKEN_SUB, "-", tokenLine, tokenCol };
         }
 
         else if (ch == '*')
 	    {
             advance();
+            if (peek() == '=')
+            {
+                advance();
+                return Token{ TOKEN_MUL_ASSIGN, "*=", tokenLine, tokenCol };
+            }
             return Token{ TOKEN_MUL, "*", tokenLine, tokenCol };
         }
 
         else if (ch == '/')
 	    {
             advance();
+            if (peek() == '=')
+            {
+                advance();
+                return Token{ TOKEN_DIV_ASSIGN, "/=", tokenLine, tokenCol };
+            }
             // Check for single-line comment (//)
             if (peek() == '/')
             {
@@ -725,13 +809,18 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             }
             return Token{ TOKEN_DIV, "/", tokenLine, tokenCol };
         }
-        
-        else if (ch == '^')
+
+        else if (ch == '%')
         {
             advance();
-            return Token{ TOKEN_XOR, "^", tokenLine, tokenCol };
+            if (peek() == '=')
+            {
+                advance();
+                return Token{ TOKEN_MOD_ASSIGN, "%=", tokenLine, tokenCol };
+            }
+            return Token{ TOKEN_MOD, "%", tokenLine, tokenCol };
         }
-
+        
         else if (ch == '(')
 	    {
             advance();
@@ -748,6 +837,18 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
         {
             advance();
             return Token{TOKEN_COMMA, ",", tokenLine, tokenCol};
+        }
+
+        else if (ch == '?')
+        {
+            advance();
+            return Token{ TOKEN_QUESTION, "?", tokenLine, tokenCol };
+        }
+
+        else if (ch == ':')
+        {
+            advance();
+            return Token{ TOKEN_COLON, ":", tokenLine, tokenCol };
         }
 
         else if (ch == '{')
@@ -785,6 +886,11 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             else if (peek() == '<')
             {
                 advance();
+                if (peek() == '=')
+                {
+                    advance();
+                    return Token{ TOKEN_SHL_ASSIGN, "<<=", tokenLine, tokenCol };
+                }
                 return Token{ TOKEN_SHL, "<<", tokenLine, tokenCol };
             }
             return Token{ TOKEN_LT, "<", tokenLine, tokenCol };
@@ -801,6 +907,11 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             else if (peek() == '>')
             {
                 advance();
+                if (peek() == '=')
+                {
+                    advance();
+                    return Token{ TOKEN_SHR_ASSIGN, ">>=", tokenLine, tokenCol };
+                }
                 return Token{ TOKEN_SHR, ">>", tokenLine, tokenCol };
             }
             return Token{ TOKEN_GT, ">", tokenLine, tokenCol };
@@ -825,6 +936,11 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
                 advance();
                 return Token{ TOKEN_LOGICAL_AND, "&&", tokenLine, tokenCol };
             }
+            if (peek() == '=')
+            {
+                advance();
+                return Token{ TOKEN_AND_ASSIGN, "&=", tokenLine, tokenCol };
+            }
             return Token{ TOKEN_AND, "&", tokenLine, tokenCol };
         }
 
@@ -836,7 +952,23 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
                 advance();
                 return Token{ TOKEN_LOGICAL_OR, "||", tokenLine, tokenCol };
             }
+            if (peek() == '=')
+            {
+                advance();
+                return Token{ TOKEN_OR_ASSIGN, "|=", tokenLine, tokenCol };
+            }
             return Token{ TOKEN_OR, "|", tokenLine, tokenCol };
+        }
+
+        else if (ch == '^')
+        {
+            advance();
+            if (peek() == '=')
+            {
+                advance();
+                return Token{ TOKEN_XOR_ASSIGN, "^=", tokenLine, tokenCol };
+            }
+            return Token{ TOKEN_XOR, "^", tokenLine, tokenCol };
         }
 
         else if (ch == '\0')
@@ -1079,6 +1211,63 @@ struct LogicalNotNode : ASTNode
     {
         int v = operand->getConstantValue();
         return (v == 0) ? 1 : 0;
+    }
+};
+
+struct TernaryNode : ASTNode
+{
+    std::unique_ptr<ASTNode> conditionExpr;
+    std::unique_ptr<ASTNode> trueExpr;
+    std::unique_ptr<ASTNode> falseExpr;
+    int line = 0;
+    int col = 0;
+
+    TernaryNode(std::unique_ptr<ASTNode> cond,
+                std::unique_ptr<ASTNode> whenTrue,
+                std::unique_ptr<ASTNode> whenFalse,
+                int l = 0,
+                int c = 0)
+        : conditionExpr(std::move(cond)), trueExpr(std::move(whenTrue)), falseExpr(std::move(whenFalse)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        conditionExpr->emitData(f);
+        trueExpr->emitData(f);
+        falseExpr->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        size_t labelID = labelCounter++;
+        std::string falseLabel = ".ternary_false_" + std::to_string(labelID);
+        std::string endLabel = ".ternary_end_" + std::to_string(labelID);
+
+        conditionExpr->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Ternary condition compare" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tje " + falseLabel) << ";; Jump to false branch" << std::endl;
+
+        trueExpr->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + endLabel) << ";; Skip false branch" << std::endl;
+
+        f << std::endl << falseLabel << ":" << std::endl;
+        falseExpr->emitCode(f);
+        f << std::endl << endLabel << ":" << std::endl;
+    }
+
+    bool isConstant() const override
+    {
+        if (!conditionExpr || !conditionExpr->isConstant())
+            return false;
+        int cv = conditionExpr->getConstantValue();
+        if (cv)
+            return trueExpr && trueExpr->isConstant();
+        return falseExpr && falseExpr->isConstant();
+    }
+
+    int getConstantValue() const override
+    {
+        int cv = conditionExpr->getConstantValue();
+        return cv ? trueExpr->getConstantValue() : falseExpr->getConstantValue();
     }
 };
 
@@ -2193,6 +2382,62 @@ struct ArrayAccessNode : ASTNode
     }
 };
 
+// Indexing on arbitrary expression results, e.g. foo(arr)[0] or "ABCD"[0]
+struct PostfixIndexNode : ASTNode
+{
+    std::unique_ptr<ASTNode> baseExpr;
+    std::unique_ptr<ASTNode> indexExpr;
+    Type baseType{Type::INT,1};
+    Type resultType{Type::INT,0};
+    int line = 0;
+    int col = 0;
+
+    PostfixIndexNode(std::unique_ptr<ASTNode> b, std::unique_ptr<ASTNode> i, int l = 0, int c = 0)
+        : baseExpr(std::move(b)), indexExpr(std::move(i)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        baseExpr->emitData(f);
+        indexExpr->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        baseExpr->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save base pointer" << std::endl;
+        indexExpr->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore base pointer" << std::endl;
+
+        size_t elemSize = pointeeSize(baseType);
+        if (elemSize > 1)
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\timul rax, " + std::to_string(elemSize))
+              << ";; Scale index by element size" << std::endl;
+        }
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, rax" << ";; Compute indexed address" << std::endl;
+
+        std::string instruction;
+        if (resultType.pointerLevel > 0 || resultType.base == Type::DOUBLE)
+            instruction = "\tmov rax, [rcx]";
+        else if (resultType.base == Type::FLOAT || (resultType.base == Type::INT && resultType.isUnsigned))
+            instruction = "\tmov eax, dword [rcx]";
+        else if (resultType.base == Type::INT)
+            instruction = "\tmovsxd rax, dword [rcx]";
+        else if (resultType.base == Type::SHORT && resultType.isUnsigned)
+            instruction = "\tmovzx eax, word [rcx]";
+        else if (resultType.base == Type::SHORT)
+            instruction = "\tmovsx rax, word [rcx]";
+        else if (resultType.base == Type::CHAR && resultType.isUnsigned)
+            instruction = "\tmovzx eax, byte [rcx]";
+        else if (resultType.base == Type::CHAR)
+            instruction = "\tmovsx rax, byte [rcx]";
+        else
+            instruction = "\tmov rax, [rcx]";
+
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load indexed temporary element" << std::endl;
+    }
+};
+
 
 /********************************************************************************************
  *                 _____   _____  _____   _____  _   _  __  __  ______  _   _  _______      *
@@ -2536,6 +2781,45 @@ struct AssignmentNode : ASTNode
             }
         }
         // Apply all deferred postfix operations at the end of assignment
+        emitDeferredPostfixOps(f);
+    }
+};
+
+struct IndirectAssignmentNode : ASTNode
+{
+    std::unique_ptr<ASTNode> pointerExpr;
+    std::unique_ptr<ASTNode> expression;
+    Type valueType{Type::INT,0};
+    int line = 0;
+    int col = 0;
+
+    IndirectAssignmentNode(std::unique_ptr<ASTNode> ptr, std::unique_ptr<ASTNode> expr, int l = 0, int c = 0)
+        : pointerExpr(std::move(ptr)), expression(std::move(expr)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        pointerExpr->emitData(f);
+        expression->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        expression->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save assigned value" << std::endl;
+        pointerExpr->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore assigned value" << std::endl;
+
+        size_t storeSize = sizeOfType(valueType);
+        if (storeSize == 1)
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov byte [rax], cl" << ";; Store via computed pointer" << std::endl;
+        else if (storeSize == 2)
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov word [rax], cx" << ";; Store via computed pointer" << std::endl;
+        else if (storeSize == 4)
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov dword [rax], ecx" << ";; Store via computed pointer" << std::endl;
+        else
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rax], rcx" << ";; Store via computed pointer" << std::endl;
+
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Assignment expression result" << std::endl;
         emitDeferredPostfixOps(f);
     }
 };
@@ -2893,74 +3177,137 @@ struct BinaryOpNode : ASTNode
     }
     void emitCode(std::ofstream& f) const override
     {
+        if (op == ",")
+        {
+            left->emitCode(f);
+            right->emitCode(f);
+            return;
+        }
+
+        auto isFloatLikeType = [](const Type& t) {
+            return t.pointerLevel == 0 && (t.base == Type::FLOAT || t.base == Type::DOUBLE);
+        };
+
+        bool isRelational = (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=");
+        bool needsFloatCompare = isRelational && (isFloatLikeType(leftType) || isFloatLikeType(rightType));
+        if (needsFloatCompare)
+        {
+            bool useDouble = (leftType.base == Type::DOUBLE || rightType.base == Type::DOUBLE);
+
+            auto moveRaxToXmm = [&](const Type& src, const std::string& xmmReg)
+            {
+                if (src.base == Type::DOUBLE)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tmovq " + xmmReg + ", rax") << ";; load double operand" << std::endl;
+                }
+                else if (src.base == Type::FLOAT)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tmovd " + xmmReg + ", eax") << ";; load float operand" << std::endl;
+                    if (useDouble)
+                    {
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tcvtss2sd " + xmmReg + ", " + xmmReg) << ";; float->double" << std::endl;
+                    }
+                }
+                else
+                {
+                    if (useDouble)
+                    {
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tcvtsi2sd " + xmmReg + ", rax") << ";; int->double" << std::endl;
+                    }
+                    else
+                    {
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tcvtsi2ss " + xmmReg + ", rax") << ";; int->float" << std::endl;
+                    }
+                }
+            };
+
+            left->emitCode(f);
+            moveRaxToXmm(leftType, "xmm0");
+            right->emitCode(f);
+            moveRaxToXmm(rightType, "xmm1");
+
+            if (useDouble)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tucomisd xmm0, xmm1" << ";; compare doubles" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tucomiss xmm0, xmm1" << ";; compare floats" << std::endl;
+
+            if (op == "==")
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsete al" << ";; set if equal" << std::endl;
+            else if (op == "!=")
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetne al" << ";; set if not equal" << std::endl;
+            else if (op == "<")
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetb al" << ";; set if less" << std::endl;
+            else if (op == ">")
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tseta al" << ";; set if greater" << std::endl;
+            else if (op == "<=")
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetbe al" << ";; set if less or equal" << std::endl;
+            else if (op == ">=")
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetae al" << ";; set if greater or equal" << std::endl;
+
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; normalize compare result" << std::endl;
+            return;
+        }
+
         // For floating-point results, use SSE instructions rather than integer arithmetic.
         bool isFloatResult = (resultType.pointerLevel == 0) &&
                              (resultType.base == Type::FLOAT || resultType.base == Type::DOUBLE);
         if (isFloatResult) {
-            // evaluate left operand first
+            auto loadToXmm = [&](const Type& src, const std::string& xmmReg)
+            {
+                if (resultType.base == Type::DOUBLE)
+                {
+                    if (src.pointerLevel == 0)
+                    {
+                        if (src.base == Type::DOUBLE)
+                            f << std::left << std::setw(COMMENT_COLUMN) << ("\tmovq " + xmmReg + ", rax") << std::endl;
+                        else if (src.base == Type::FLOAT)
+                        {
+                            f << std::left << std::setw(COMMENT_COLUMN) << ("\tmovd " + xmmReg + ", eax") << std::endl;
+                            f << std::left << std::setw(COMMENT_COLUMN) << ("\tcvtss2sd " + xmmReg + ", " + xmmReg) << ";; float->double" << std::endl;
+                        }
+                        else
+                            f << std::left << std::setw(COMMENT_COLUMN) << ("\tcvtsi2sd " + xmmReg + ", rax") << ";; int->double" << std::endl;
+                    }
+                }
+                else
+                {
+                    if (src.pointerLevel == 0)
+                    {
+                        if (src.base == Type::FLOAT)
+                            f << std::left << std::setw(COMMENT_COLUMN) << ("\tmovd " + xmmReg + ", eax") << std::endl;
+                        else if (src.base == Type::DOUBLE)
+                        {
+                            f << std::left << std::setw(COMMENT_COLUMN) << ("\tmovq " + xmmReg + ", rax") << std::endl;
+                            f << std::left << std::setw(COMMENT_COLUMN) << ("\tcvtsd2ss " + xmmReg + ", " + xmmReg) << ";; double->float" << std::endl;
+                        }
+                        else
+                            f << std::left << std::setw(COMMENT_COLUMN) << ("\tcvtsi2ss " + xmmReg + ", rax") << ";; int->float" << std::endl;
+                    }
+                }
+            };
+
             left->emitCode(f);
-            // convert left operand into xmm0 according to its type and the desired result
-            if (resultType.base == Type::DOUBLE) {
-                if (leftType.pointerLevel==0) {
-                    if (leftType.base == Type::INT || leftType.base == Type::CHAR) {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm0, rax" << ";; int->double" << std::endl;
-                    } else if (leftType.base == Type::FLOAT) {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd xmm0, xmm0" << ";; float->double" << std::endl;
-                    } else {
-                        // left is already double
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << std::endl;
-                    }
-                }
-            } else {
-                // target float precision
-                if (leftType.pointerLevel==0) {
-                    if (leftType.base == Type::INT || leftType.base == Type::CHAR) {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm0, rax" << ";; int->float" << std::endl;
-                    } else if (leftType.base == Type::DOUBLE) {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << ";; double->float" << std::endl;
-                    } else if (leftType.base == Type::FLOAT) {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << std::endl;
-                    }
-                }
-            }
-
-            // evaluate right operand
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save left float operand bits" << std::endl;
             right->emitCode(f);
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm1, rax" << ";; move right into xmm1" << std::endl;
+            loadToXmm(rightType, "xmm1");
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Restore left float operand bits" << std::endl;
+            loadToXmm(leftType, "xmm0");
 
-            // convert right operand into correct precision
-            if (resultType.base == Type::DOUBLE) {
-                if (rightType.pointerLevel==0) {
-                    if (rightType.base == Type::INT || rightType.base == Type::CHAR) {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm1, rax" << ";; int->double" << std::endl;
-                    } else if (rightType.base == Type::FLOAT) {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd xmm1, xmm1" << ";; float->double" << std::endl;
-                    }
-                }
-                // perform operation
+            if (resultType.base == Type::DOUBLE)
+            {
                 if (op == "+") f << std::left << std::setw(COMMENT_COLUMN) << "\taddsd xmm0, xmm1" << ";; double add" << std::endl;
                 else if (op == "-") f << std::left << std::setw(COMMENT_COLUMN) << "\tsubsd xmm0, xmm1" << ";; double sub" << std::endl;
                 else if (op == "*") f << std::left << std::setw(COMMENT_COLUMN) << "\tmulsd xmm0, xmm1" << ";; double mul" << std::endl;
                 else if (op == "/") f << std::left << std::setw(COMMENT_COLUMN) << "\tdivsd xmm0, xmm1" << ";; double div" << std::endl;
-                // convert result back to rax
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << ";; move double result to rax" << std::endl;
-            } else {
-                // target float precision
-                if (rightType.pointerLevel==0) {
-                    if (rightType.base == Type::INT || rightType.base == Type::CHAR) {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm1, rax" << ";; int->float" << std::endl;
-                    } else if (rightType.base == Type::DOUBLE) {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm1, xmm1" << ";; double->float" << std::endl;
-                    }
-                }
+            }
+            else
+            {
                 if (op == "+") f << std::left << std::setw(COMMENT_COLUMN) << "\taddss xmm0, xmm1" << ";; float add" << std::endl;
                 else if (op == "-") f << std::left << std::setw(COMMENT_COLUMN) << "\tsubss xmm0, xmm1" << ";; float sub" << std::endl;
                 else if (op == "*") f << std::left << std::setw(COMMENT_COLUMN) << "\tmulss xmm0, xmm1" << ";; float mul" << std::endl;
                 else if (op == "/") f << std::left << std::setw(COMMENT_COLUMN) << "\tdivss xmm0, xmm1" << ";; float div" << std::endl;
-                // move lower 32 bits into rax and clear high bits
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << ";; move float result to eax (upper bits zeroed)" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << ";; move float result to eax" << std::endl;
             }
             return;
         }
@@ -3081,6 +3428,17 @@ struct BinaryOpNode : ASTNode
             f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rbx" << ";; Divide rdx:rax by rbx" << std::endl;
         }
 
+        else if (op == "%")
+    	{
+            // operands are currently: rcx = left, rax = right
+            // signed modulo: remainder is left in rdx after idiv.
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rbx, rax" << ";; Save right operand (divisor)" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Move left operand (dividend) into rax" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcqo" << ";; Sign-extend rax into rdx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rbx" << ";; Divide rdx:rax by rbx" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rdx" << ";; Move remainder into rax" << std::endl;
+        }
+
         else if (op == "==")
     	{
             f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
@@ -3138,6 +3496,7 @@ struct BinaryOpNode : ASTNode
         if (op == "-") return lv - rv;
         if (op == "*") return lv * rv;
         if (op == "/") return rv != 0 ? (lv / rv) : 0;
+        if (op == "%") return rv != 0 ? (lv % rv) : 0;
         if (op == "&") return lv & rv;
         if (op == "|") return lv | rv;
         if (op == "^") return lv ^ rv;
@@ -3149,6 +3508,7 @@ struct BinaryOpNode : ASTNode
         if (op == ">") return lv > rv;
         if (op == "<=") return lv <= rv;
         if (op == ">=") return lv >= rv;
+        if (op == ",") return rv;
         throw std::logic_error("Binary operation is not a constant expression");
     }
 };
@@ -3753,6 +4113,60 @@ class Parser
     Lexer& lexer;
     Token currentToken;
 
+    std::unique_ptr<ASTNode> cloneExpr(const ASTNode* node, const FunctionNode* currentFunction = nullptr)
+    {
+        if (!node) return nullptr;
+        if (auto n = dynamic_cast<const NumberNode*>(node))
+            return std::make_unique<NumberNode>(n->value);
+        if (auto fl = dynamic_cast<const FloatLiteralNode*>(node))
+            return std::make_unique<FloatLiteralNode>(fl->value);
+        if (auto ch = dynamic_cast<const CharLiteralNode*>(node))
+            return std::make_unique<CharLiteralNode>(ch->value);
+        if (auto s = dynamic_cast<const StringLiteralNode*>(node))
+            return std::make_unique<StringLiteralNode>(s->value);
+        if (auto id = dynamic_cast<const IdentifierNode*>(node))
+            return std::make_unique<IdentifierNode>(id->name, id->line, id->col, currentFunction);
+        if (auto un = dynamic_cast<const UnaryOpNode*>(node))
+            return std::make_unique<UnaryOpNode>(un->op, un->name, un->isPrefix, un->line, un->col);
+        if (auto ln = dynamic_cast<const LogicalNotNode*>(node))
+            return std::make_unique<LogicalNotNode>(cloneExpr(ln->operand.get(), currentFunction), ln->line, ln->col);
+        if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
+            return std::make_unique<BinaryOpNode>(bin->op, cloneExpr(bin->left.get(), currentFunction), cloneExpr(bin->right.get(), currentFunction));
+        if (auto lor = dynamic_cast<const LogicalOrNode*>(node))
+            return std::make_unique<LogicalOrNode>(cloneExpr(lor->left.get(), currentFunction), cloneExpr(lor->right.get(), currentFunction));
+        if (auto land = dynamic_cast<const LogicalAndNode*>(node))
+            return std::make_unique<LogicalAndNode>(cloneExpr(land->left.get(), currentFunction), cloneExpr(land->right.get(), currentFunction));
+        if (auto tn = dynamic_cast<const TernaryNode*>(node))
+            return std::make_unique<TernaryNode>(cloneExpr(tn->conditionExpr.get(), currentFunction), cloneExpr(tn->trueExpr.get(), currentFunction), cloneExpr(tn->falseExpr.get(), currentFunction), tn->line, tn->col);
+        if (auto aa = dynamic_cast<const ArrayAccessNode*>(node))
+        {
+            std::vector<std::unique_ptr<ASTNode>> idx;
+            for (const auto& i : aa->indices)
+                idx.push_back(cloneExpr(i.get(), currentFunction));
+            return std::make_unique<ArrayAccessNode>(aa->identifier, std::move(idx), currentFunction, aa->line, aa->col);
+        }
+        if (auto pi = dynamic_cast<const PostfixIndexNode*>(node))
+            return std::make_unique<PostfixIndexNode>(cloneExpr(pi->baseExpr.get(), currentFunction), cloneExpr(pi->indexExpr.get(), currentFunction), pi->line, pi->col);
+        if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
+        {
+            std::vector<std::unique_ptr<ASTNode>> args;
+            for (const auto& a : fc->arguments)
+                args.push_back(cloneExpr(a.get(), currentFunction));
+            return std::make_unique<FunctionCallNode>(fc->functionName, std::move(args), fc->line, fc->col);
+        }
+        if (auto dn = dynamic_cast<const DereferenceNode*>(node))
+            return std::make_unique<DereferenceNode>(cloneExpr(dn->operand.get(), currentFunction), currentFunction);
+        if (auto ao = dynamic_cast<const AddressOfNode*>(node))
+            return std::make_unique<AddressOfNode>(ao->Identifier, currentFunction, ao->line, ao->col);
+        if (auto so = dynamic_cast<const SizeofNode*>(node))
+        {
+            if (so->isType)
+                return std::make_unique<SizeofNode>(so->typeOperand, currentFunction);
+            return std::make_unique<SizeofNode>(cloneExpr(so->expr.get(), currentFunction), currentFunction);
+        }
+        return std::make_unique<NumberNode>(0);
+    }
+
     void eat(TokenType type)
     {
         if (currentToken.type == type)
@@ -3783,6 +4197,17 @@ class Parser
     std::unique_ptr<ASTNode> factor(const FunctionNode* currentFunction = nullptr)
     {
         Token token = currentToken;
+        auto applyPostfixIndex = [&](std::unique_ptr<ASTNode> node, int l, int c) -> std::unique_ptr<ASTNode>
+        {
+            while (currentToken.type == TOKEN_LBRACKET)
+            {
+                eat(TOKEN_LBRACKET);
+                auto idx = condition(currentFunction);
+                eat(TOKEN_RBRACKET);
+                node = std::make_unique<PostfixIndexNode>(std::move(node), std::move(idx), l, c);
+            }
+            return node;
+        };
 
         if (token.type == TOKEN_SUB)
         {
@@ -3845,7 +4270,7 @@ class Parser
                 }
                 else
                 {
-                    auto exprNode = logicalOr(currentFunction);
+                    auto exprNode = condition(currentFunction);
                     eat(TOKEN_RPAREN);
                     return std::make_unique<SizeofNode>(std::move(exprNode), currentFunction);
                 }
@@ -3914,7 +4339,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 combined += currentToken.value;
                 eat(TOKEN_STRING_LITERAL);
             }
-            return std::make_unique<StringLiteralNode>(combined);
+            auto node = std::make_unique<StringLiteralNode>(combined);
+            return applyPostfixIndex(std::move(node), token.line, token.col);
         }
 
         else if (token.type == TOKEN_IDENTIFIER)
@@ -3953,7 +4379,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             // Check if this is a function call
             if (currentToken.type == TOKEN_LPAREN)
             {
-                return functionCall(identifier, token.line, token.col, currentFunction);
+                auto node = functionCall(identifier, token.line, token.col, currentFunction);
+                return applyPostfixIndex(std::move(node), token.line, token.col);
             }
 
             // Otherwise it's a variable or parameter
@@ -3963,9 +4390,9 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         else if (token.type == TOKEN_LPAREN)
 	    {
             eat(TOKEN_LPAREN);
-            auto node = logicalOr(currentFunction);
+            auto node = condition(currentFunction);
             eat(TOKEN_RPAREN);
-            return node;
+            return applyPostfixIndex(std::move(node), token.line, token.col);
         }
         reportError(token.line, token.col, "Unexpected token in factor " + token.value);
         // try to recover by advancing one token
@@ -4084,13 +4511,14 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
     std::unique_ptr<ASTNode> term(const FunctionNode* currentFunction = nullptr)
     {
         auto node = factor(currentFunction); // Pass the currentFunction context
-        while (currentToken.type == TOKEN_MUL || currentToken.type == TOKEN_DIV)
+	    while (currentToken.type == TOKEN_MUL || currentToken.type == TOKEN_DIV || currentToken.type == TOKEN_MOD)
 	    {
             Token token = currentToken;
             switch (token.type)
             {
                 case TOKEN_MUL: eat(TOKEN_MUL); break;
                 case TOKEN_DIV: eat(TOKEN_DIV); break;
+                case TOKEN_MOD: eat(TOKEN_MOD); break;
                 default: ;
             }
 
@@ -4137,6 +4565,112 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         return node;
     }
 
+    std::unique_ptr<ASTNode> conditional(const FunctionNode* currentFunction = nullptr)
+    {
+        auto node = logicalOr(currentFunction);
+        if (currentToken.type == TOKEN_QUESTION)
+        {
+            Token ternaryToken = currentToken;
+            eat(TOKEN_QUESTION);
+            auto whenTrue = condition(currentFunction);
+            eat(TOKEN_COLON);
+            auto whenFalse = conditional(currentFunction);
+            node = std::make_unique<TernaryNode>(std::move(node), std::move(whenTrue), std::move(whenFalse), ternaryToken.line, ternaryToken.col);
+        }
+        return node;
+    }
+
+    std::unique_ptr<ASTNode> assignmentExpression(const FunctionNode* currentFunction = nullptr)
+    {
+        auto isCompoundAssign = [](TokenType t) -> bool
+        {
+            return t == TOKEN_ADD_ASSIGN || t == TOKEN_SUB_ASSIGN || t == TOKEN_MUL_ASSIGN ||
+                   t == TOKEN_DIV_ASSIGN || t == TOKEN_MOD_ASSIGN || t == TOKEN_AND_ASSIGN ||
+                   t == TOKEN_OR_ASSIGN || t == TOKEN_XOR_ASSIGN || t == TOKEN_SHL_ASSIGN ||
+                   t == TOKEN_SHR_ASSIGN;
+        };
+        auto compoundToBinary = [](TokenType t) -> std::string
+        {
+            if (t == TOKEN_ADD_ASSIGN) return "+";
+            if (t == TOKEN_SUB_ASSIGN) return "-";
+            if (t == TOKEN_MUL_ASSIGN) return "*";
+            if (t == TOKEN_DIV_ASSIGN) return "/";
+            if (t == TOKEN_MOD_ASSIGN) return "%";
+            if (t == TOKEN_AND_ASSIGN) return "&";
+            if (t == TOKEN_OR_ASSIGN) return "|";
+            if (t == TOKEN_XOR_ASSIGN) return "^";
+            if (t == TOKEN_SHL_ASSIGN) return "<<";
+            if (t == TOKEN_SHR_ASSIGN) return ">>";
+            return "";
+        };
+
+        auto node = conditional(currentFunction);
+        if (currentToken.type == TOKEN_ASSIGN || isCompoundAssign(currentToken.type))
+        {
+            TokenType assignTok = currentToken.type;
+            Token tok = currentToken;
+            eat(assignTok);
+            auto rhs = assignmentExpression(currentFunction); // right-associative
+
+            if (auto id = dynamic_cast<IdentifierNode*>(node.get()))
+            {
+                std::string identifier = id->name;
+                std::unique_ptr<ASTNode> expr;
+                if (assignTok == TOKEN_ASSIGN)
+                {
+                    expr = std::move(rhs);
+                }
+                else
+                {
+                    auto lhs = std::make_unique<IdentifierNode>(identifier, id->line, id->col, currentFunction);
+                    expr = std::make_unique<BinaryOpNode>(compoundToBinary(assignTok), std::move(lhs), std::move(rhs));
+                }
+                return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::vector<std::unique_ptr<ASTNode>>(), tok.line, tok.col);
+            }
+            else if (auto aa = dynamic_cast<ArrayAccessNode*>(node.get()))
+            {
+                std::vector<std::unique_ptr<ASTNode>> idx;
+                for (const auto& i : aa->indices)
+                    idx.push_back(cloneExpr(i.get(), currentFunction));
+                std::unique_ptr<ASTNode> expr;
+                if (assignTok == TOKEN_ASSIGN)
+                {
+                    expr = std::move(rhs);
+                }
+                else
+                {
+                    auto lhs = std::make_unique<ArrayAccessNode>(aa->identifier, std::move(idx), currentFunction, aa->line, aa->col);
+                    expr = std::make_unique<BinaryOpNode>(compoundToBinary(assignTok), std::move(lhs), std::move(rhs));
+                    idx.clear();
+                    for (const auto& i : aa->indices)
+                        idx.push_back(cloneExpr(i.get(), currentFunction));
+                }
+                return std::make_unique<AssignmentNode>(aa->identifier, std::move(expr), 0, std::move(idx), tok.line, tok.col);
+            }
+            else if (auto dn = dynamic_cast<DereferenceNode*>(node.get()))
+            {
+                std::unique_ptr<ASTNode> ptrExpr = cloneExpr(dn->operand.get(), currentFunction);
+                std::unique_ptr<ASTNode> expr;
+                if (assignTok == TOKEN_ASSIGN)
+                {
+                    expr = std::move(rhs);
+                }
+                else
+                {
+                    auto lhs = cloneExpr(dn, currentFunction);
+                    expr = std::make_unique<BinaryOpNode>(compoundToBinary(assignTok), std::move(lhs), std::move(rhs));
+                }
+                return std::make_unique<IndirectAssignmentNode>(std::move(ptrExpr), std::move(expr), tok.line, tok.col);
+            }
+            else
+            {
+                reportError(tok.line, tok.col, "Left side of assignment must be assignable");
+                hadError = true;
+            }
+        }
+        return node;
+    }
+
 
     /*****************************************************************************************
      *       _____  ____   _   _  _____  _____  _______  _____  ____   _   _    __  __       *
@@ -4151,7 +4685,13 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
     std::unique_ptr<ASTNode> condition(const FunctionNode* currentFunction = nullptr) 
     {
-        return logicalOr(currentFunction); // Parse the entire condition
+        auto node = assignmentExpression(currentFunction);
+        while (currentToken.type == TOKEN_COMMA)
+        {
+            eat(TOKEN_COMMA);
+            node = std::make_unique<BinaryOpNode>(",", std::move(node), assignmentExpression(currentFunction));
+        }
+        return node;
     }
 
     
@@ -4169,6 +4709,27 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
     std::unique_ptr<ASTNode> statement(const FunctionNode* currentFunction = nullptr)
     {
         Token token = currentToken;
+        auto isCompoundAssign = [](TokenType t) -> bool
+        {
+            return t == TOKEN_ADD_ASSIGN || t == TOKEN_SUB_ASSIGN || t == TOKEN_MUL_ASSIGN ||
+                   t == TOKEN_DIV_ASSIGN || t == TOKEN_MOD_ASSIGN || t == TOKEN_AND_ASSIGN ||
+                   t == TOKEN_OR_ASSIGN || t == TOKEN_XOR_ASSIGN || t == TOKEN_SHL_ASSIGN ||
+                   t == TOKEN_SHR_ASSIGN;
+        };
+        auto compoundToBinary = [](TokenType t) -> std::string
+        {
+            if (t == TOKEN_ADD_ASSIGN) return "+";
+            if (t == TOKEN_SUB_ASSIGN) return "-";
+            if (t == TOKEN_MUL_ASSIGN) return "*";
+            if (t == TOKEN_DIV_ASSIGN) return "/";
+            if (t == TOKEN_MOD_ASSIGN) return "%";
+            if (t == TOKEN_AND_ASSIGN) return "&";
+            if (t == TOKEN_OR_ASSIGN) return "|";
+            if (t == TOKEN_XOR_ASSIGN) return "^";
+            if (t == TOKEN_SHL_ASSIGN) return "<<";
+            if (t == TOKEN_SHR_ASSIGN) return ">>";
+            return "";
+        };
 
         if (token.type == TOKEN_LBRACE) {
             eat(TOKEN_LBRACE);
@@ -4325,7 +4886,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     if (currentToken.type == TOKEN_ASSIGN)
                     {
                         eat(TOKEN_ASSIGN);
-                        initializer = condition(currentFunction);
+                        initializer = assignmentExpression(currentFunction);
                     }
                     declNodes.push_back(std::make_unique<DeclarationNode>(identifier, baseType, std::move(initializer)));
                 }
@@ -4363,14 +4924,27 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             std::string identifier = idToken.value;
             eat(TOKEN_IDENTIFIER);
 
-            if (currentToken.type != TOKEN_ASSIGN)
+            if (currentToken.type != TOKEN_ASSIGN && !isCompoundAssign(currentToken.type))
             {
                 reportError(currentToken.line, currentToken.col, "Expected = after dereference identifier");
                 hadError = true;
             }
-            eat(TOKEN_ASSIGN);
+            TokenType assignTok = currentToken.type;
+            eat(assignTok);
 
-            auto expr = condition(currentFunction);
+            auto rhs = assignmentExpression(currentFunction);
+            std::unique_ptr<ASTNode> expr;
+            if (assignTok == TOKEN_ASSIGN)
+            {
+                expr = std::move(rhs);
+            }
+            else
+            {
+                std::unique_ptr<ASTNode> lhs = std::make_unique<IdentifierNode>(identifier, idToken.line, idToken.col, currentFunction);
+                for (int i = 0; i < dereferenceLevel; ++i)
+                    lhs = std::make_unique<DereferenceNode>(std::move(lhs), currentFunction);
+                expr = std::make_unique<BinaryOpNode>(compoundToBinary(assignTok), std::move(lhs), std::move(rhs));
+            }
             eat(TOKEN_SEMICOLON);
             return std::make_unique<AssignmentNode>(identifier, std::move(expr), dereferenceLevel, std::vector<std::unique_ptr<ASTNode>>(), idToken.line, idToken.col); // true for dereference
         }
@@ -4395,7 +4969,22 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 if (currentToken.type == TOKEN_ASSIGN)
                 {
                     eat(TOKEN_ASSIGN);
-                    auto expr = condition(currentFunction);
+                    auto expr = assignmentExpression(currentFunction);
+                    eat(TOKEN_SEMICOLON);
+                    return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::move(indices), idToken.line, idToken.col);
+                }
+                else if (isCompoundAssign(currentToken.type))
+                {
+                    TokenType assignTok = currentToken.type;
+                    eat(assignTok);
+                    auto rhs = assignmentExpression(currentFunction);
+
+                    std::vector<std::unique_ptr<ASTNode>> lhsIndices;
+                    for (const auto& idx : indices)
+                        lhsIndices.push_back(cloneExpr(idx.get(), currentFunction));
+
+                    auto lhs = std::make_unique<ArrayAccessNode>(identifier, std::move(lhsIndices), currentFunction, idToken.line, idToken.col);
+                    auto expr = std::make_unique<BinaryOpNode>(compoundToBinary(assignTok), std::move(lhs), std::move(rhs));
                     eat(TOKEN_SEMICOLON);
                     return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::move(indices), idToken.line, idToken.col);
                 }
@@ -4412,6 +5001,13 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             {
                 // Parse the function call
                 auto stmt = functionCall(identifier, idToken.line, idToken.col, currentFunction);
+                while (currentToken.type == TOKEN_LBRACKET)
+                {
+                    eat(TOKEN_LBRACKET);
+                    auto idx = condition(currentFunction);
+                    eat(TOKEN_RBRACKET);
+                    stmt = std::make_unique<PostfixIndexNode>(std::move(stmt), std::move(idx), idToken.line, idToken.col);
+                }
                 eat(TOKEN_SEMICOLON);
                 return stmt;
             }
@@ -4420,7 +5016,17 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             if (currentToken.type == TOKEN_ASSIGN)
             {
                 eat(TOKEN_ASSIGN);
-                auto expr = condition(currentFunction); // Parse the right-hand side
+                auto expr = assignmentExpression(currentFunction); // Parse the right-hand side
+                eat(TOKEN_SEMICOLON);
+                return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::vector<std::unique_ptr<ASTNode>>(), idToken.line, idToken.col);
+            }
+            else if (isCompoundAssign(currentToken.type))
+            {
+                TokenType assignTok = currentToken.type;
+                eat(assignTok);
+                auto rhs = assignmentExpression(currentFunction);
+                auto lhs = std::make_unique<IdentifierNode>(identifier, idToken.line, idToken.col, currentFunction);
+                auto expr = std::make_unique<BinaryOpNode>(compoundToBinary(assignTok), std::move(lhs), std::move(rhs));
                 eat(TOKEN_SEMICOLON);
                 return std::make_unique<AssignmentNode>(identifier, std::move(expr), 0, std::vector<std::unique_ptr<ASTNode>>(), idToken.line, idToken.col);
             }
@@ -4598,9 +5204,10 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             }
             else
             {
-                auto stmt = statement(currentFunction);
-                if (stmt)
-                    body.push_back(std::move(stmt));
+                auto exprStmt = condition(currentFunction);
+                eat(TOKEN_SEMICOLON);
+                if (exprStmt)
+                    body.push_back(std::move(exprStmt));
             }
     
             return std::make_unique<WhileLoopNode>(std::move(cond), std::move(body), currentFunction->name);
@@ -4667,8 +5274,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             std::unique_ptr<ASTNode> iteration = nullptr;
             if (currentToken.type != TOKEN_RPAREN)
             {
-                // Parse the iteration as a statement (e.g., i++)
-                iteration = statement(currentFunction); // Parse the iteration statement
+                iteration = condition(currentFunction);
             }
             eat(TOKEN_RPAREN); // Consume the closing parenthesis
 
@@ -4708,6 +5314,16 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             return std::make_unique<ReturnNode>(std::move(expr), currentFunction, returnToken.line, returnToken.col);
         }
 
+        // Generic expression statement (e.g. (a>b)?foo():bar(); )
+        else if (token.type == TOKEN_LPAREN || token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL ||
+                 token.type == TOKEN_CHAR_LITERAL || token.type == TOKEN_STRING_LITERAL || token.type == TOKEN_NOT ||
+                 token.type == TOKEN_SIZEOF || token.type == TOKEN_ADD || token.type == TOKEN_SUB || token.type == TOKEN_AND)
+        {
+            auto expr = condition(currentFunction);
+            eat(TOKEN_SEMICOLON);
+            return expr;
+        }
+
         reportError(token.line, token.col, "Unexpected token in statement " + token.value);
         // try to synchronize
         currentToken = lexer.nextToken();
@@ -4727,7 +5343,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 elements.push_back(parseInitializerList());
             } else {
                 // single expression value
-                std::unique_ptr<ASTNode> val = condition();
+                std::unique_ptr<ASTNode> val = assignmentExpression();
                 elements.emplace_back(std::move(val));
             }
             if (currentToken.type == TOKEN_COMMA) {
@@ -4817,6 +5433,13 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             else if (currentToken.type == TOKEN_INT) returnType = TOKEN_INT;
             eat(currentToken.type);
         }
+
+        int returnPtrLevel = 0;
+        while (currentToken.type == TOKEN_MUL)
+        {
+            eat(TOKEN_MUL);
+            returnPtrLevel++;
+        }
         
         // Parse the function/variable name
         Token nameToken = currentToken;
@@ -4826,13 +5449,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         // If the next token is not '(', we treat this as a global variable
         if (currentToken.type != TOKEN_LPAREN)
         {
-            // parse optional pointer stars
-            int ptrLevel = 0;
-            while (currentToken.type == TOKEN_MUL)
-            {
-                eat(TOKEN_MUL);
-                ptrLevel++;
-            }
+            int ptrLevel = returnPtrLevel;
             // parse dimensions (same rules as locals)
             std::vector<size_t> dimensions;
             while (currentToken.type == TOKEN_LBRACKET)
@@ -5021,13 +5638,13 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         if (currentToken.type == TOKEN_SEMICOLON)
         {
             // create node with empty body and return
-            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,0,returnUns), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, true, nameToken.line, nameToken.col);
+            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,returnPtrLevel,returnUns), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, true, nameToken.line, nameToken.col);
             eat(TOKEN_SEMICOLON);
             return functionNode;
         }
 
         // Create the FunctionNode; body will be filled in below
-        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,0,returnUns), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, false, nameToken.line, nameToken.col);
+        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType,returnPtrLevel,returnUns), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, false, nameToken.line, nameToken.col);
 
         if (isExternal)
         {
@@ -5066,7 +5683,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         std::vector<std::unique_ptr<ASTNode>> arguments;
         while (currentToken.type != TOKEN_RPAREN)
         {
-            arguments.push_back(condition(currentFunction));
+            arguments.push_back(assignmentExpression(currentFunction));
             if (currentToken.type == TOKEN_COMMA)
             {
                 eat(TOKEN_COMMA);
@@ -5327,9 +5944,12 @@ static std::pair<int,int> bestEffortNodeLocation(const ASTNode* node)
     if (auto id = dynamic_cast<const IdentifierNode*>(node)) return {id->line, id->col};
     if (auto call = dynamic_cast<const FunctionCallNode*>(node)) return {call->line, call->col};
     if (auto aa = dynamic_cast<const ArrayAccessNode*>(node)) return {aa->line, aa->col};
+    if (auto pi = dynamic_cast<const PostfixIndexNode*>(node)) return {pi->line, pi->col};
     if (auto asg = dynamic_cast<const AssignmentNode*>(node)) return {asg->line, asg->col};
+    if (auto iasg = dynamic_cast<const IndirectAssignmentNode*>(node)) return {iasg->line, iasg->col};
     if (auto un = dynamic_cast<const UnaryOpNode*>(node)) return {un->line, un->col};
     if (auto ln = dynamic_cast<const LogicalNotNode*>(node)) return {ln->line, ln->col};
+    if (auto tn = dynamic_cast<const TernaryNode*>(node)) return {tn->line, tn->col};
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node)) return bestEffortNodeLocation(bin->left.get());
     if (auto ret = dynamic_cast<const ReturnNode*>(node)) return bestEffortNodeLocation(ret->expression.get());
     return {0,0};
@@ -5444,7 +6064,7 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     }
     if (auto ao = dynamic_cast<const AddressOfNode*>(node))
     {
-        auto lookupResult = lookupVariable(ao->Identifier);
+        auto lookupResult = lookupInScopes(scopes, ao->Identifier);
         Type bt = {Type::INT,0};
         if (lookupResult.first) bt = lookupResult.second.type;
         else if (globalVariables.count(ao->Identifier)) bt = globalVariables[ao->Identifier];
@@ -5466,6 +6086,61 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     {
         return {Type::INT,0};
     }
+    if (auto lor = dynamic_cast<const LogicalOrNode*>(node))
+    {
+        computeExprType(lor->left.get(), scopes, currentFunction);
+        computeExprType(lor->right.get(), scopes, currentFunction);
+        return {Type::INT,0};
+    }
+    if (auto land = dynamic_cast<const LogicalAndNode*>(node))
+    {
+        computeExprType(land->left.get(), scopes, currentFunction);
+        computeExprType(land->right.get(), scopes, currentFunction);
+        return {Type::INT,0};
+    }
+    if (auto tn = dynamic_cast<const TernaryNode*>(node))
+    {
+        Type tt = computeExprType(tn->trueExpr.get(), scopes, currentFunction);
+        Type ft = computeExprType(tn->falseExpr.get(), scopes, currentFunction);
+
+        auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT||t.base==Type::CHAR||t.base==Type::SHORT||t.base==Type::LONG); };
+        auto isFloatLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::FLOAT||t.base==Type::DOUBLE); };
+        auto isNumeric = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
+
+        if (isNumeric(tt) && isNumeric(ft))
+        {
+            if (tt.base == Type::DOUBLE || ft.base == Type::DOUBLE)
+                return {Type::DOUBLE,0};
+            if (tt.base == Type::FLOAT || ft.base == Type::FLOAT)
+                return {Type::FLOAT,0};
+            return {Type::INT,0};
+        }
+
+        if (tt == ft)
+            return tt;
+        if (typesCompatible(tt, ft))
+            return tt;
+        if (typesCompatible(ft, tt))
+            return ft;
+        return {Type::INT,0};
+    }
+    if (auto asg = dynamic_cast<const AssignmentNode*>(node))
+    {
+        return getLValueType(asg, scopes);
+    }
+    if (auto iasg = dynamic_cast<const IndirectAssignmentNode*>(node))
+    {
+        Type pt = computeExprType(iasg->pointerExpr.get(), scopes, currentFunction);
+        Type vt = {Type::INT,0};
+        if (pt.pointerLevel > 0)
+        {
+            vt = pt;
+            vt.pointerLevel--;
+        }
+        if (auto mutableIasg = dynamic_cast<IndirectAssignmentNode*>(const_cast<ASTNode*>(node)))
+            mutableIasg->valueType = vt;
+        return vt;
+    }
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
     {
         // compute operand types recursively first
@@ -5481,7 +6156,14 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
         auto isFloatLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::FLOAT||t.base==Type::DOUBLE); };
         auto isNumeric = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
         Type result;
-        if (isNumeric(lt) && isNumeric(rt)) {
+        if (bin->op == ",") {
+            result = rt;
+        }
+        else if (bin->op == "<" || bin->op == ">" || bin->op == "<=" || bin->op == ">=" ||
+                 bin->op == "==" || bin->op == "!=") {
+            result = {Type::INT,0};
+        }
+        else if (isNumeric(lt) && isNumeric(rt)) {
             // arithmetic promotion: double > float > int
             if (lt.base == Type::DOUBLE || rt.base == Type::DOUBLE)
                 result = {Type::DOUBLE,0};
@@ -5526,12 +6208,43 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
         if (baseType.pointerLevel>0) baseType.pointerLevel--;
         return baseType;
     }
+    if (auto pi = dynamic_cast<const PostfixIndexNode*>(node))
+    {
+        Type bt = computeExprType(pi->baseExpr.get(), scopes, currentFunction);
+        Type rt = bt;
+        if (rt.pointerLevel > 0)
+            rt.pointerLevel--;
+        else
+            rt = {Type::INT,0};
+
+        if (auto mpi = dynamic_cast<PostfixIndexNode*>(const_cast<ASTNode*>(node)))
+        {
+            mpi->baseType = bt;
+            mpi->resultType = rt;
+        }
+        return rt;
+    }
     return {Type::INT,0};
 }
 
 static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std::string, VarInfo>> &scopes, const FunctionNode* currentFunction)
 {
     if (!node) return;
+
+    if (auto lor = dynamic_cast<const LogicalOrNode*>(node))
+    {
+        semanticCheckExpression(lor->left.get(), scopes, currentFunction);
+        semanticCheckExpression(lor->right.get(), scopes, currentFunction);
+        return;
+    }
+
+    if (auto land = dynamic_cast<const LogicalAndNode*>(node))
+    {
+        semanticCheckExpression(land->left.get(), scopes, currentFunction);
+        semanticCheckExpression(land->right.get(), scopes, currentFunction);
+        return;
+    }
+
     // Identifier usage
     if (auto idn = dynamic_cast<const IdentifierNode*>(node))
     {
@@ -5556,6 +6269,8 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
     {
         semanticCheckExpression(bin->left.get(), scopes, currentFunction);
         semanticCheckExpression(bin->right.get(), scopes, currentFunction);
+        if (bin->op == ",")
+            return;
         // compute types of the operands (and populate the node fields via computeExprType)
         computeExprType(bin, scopes, currentFunction);
         Type lt = computeExprType(bin->left.get(), scopes, currentFunction);
@@ -5572,7 +6287,7 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             }
             // numeric combinations are fine regardless of base
         }
-        else if (bin->op == "+" || bin->op == "-" || bin->op == "*" || bin->op == "/" ||
+        else if (bin->op == "+" || bin->op == "-" || bin->op == "*" || bin->op == "/" || bin->op == "%" ||
                  bin->op == "&" || bin->op == "|" || bin->op == "^" || bin->op == "<<" || bin->op == ">>")
         {
             // arithmetic: integer or float; pointer arithmetic only + or - with integer
@@ -5616,6 +6331,72 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         if (!scalar)
         {
             reportError(ln->line, ln->col, "Operator '!' requires a scalar operand");
+            hadError = true;
+        }
+        return;
+    }
+
+    if (auto tn = dynamic_cast<const TernaryNode*>(node))
+    {
+        semanticCheckExpression(tn->conditionExpr.get(), scopes, currentFunction);
+        semanticCheckExpression(tn->trueExpr.get(), scopes, currentFunction);
+        semanticCheckExpression(tn->falseExpr.get(), scopes, currentFunction);
+
+        Type ct = computeExprType(tn->conditionExpr.get(), scopes, currentFunction);
+        bool condScalar = (ct.pointerLevel > 0) ||
+                          (ct.pointerLevel == 0 && (ct.base == Type::INT || ct.base == Type::CHAR || ct.base == Type::SHORT || ct.base == Type::LONG || ct.base == Type::FLOAT || ct.base == Type::DOUBLE));
+        if (!condScalar)
+        {
+            reportError(tn->line, tn->col, "Ternary condition must be a scalar expression");
+            hadError = true;
+        }
+
+        Type tt = computeExprType(tn->trueExpr.get(), scopes, currentFunction);
+        Type ft = computeExprType(tn->falseExpr.get(), scopes, currentFunction);
+        if (!typesCompatible(tt, ft) && !typesCompatible(ft, tt))
+        {
+            reportError(tn->line, tn->col, "Incompatible types in ternary branches");
+            hadError = true;
+        }
+        return;
+    }
+
+    if (auto asg = dynamic_cast<const AssignmentNode*>(node))
+    {
+        semanticCheckExpression(asg->expression.get(), scopes, currentFunction);
+        Type lhs = getLValueType(asg, scopes);
+        Type rhs = computeExprType(asg->expression.get(), scopes, currentFunction);
+        if (!typesCompatible(lhs, rhs))
+        {
+            reportError(asg->line, asg->col,
+                        "Type mismatch in assignment: cannot assign '" + rhs.toString() + "' to '" + lhs.toString() + "'");
+            hadError = true;
+        }
+        return;
+    }
+
+    if (auto iasg = dynamic_cast<const IndirectAssignmentNode*>(node))
+    {
+        semanticCheckExpression(iasg->pointerExpr.get(), scopes, currentFunction);
+        semanticCheckExpression(iasg->expression.get(), scopes, currentFunction);
+
+        Type pt = computeExprType(iasg->pointerExpr.get(), scopes, currentFunction);
+        if (pt.pointerLevel == 0)
+        {
+            reportError(iasg->line, iasg->col, "Left side of indirect assignment must be a pointer");
+            hadError = true;
+            return;
+        }
+
+        Type lhs = pt;
+        lhs.pointerLevel--;
+        if (auto mut = const_cast<IndirectAssignmentNode*>(iasg))
+            mut->valueType = lhs;
+        Type rhs = computeExprType(iasg->expression.get(), scopes, currentFunction);
+        if (!typesCompatible(lhs, rhs))
+        {
+            reportError(iasg->line, iasg->col,
+                        "Type mismatch in assignment: cannot assign '" + rhs.toString() + "' to '" + lhs.toString() + "'");
             hadError = true;
         }
         return;
@@ -5682,6 +6463,29 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             hadError = true;
         }
         for (const auto& idx : aa->indices) semanticCheckExpression(idx.get(), scopes, currentFunction);
+        return;
+    }
+
+    if (auto pi = dynamic_cast<const PostfixIndexNode*>(node))
+    {
+        semanticCheckExpression(pi->baseExpr.get(), scopes, currentFunction);
+        semanticCheckExpression(pi->indexExpr.get(), scopes, currentFunction);
+
+        Type bt = computeExprType(pi->baseExpr.get(), scopes, currentFunction);
+        if (bt.pointerLevel == 0)
+        {
+            reportError(pi->line, pi->col, "Subscripted value is not an array or pointer");
+            hadError = true;
+        }
+
+        Type it = computeExprType(pi->indexExpr.get(), scopes, currentFunction);
+        bool indexIntLike = (it.pointerLevel == 0) &&
+                            (it.base == Type::INT || it.base == Type::CHAR || it.base == Type::SHORT || it.base == Type::LONG);
+        if (!indexIntLike)
+        {
+            reportError(pi->line, pi->col, "Array subscript must have integer type");
+            hadError = true;
+        }
         return;
     }
 }
