@@ -1,1 +1,3 @@
 *.c linguist-vendored
+Makefile linguist-vendored
+*.asm linguist-vendored
