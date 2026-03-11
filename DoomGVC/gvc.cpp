@@ -23,7 +23,7 @@
 
 // Type system used for static checking
 struct Type {
-    enum Base { INT, CHAR, VOID, SHORT, LONG, FLOAT, DOUBLE } base;
+    enum Base { INT, CHAR, VOID, SHORT, LONG, LONG_LONG, FLOAT, DOUBLE } base;
     int pointerLevel = 0; // number of '*' qualifiers
     bool isUnsigned = false; // type qualifier
 
@@ -43,6 +43,7 @@ struct Type {
             case VOID: s += "void"; break;
             case SHORT: s += "short"; break;
             case LONG:  s += "long"; break;
+            case LONG_LONG: s += "long long"; break;
             case FLOAT: s += "float"; break;
             case DOUBLE: s += "double"; break;
         }
@@ -58,6 +59,7 @@ struct Type {
 //   short   - 2 bytes
 //   int     - 4 bytes
 //   long    - 8 bytes
+//   long long - 8 bytes
 //   float   - 4 bytes
 //   double  - 8 bytes
 //   void    - treated as 1 byte (for sizeof and pointer arithmetic)
@@ -73,11 +75,106 @@ static size_t sizeOfType(const Type &t)
         case Type::SHORT:  return 2;
         case Type::INT:    return 4;
         case Type::LONG:   return 8;
+        case Type::LONG_LONG: return 8;
         case Type::FLOAT:  return 4;
         case Type::DOUBLE: return 8;
         case Type::VOID:   return 1; // sizeof(void) is not used in C but we pick 1
         default:           return 8;
     }
+}
+
+static bool isIntegerScalarType(const Type &t)
+{
+    return t.pointerLevel == 0 &&
+           (t.base == Type::CHAR || t.base == Type::SHORT || t.base == Type::INT ||
+            t.base == Type::LONG || t.base == Type::LONG_LONG);
+}
+
+static bool isFloatScalarType(const Type &t)
+{
+    return t.pointerLevel == 0 && (t.base == Type::FLOAT || t.base == Type::DOUBLE);
+}
+
+static int integerConversionRank(Type::Base b)
+{
+    switch (b)
+    {
+        case Type::CHAR: return 1;
+        case Type::SHORT: return 2;
+        case Type::INT: return 3;
+        case Type::LONG: return 4;
+        case Type::LONG_LONG: return 5;
+        default: return 0;
+    }
+}
+
+static Type promoteIntegerType(Type t)
+{
+    if (!isIntegerScalarType(t))
+        return t;
+
+    if (t.base == Type::CHAR || t.base == Type::SHORT)
+    {
+        t.base = Type::INT;
+        t.isUnsigned = false;
+    }
+    return t;
+}
+
+static Type usualArithmeticConversion(Type lhs, Type rhs)
+{
+    if (isFloatScalarType(lhs) || isFloatScalarType(rhs))
+    {
+        if (lhs.base == Type::DOUBLE || rhs.base == Type::DOUBLE)
+            return {Type::DOUBLE, 0};
+        return {Type::FLOAT, 0};
+    }
+
+    if (!isIntegerScalarType(lhs) || !isIntegerScalarType(rhs))
+        return lhs;
+
+    lhs = promoteIntegerType(lhs);
+    rhs = promoteIntegerType(rhs);
+
+    int lhsRank = integerConversionRank(lhs.base);
+    int rhsRank = integerConversionRank(rhs.base);
+
+    if (lhs.isUnsigned == rhs.isUnsigned)
+        return (lhsRank >= rhsRank) ? lhs : rhs;
+
+    Type u = lhs.isUnsigned ? lhs : rhs;
+    Type s = lhs.isUnsigned ? rhs : lhs;
+    int uRank = integerConversionRank(u.base);
+    int sRank = integerConversionRank(s.base);
+
+    if (uRank >= sRank)
+        return u;
+
+    if (sizeOfType(s) > sizeOfType(u))
+        return s;
+
+    Type su = s;
+    su.isUnsigned = true;
+    return su;
+}
+
+static std::string loadScalarToRaxInstruction(const Type &t, const std::string &addressExpr)
+{
+    if (t.pointerLevel > 0 || t.base == Type::DOUBLE || t.base == Type::LONG || t.base == Type::LONG_LONG)
+        return "\tmov rax, " + addressExpr;
+    if (t.base == Type::FLOAT || (t.base == Type::INT && t.isUnsigned))
+        return "\tmov eax, dword " + addressExpr;
+    if (t.base == Type::INT)
+        return "\tmovsxd rax, dword " + addressExpr;
+    if (t.base == Type::SHORT && t.isUnsigned)
+        return "\tmovzx eax, word " + addressExpr;
+    if (t.base == Type::SHORT)
+        return "\tmovsx rax, word " + addressExpr;
+    if (t.base == Type::CHAR && t.isUnsigned)
+        return "\tmovzx eax, byte " + addressExpr;
+    if (t.base == Type::CHAR)
+        return "\tmovsx rax, byte " + addressExpr;
+    return "\tmov rax, " + addressExpr;
 }
 
 // size of the element pointed to by a pointer type
@@ -172,6 +269,7 @@ enum TokenType
     TOKEN_ASSIGN,
     TOKEN_SHORT,
     TOKEN_LONG,
+    TOKEN_LONG_LONG,
     TOKEN_FLOAT,
     TOKEN_DOUBLE,
     TOKEN_UNSIGNED,
@@ -200,6 +298,8 @@ enum TokenType
     TOKEN_DO,
     TOKEN_WHILE,
     TOKEN_FOR,
+    TOKEN_BREAK,
+    TOKEN_CONTINUE,
     TOKEN_EQ,
     TOKEN_NE,
     TOKEN_LT,
@@ -266,6 +366,7 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_SIZEOF: return "sizeof";
         case TOKEN_SHORT: return "short";
         case TOKEN_LONG: return "long";
+        case TOKEN_LONG_LONG: return "long long";
         case TOKEN_FLOAT: return "float";
         case TOKEN_DOUBLE: return "double";
         case TOKEN_UNSIGNED: return "unsigned";
@@ -274,6 +375,8 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_DO: return "do";
         case TOKEN_WHILE: return "while";
         case TOKEN_FOR: return "for";
+        case TOKEN_BREAK: return "break";
+        case TOKEN_CONTINUE: return "continue";
         case TOKEN_EQ: return "==";
         case TOKEN_NE: return "!=";
         case TOKEN_LT: return "<";
@@ -309,6 +412,7 @@ Type makeType(TokenType tok, int ptrLevel = 0, bool isUnsigned = false)
         case TOKEN_VOID:  t.base = Type::VOID; break;
         case TOKEN_SHORT: t.base = Type::SHORT; break;
         case TOKEN_LONG:  t.base = Type::LONG; break;
+        case TOKEN_LONG_LONG: t.base = Type::LONG_LONG; break;
         case TOKEN_FLOAT: t.base = Type::FLOAT; break;
         case TOKEN_DOUBLE:t.base = Type::DOUBLE; break;
         case TOKEN_INT:   t.base = Type::INT;  break;
@@ -363,15 +467,7 @@ void emitDeferredPostfixOps(std::ofstream& f)
             std::string uniqueName = info.uniqueName;
             size_t index = info.index; // byte offset
             size_t varSize = sizeOfType(info.type);
-            std::string instruction;
-            if (varSize == 1)
-                instruction = "\tmovsx rax, byte [rbp - " + std::to_string(index) + "]";
-            else if (varSize == 2)
-                instruction = "\tmovsx rax, word [rbp - " + std::to_string(index) + "]";
-            else if (varSize == 4)
-                instruction = "\tmovsxd rax, dword [rbp - " + std::to_string(index) + "]";
-            else
-                instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
+            std::string instruction = loadScalarToRaxInstruction(info.type, "[rbp - " + std::to_string(index) + "]");
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " for deferred postfix" << std::endl;
             if (deferredOp.op == "++")
             {
@@ -399,14 +495,8 @@ void emitDeferredPostfixOps(std::ofstream& f)
             if (it != globalVariables.end())
                 globalType = it->second;
             size_t varSize = sizeOfType(globalType);
-            if (varSize == 1)
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
-            else if (varSize == 2)
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
-            else if (varSize == 4)
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
-            else
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << deferredOp.varName << "]" << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
+            std::string instruction = loadScalarToRaxInstruction(globalType, "[" + deferredOp.varName + "]");
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << deferredOp.varName << " for deferred postfix" << std::endl;
             if (deferredOp.op == "++")
             {
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Deferred increment" << std::endl;
@@ -671,14 +761,14 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
                 if (peek() == '+' || peek() == '-') num += advance();
                 while (isdigit(peek())) num += advance();
             }
-            if (peek() == 'f' || peek() == 'F' || peek() == 'l' || peek() == 'L') {
-                isFloat = true;
-                advance();
-            }
-            if (isFloat)
+            if (isFloat) {
+                if (peek() == 'f' || peek() == 'F' || peek() == 'l' || peek() == 'L')
+                    advance();
                 return Token{ TOKEN_FLOAT_LITERAL, num, tokenLine, tokenCol };
-            else
-                return Token{ TOKEN_NUMBER, num, tokenLine, tokenCol };
+            }
+            while (peek() == 'u' || peek() == 'U' || peek() == 'l' || peek() == 'L')
+                advance();
+            return Token{ TOKEN_NUMBER, num, tokenLine, tokenCol };
         }
 
         else if (isalpha(ch) || ch == '_')
@@ -701,6 +791,8 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             if (ident == "do")      return Token{ TOKEN_DO    , ident, tokenLine, tokenCol };
             if (ident == "while")   return Token{ TOKEN_WHILE , ident, tokenLine, tokenCol };
             if (ident == "return")  return Token{ TOKEN_RETURN, ident, tokenLine, tokenCol };
+            if (ident == "break")   return Token{ TOKEN_BREAK, ident, tokenLine, tokenCol };
+            if (ident == "continue")return Token{ TOKEN_CONTINUE, ident, tokenLine, tokenCol };
             if (ident == "extern")  return Token{ TOKEN_EXTERN, ident, tokenLine, tokenCol };
             if (ident == "sizeof")  return Token{ TOKEN_SIZEOF, ident, tokenLine, tokenCol };
             return Token{ TOKEN_IDENTIFIER, ident, tokenLine, tokenCol };
@@ -1110,6 +1202,8 @@ struct StatementListNode : ASTNode
 };
 
 static size_t labelCounter = 0; // Global counter for generating unique labels
+// Stack of active loops: {continueTargetLabel, breakTargetLabel}
+static std::vector<std::pair<std::string, std::string>> loopControlStack;
 
 struct LogicalOrNode : ASTNode
 {
@@ -1369,7 +1463,7 @@ struct FunctionCallNode : ASTNode
             if (sigIt != functionParamTypes.end() && i < sigIt->second.size())
                 expected = sigIt->second[i];
             // only convert non-pointer arithmetic types
-            auto isNum = [&](const Type &tt){ return tt.pointerLevel==0 && (tt.base==Type::INT||tt.base==Type::FLOAT||tt.base==Type::DOUBLE||tt.base==Type::CHAR||tt.base==Type::SHORT||tt.base==Type::LONG); };
+            auto isNum = [&](const Type &tt){ return isIntegerScalarType(tt) || isFloatScalarType(tt); };
             if (isNum(actual) && isNum(expected) && !(actual==expected)) {
                 // convert rax from actual to expected
                 if (expected.base == Type::FLOAT) {
@@ -1765,7 +1859,7 @@ struct DeclarationNode : ASTNode
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; prepare for float->double" << std::endl;
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd xmm0, xmm0" << ";; float->double" << std::endl;
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
-                    } else if (itype.base == Type::INT || itype.base == Type::CHAR) {
+                    } else if (isIntegerScalarType(itype)) {
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm0, rax" << ";; int->double" << std::endl;
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
                     }
@@ -1775,7 +1869,7 @@ struct DeclarationNode : ASTNode
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; prepare for double->float" << std::endl;
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << ";; double->float" << std::endl;
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << ";; move float bits into eax" << std::endl;
-                    } else if (itype.base == Type::INT || itype.base == Type::CHAR) {
+                    } else if (isIntegerScalarType(itype)) {
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm0, rax" << ";; int->float" << std::endl;
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << ";; move float bits into eax" << std::endl;
                     }
@@ -2741,7 +2835,7 @@ struct AssignmentNode : ASTNode
                                 f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; prepare float->double conv" << std::endl;
                                 f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtss2sd xmm0, xmm0" << std::endl;
                                 f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
-                            } else if (exprType.base == Type::INT || exprType.base == Type::CHAR) {
+                            } else if (isIntegerScalarType(exprType)) {
                                 f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm0, rax" << std::endl;
                                 f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
                             }
@@ -2754,7 +2848,7 @@ struct AssignmentNode : ASTNode
                                 f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << std::endl;
                             } else if (exprType.base == Type::FLOAT) {
                                 f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << std::endl;
-                            } else if (exprType.base == Type::INT || exprType.base == Type::CHAR) {
+                            } else if (isIntegerScalarType(exprType)) {
                                 f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm0, rax" << std::endl;
                             }
                         }
@@ -2991,12 +3085,16 @@ struct WhileLoopNode : ASTNode
     {
         size_t loopStartLabel = labelCounter++;
         size_t loopEndLabel = labelCounter++;
-        f << std::endl << functionName << ".loop_start_" << loopStartLabel << ":" << std::endl;
+        std::string fullStartLabel = functionName + ".loop_start_" + std::to_string(loopStartLabel);
+        std::string fullEndLabel = functionName + ".loop_end_" + std::to_string(loopEndLabel);
+        f << std::endl << fullStartLabel << ":" << std::endl;
         condition->emitCode(f); // Evaluate the condition
         
-        std::string instruction = "\tje " + functionName + ".loop_end_" + std::to_string(loopEndLabel);
+        std::string instruction = "\tje " + fullEndLabel;
         f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare condition result with 0" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
+
+        loopControlStack.push_back({fullStartLabel, fullEndLabel});
 
         // Emit the loop body (with its own scope)
         scopes.push({});
@@ -3005,10 +3103,11 @@ struct WhileLoopNode : ASTNode
             stmt->emitCode(f);
         }
         scopes.pop();
+        loopControlStack.pop_back();
         
-        instruction = "\tjmp " + functionName + ".loop_start_" + std::to_string(loopStartLabel);
+        instruction = "\tjmp " + fullStartLabel;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump back to start of loop" << std::endl;
-        f << std::endl << functionName << ".loop_end_" << loopEndLabel << ":" << std::endl;
+        f << std::endl << fullEndLabel << ":" << std::endl;
     }
 
     size_t getArraySpaceNeeded() const override
@@ -3038,19 +3137,28 @@ struct DoWhileLoopNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         size_t loopStartLabel = labelCounter++;
+        size_t loopCondLabel = labelCounter++;
         size_t loopEndLabel = labelCounter++;
-        f << std::endl << functionName << ".do_loop_start_" << loopStartLabel << ":" << std::endl;
+        std::string fullStartLabel = functionName + ".do_loop_start_" + std::to_string(loopStartLabel);
+        std::string fullCondLabel = functionName + ".do_loop_cond_" + std::to_string(loopCondLabel);
+        std::string fullEndLabel = functionName + ".do_loop_end_" + std::to_string(loopEndLabel);
+        f << std::endl << fullStartLabel << ":" << std::endl;
+
+        loopControlStack.push_back({fullCondLabel, fullEndLabel});
 
         scopes.push({});
         for (const auto& stmt : body)
             stmt->emitCode(f);
         scopes.pop();
+        loopControlStack.pop_back();
+
+        f << std::endl << fullCondLabel << ":" << std::endl;
 
         condition->emitCode(f);
         f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare condition result with 0" << std::endl;
-        std::string instruction = "\tjne " + functionName + ".do_loop_start_" + std::to_string(loopStartLabel);
+        std::string instruction = "\tjne " + fullStartLabel;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump back to start if condition is true" << std::endl;
-        f << std::endl << functionName << ".do_loop_end_" << loopEndLabel << ":" << std::endl;
+        f << std::endl << fullEndLabel << ":" << std::endl;
     }
 
     size_t getArraySpaceNeeded() const override
@@ -3092,10 +3200,12 @@ struct ForLoopNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         size_t loopStartLabel = labelCounter++;
+        size_t loopContinueLabel = labelCounter++;
         size_t loopEndLabel = labelCounter++;
 
         // Fully qualified label names
         std::string fullStartLabel = functionName + ".loop_start_" + std::to_string(loopStartLabel);
+        std::string fullContinueLabel = functionName + ".loop_continue_" + std::to_string(loopContinueLabel);
         std::string fullEndLabel = functionName + ".loop_end_" + std::to_string(loopEndLabel);
 
         // Create a loop scope for loop variables
@@ -3115,10 +3225,16 @@ struct ForLoopNode : ASTNode
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
         }
 
+        loopControlStack.push_back({fullContinueLabel, fullEndLabel});
+
         for (const auto& stmt : body)
         {
             stmt->emitCode(f); // e.g., print("%d, ", i)
         }
+
+        loopControlStack.pop_back();
+
+        f << std::endl << fullContinueLabel << ":" << std::endl;
 
         if (iteration)
         {
@@ -3142,6 +3258,50 @@ struct ForLoopNode : ASTNode
         for (const auto& stmt : body)
             total += stmt->getArraySpaceNeeded();
         return total;
+    }
+};
+
+struct BreakNode : ASTNode
+{
+    int line = 0;
+    int col = 0;
+
+    BreakNode(int l = 0, int c = 0) : line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override {}
+
+    void emitCode(std::ofstream& f) const override
+    {
+        if (loopControlStack.empty())
+        {
+            reportError(line, col, "'break' used outside of loop");
+            hadError = true;
+            return;
+        }
+        const std::string& breakLabel = loopControlStack.back().second;
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + breakLabel) << ";; break" << std::endl;
+    }
+};
+
+struct ContinueNode : ASTNode
+{
+    int line = 0;
+    int col = 0;
+
+    ContinueNode(int l = 0, int c = 0) : line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override {}
+
+    void emitCode(std::ofstream& f) const override
+    {
+        if (loopControlStack.empty())
+        {
+            reportError(line, col, "'continue' used outside of loop");
+            hadError = true;
+            return;
+        }
+        const std::string& continueLabel = loopControlStack.back().first;
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + continueLabel) << ";; continue" << std::endl;
     }
 };
 
@@ -3322,6 +3482,11 @@ struct BinaryOpNode : ASTNode
         auto rightPtr = rightType.pointerLevel > 0;
         auto leftInt = !leftPtr;
         auto rightInt = !rightPtr;
+        Type integerOpType = usualArithmeticConversion(leftType, rightType);
+        bool useUnsignedIntOp = isIntegerScalarType(integerOpType) && integerOpType.isUnsigned;
+        bool useUnsignedCompare = useUnsignedIntOp || leftPtr || rightPtr;
+        Type promotedLeft = promoteIntegerType(leftType);
+        bool shiftRightUnsigned = isIntegerScalarType(promotedLeft) && promotedLeft.isUnsigned;
 
         if (op == "+")
 	    {
@@ -3410,7 +3575,10 @@ struct BinaryOpNode : ASTNode
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, rcx" << ";; Preserve left operand" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov cl, al" << ";; Load shift count (right operand low 8 bits)" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rdx" << ";; Move left operand into rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tshr rax, cl" << ";; Perform SHR on left by right" << std::endl;
+            if (shiftRightUnsigned)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tshr rax, cl" << ";; Perform logical SHR on left by right" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsar rax, cl" << ";; Perform arithmetic SHR on left by right" << std::endl;
         }
 
         else if (op == "*")
@@ -3421,21 +3589,37 @@ struct BinaryOpNode : ASTNode
         else if (op == "/")
     	{
             // operands are currently: rcx = left, rax = right
-            // signed division expects dividend in rax and divisor as operand.
+            // division expects dividend in rax and divisor as operand.
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rbx, rax" << ";; Save right operand (divisor)" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Move left operand (dividend) into rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tcqo" << ";; Sign-extend rax into rdx" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rbx" << ";; Divide rdx:rax by rbx" << std::endl;
+            if (useUnsignedIntOp)
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\txor edx, edx" << ";; Zero high dividend for unsigned division" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tdiv rbx" << ";; Unsigned divide rdx:rax by rbx" << std::endl;
+            }
+            else
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tcqo" << ";; Sign-extend rax into rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rbx" << ";; Signed divide rdx:rax by rbx" << std::endl;
+            }
         }
 
         else if (op == "%")
     	{
             // operands are currently: rcx = left, rax = right
-            // signed modulo: remainder is left in rdx after idiv.
+            // modulo: remainder is left in rdx after div or idiv.
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rbx, rax" << ";; Save right operand (divisor)" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Move left operand (dividend) into rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tcqo" << ";; Sign-extend rax into rdx" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rbx" << ";; Divide rdx:rax by rbx" << std::endl;
+            if (useUnsignedIntOp)
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\txor edx, edx" << ";; Zero high dividend for unsigned modulo" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tdiv rbx" << ";; Unsigned divide rdx:rax by rbx" << std::endl;
+            }
+            else
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tcqo" << ";; Sign-extend rax into rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tidiv rbx" << ";; Signed divide rdx:rax by rbx" << std::endl;
+            }
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rdx" << ";; Move remainder into rax" << std::endl;
         }
 
@@ -3456,28 +3640,40 @@ struct BinaryOpNode : ASTNode
         else if (op == "<")
     	{
             f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetl al" << ";; Set al to 1 if less, else 0" << std::endl;
+            if (useUnsignedCompare)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetb al" << ";; Set al to 1 if unsigned less, else 0" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetl al" << ";; Set al to 1 if signed less, else 0" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == ">")
     	{
             f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetg al" << ";; Set al to 1 if greater, else 0" << std::endl;
+            if (useUnsignedCompare)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tseta al" << ";; Set al to 1 if unsigned greater, else 0" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetg al" << ";; Set al to 1 if signed greater, else 0" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == "<=")
     	{
             f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetle al" << ";; Set al to 1 if less or equal, else 0" << std::endl;
+            if (useUnsignedCompare)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetbe al" << ";; Set al to 1 if unsigned less or equal, else 0" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetle al" << ";; Set al to 1 if signed less or equal, else 0" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
 
         else if (op == ">=")
     	{
             f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rcx, rax" << ";; Compare rcx and rax" << std::endl;
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetge al" << ";; Set al to 1 if greater or equal, else 0" << std::endl;
+            if (useUnsignedCompare)
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetae al" << ";; Set al to 1 if unsigned greater or equal, else 0" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsetge al" << ";; Set al to 1 if signed greater or equal, else 0" << std::endl;
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx rax, al" << ";; Zero-extend al to rax" << std::endl;
         }
     }
@@ -3542,15 +3738,7 @@ struct UnaryOpNode : ASTNode
                 std::string uniqueName = infoD.uniqueName;
                 size_t offset = infoD.index;
                 size_t varSize = sizeOfType(infoD.type);
-                std::string instruction;
-                if (varSize == 1)
-                    instruction = "\tmovsx rax, byte [rbp - " + std::to_string(offset) + "]";
-                else if (varSize == 2)
-                    instruction = "\tmovsx rax, word [rbp - " + std::to_string(offset) + "]";
-                else if (varSize == 4)
-                    instruction = "\tmovsxd rax, dword [rbp - " + std::to_string(offset) + "]";
-                else
-                    instruction = "\tmov rax, [rbp - " + std::to_string(offset) + "]";
+                std::string instruction = loadScalarToRaxInstruction(infoD.type, "[rbp - " + std::to_string(offset) + "]");
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax" << std::endl;
                 if (op == "++")
                 {
@@ -3578,14 +3766,8 @@ struct UnaryOpNode : ASTNode
                 if (it != globalVariables.end())
                     globalType = it->second;
                 size_t varSize = sizeOfType(globalType);
-                if (varSize == 1)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
-                else if (varSize == 2)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
-                else if (varSize == 4)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
-                else
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << name << "]" << ";; Load " << name << " into rax" << std::endl;
+                std::string instruction = loadScalarToRaxInstruction(globalType, "[" + name + "]");
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << name << " into rax" << std::endl;
                 if (op == "++")
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Increment" << std::endl;
@@ -3615,15 +3797,7 @@ struct UnaryOpNode : ASTNode
                 size_t offset = info.index;
                 // Load the current value and save it
                 size_t varSize = sizeOfType(info.type);
-                std::string instruction;
-                if (varSize == 1)
-                    instruction = "\tmovsx rax, byte [rbp - " + std::to_string(offset) + "]";
-                else if (varSize == 2)
-                    instruction = "\tmovsx rax, word [rbp - " + std::to_string(offset) + "]";
-                else if (varSize == 4)
-                    instruction = "\tmovsxd rax, dword [rbp - " + std::to_string(offset) + "]";
-                else
-                    instruction = "\tmov rax, [rbp - " + std::to_string(offset) + "]";
+                std::string instruction = loadScalarToRaxInstruction(info.type, "[rbp - " + std::to_string(offset) + "]");
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax (postfix value)" << std::endl;
                 // Don't apply the operation yet - defer it for later
                 deferredPostfixOps.push_back({op, name});
@@ -3636,14 +3810,8 @@ struct UnaryOpNode : ASTNode
                 if (it != globalVariables.end())
                     globalType = it->second;
                 size_t varSize = sizeOfType(globalType);
-                if (varSize == 1)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
-                else if (varSize == 2)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, word [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
-                else if (varSize == 4)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsxd rax, dword [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
-                else
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << name << "]" << ";; Load " << name << " into rax (postfix value)" << std::endl;
+                std::string instruction = loadScalarToRaxInstruction(globalType, "[" + name + "]");
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << name << " into rax (postfix value)" << std::endl;
                 deferredPostfixOps.push_back({op, name});
             }
         }
@@ -3666,9 +3834,9 @@ struct UnaryOpNode : ASTNode
 
 struct NumberNode : ASTNode
 {
-    int value;
+    long long value;
 
-    NumberNode(int value) : value(value) {}
+    NumberNode(long long value) : value(value) {}
 
     void emitData(std::ofstream& f) const override {}
     void emitCode(std::ofstream& f) const override
@@ -3678,7 +3846,7 @@ struct NumberNode : ASTNode
     }
 
     bool isConstant() const override { return true; }
-    int getConstantValue() const override { return value; }
+    int getConstantValue() const override { return static_cast<int>(value); }
 };
 
 // floating-point literal (parsed as double)
@@ -4183,6 +4351,99 @@ class Parser
         }
     }
 
+    bool isTypeSpecifierToken(TokenType t) const
+    {
+        return t == TOKEN_INT || t == TOKEN_CHAR || t == TOKEN_VOID || t == TOKEN_SHORT ||
+               t == TOKEN_LONG || t == TOKEN_FLOAT || t == TOKEN_DOUBLE ||
+               t == TOKEN_UNSIGNED || t == TOKEN_SIGNED;
+    }
+
+    TokenType parseTypeSpecifiers(bool &isUnsignedOut)
+    {
+        bool sawUnsigned = false;
+        bool sawSigned = false;
+        bool sawShort = false;
+        int longCount = 0;
+        bool sawInt = false;
+        bool sawChar = false;
+        bool sawVoid = false;
+        bool sawFloat = false;
+        bool sawDouble = false;
+
+        while (isTypeSpecifierToken(currentToken.type))
+        {
+            if (currentToken.type == TOKEN_UNSIGNED) sawUnsigned = true;
+            else if (currentToken.type == TOKEN_SIGNED) sawSigned = true;
+            else if (currentToken.type == TOKEN_SHORT) sawShort = true;
+            else if (currentToken.type == TOKEN_LONG) longCount++;
+            else if (currentToken.type == TOKEN_INT) sawInt = true;
+            else if (currentToken.type == TOKEN_CHAR) sawChar = true;
+            else if (currentToken.type == TOKEN_VOID) sawVoid = true;
+            else if (currentToken.type == TOKEN_FLOAT) sawFloat = true;
+            else if (currentToken.type == TOKEN_DOUBLE) sawDouble = true;
+            eat(currentToken.type);
+        }
+
+        if (sawUnsigned && sawSigned)
+        {
+            reportError(currentToken.line, currentToken.col, "Type cannot be both signed and unsigned");
+            hadError = true;
+            sawSigned = false;
+        }
+
+        TokenType baseTok = TOKEN_INT;
+        bool integerLike = true;
+
+        if (sawFloat || sawDouble)
+        {
+            integerLike = false;
+            if (sawFloat)
+                baseTok = TOKEN_FLOAT;
+            else if (longCount > 0)
+            {
+                reportError(currentToken.line, currentToken.col, "long double is not supported yet");
+                hadError = true;
+                baseTok = TOKEN_DOUBLE;
+            }
+            else
+                baseTok = TOKEN_DOUBLE;
+        }
+        else if (sawVoid)
+        {
+            integerLike = false;
+            baseTok = TOKEN_VOID;
+        }
+        else if (sawChar)
+        {
+            baseTok = TOKEN_CHAR;
+        }
+        else if (sawShort)
+        {
+            baseTok = TOKEN_SHORT;
+        }
+        else if (longCount >= 2)
+        {
+            baseTok = TOKEN_LONG_LONG;
+        }
+        else if (longCount == 1)
+        {
+            baseTok = TOKEN_LONG;
+        }
+        else if (sawInt || sawUnsigned || sawSigned)
+        {
+            baseTok = TOKEN_INT;
+        }
+
+        if ((sawFloat || sawDouble || sawVoid) && (sawUnsigned || sawSigned || sawShort || longCount > 0 || sawChar))
+        {
+            reportError(currentToken.line, currentToken.col, "Invalid type specifier combination");
+            hadError = true;
+        }
+
+        isUnsignedOut = integerLike && sawUnsigned;
+        return baseTok;
+    }
+
     /********************************************************************
      *      ______        _____  _______  ____   _____     __  __       *
      *     |  ____|/\    / ____||__   __|/ __ \ |  __ \   / /  \ \      *
@@ -4240,26 +4501,11 @@ class Parser
             {
                 eat(TOKEN_LPAREN);
                 // attempt to parse a type-name sequence as for declarations
+                bool sawType = isTypeSpecifierToken(currentToken.type);
                 TokenType tt = TOKEN_INT;
-                bool sawType = false;
                 bool sawUnsigned = false;
-                while (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR ||
-                       currentToken.type == TOKEN_VOID || currentToken.type == TOKEN_SHORT ||
-                       currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT ||
-                       currentToken.type == TOKEN_DOUBLE || currentToken.type == TOKEN_UNSIGNED ||
-                       currentToken.type == TOKEN_SIGNED)
-                {
-                    sawType = true;
-                    if (currentToken.type == TOKEN_UNSIGNED) sawUnsigned = true;
-                    else if (currentToken.type == TOKEN_SHORT) tt = TOKEN_SHORT;
-                    else if (currentToken.type == TOKEN_LONG) tt = TOKEN_LONG;
-                    else if (currentToken.type == TOKEN_FLOAT) tt = TOKEN_FLOAT;
-                    else if (currentToken.type == TOKEN_DOUBLE) tt = TOKEN_DOUBLE;
-                    else if (currentToken.type == TOKEN_CHAR) tt = TOKEN_CHAR;
-                    else if (currentToken.type == TOKEN_VOID) tt = TOKEN_VOID;
-                    else if (currentToken.type == TOKEN_INT) tt = TOKEN_INT;
-                    eat(currentToken.type);
-                }
+                if (sawType)
+                    tt = parseTypeSpecifiers(sawUnsigned);
                 if (sawType)
                 {
                     int ptrLevel = 0;
@@ -4294,7 +4540,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         {
             if (token.type == TOKEN_NUMBER) {
                 eat(TOKEN_NUMBER);
-                return std::make_unique<NumberNode>(std::stoi(token.value));
+                return std::make_unique<NumberNode>(std::stoll(token.value));
             } else {
                 eat(TOKEN_FLOAT_LITERAL);
                 return std::make_unique<FloatLiteralNode>(std::stod(token.value));
@@ -4752,22 +4998,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             token.type == TOKEN_DOUBLE || token.type == TOKEN_UNSIGNED || token.type == TOKEN_SIGNED)
         {
             // consume sequence of type specifiers (signed/unsigned, short, long, etc.)
-            TokenType typeTok = TOKEN_INT;
             bool seenUnsigned = false;
-            while (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
-                   currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT ||
-                   currentToken.type == TOKEN_DOUBLE || currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED)
-            {
-                if (currentToken.type == TOKEN_UNSIGNED) seenUnsigned = true;
-                else if (currentToken.type == TOKEN_SHORT) typeTok = TOKEN_SHORT;
-                else if (currentToken.type == TOKEN_LONG) typeTok = TOKEN_LONG;
-                else if (currentToken.type == TOKEN_FLOAT) typeTok = TOKEN_FLOAT;
-                else if (currentToken.type == TOKEN_DOUBLE) typeTok = TOKEN_DOUBLE;
-                else if (currentToken.type == TOKEN_CHAR) typeTok = TOKEN_CHAR;
-                else if (currentToken.type == TOKEN_VOID) typeTok = TOKEN_VOID;
-                else if (currentToken.type == TOKEN_INT) typeTok = TOKEN_INT;
-                eat(currentToken.type);
-            }
+            TokenType typeTok = parseTypeSpecifiers(seenUnsigned);
             bool isUns = seenUnsigned;
             std::vector<std::unique_ptr<ASTNode>> declNodes;
 
@@ -5204,10 +5436,22 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             }
             else
             {
-                auto exprStmt = condition(currentFunction);
-                eat(TOKEN_SEMICOLON);
-                if (exprStmt)
-                    body.push_back(std::move(exprStmt));
+                if (currentToken.type == TOKEN_BREAK || currentToken.type == TOKEN_CONTINUE ||
+                    currentToken.type == TOKEN_IF || currentToken.type == TOKEN_WHILE ||
+                    currentToken.type == TOKEN_DO || currentToken.type == TOKEN_FOR ||
+                    currentToken.type == TOKEN_RETURN || currentToken.type == TOKEN_LBRACE)
+                {
+                    auto stmt = statement(currentFunction);
+                    if (stmt)
+                        body.push_back(std::move(stmt));
+                }
+                else
+                {
+                    auto exprStmt = condition(currentFunction);
+                    eat(TOKEN_SEMICOLON);
+                    if (exprStmt)
+                        body.push_back(std::move(exprStmt));
+                }
             }
     
             return std::make_unique<WhileLoopNode>(std::move(cond), std::move(body), currentFunction->name);
@@ -5314,6 +5558,22 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             return std::make_unique<ReturnNode>(std::move(expr), currentFunction, returnToken.line, returnToken.col);
         }
 
+        else if (token.type == TOKEN_BREAK)
+        {
+            Token breakToken = token;
+            eat(TOKEN_BREAK);
+            eat(TOKEN_SEMICOLON);
+            return std::make_unique<BreakNode>(breakToken.line, breakToken.col);
+        }
+
+        else if (token.type == TOKEN_CONTINUE)
+        {
+            Token continueToken = token;
+            eat(TOKEN_CONTINUE);
+            eat(TOKEN_SEMICOLON);
+            return std::make_unique<ContinueNode>(continueToken.line, continueToken.col);
+        }
+
         // Generic expression statement (e.g. (a>b)?foo():bar(); )
         else if (token.type == TOKEN_LPAREN || token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL ||
                  token.type == TOKEN_CHAR_LITERAL || token.type == TOKEN_STRING_LITERAL || token.type == TOKEN_NOT ||
@@ -5417,22 +5677,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         }
 
         // Parse the return type (int, char, void, etc.)
-        TokenType returnType = TOKEN_INT;
         bool returnUns = false;
-        while (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
-               currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT ||
-               currentToken.type == TOKEN_DOUBLE || currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED)
-        {
-            if (currentToken.type == TOKEN_UNSIGNED) returnUns = true;
-            else if (currentToken.type == TOKEN_SHORT) returnType = TOKEN_SHORT;
-            else if (currentToken.type == TOKEN_LONG) returnType = TOKEN_LONG;
-            else if (currentToken.type == TOKEN_FLOAT) returnType = TOKEN_FLOAT;
-            else if (currentToken.type == TOKEN_DOUBLE) returnType = TOKEN_DOUBLE;
-            else if (currentToken.type == TOKEN_CHAR) returnType = TOKEN_CHAR;
-            else if (currentToken.type == TOKEN_VOID) returnType = TOKEN_VOID;
-            else if (currentToken.type == TOKEN_INT) returnType = TOKEN_INT;
-            eat(currentToken.type);
-        }
+        TokenType returnType = parseTypeSpecifiers(returnUns);
 
         int returnPtrLevel = 0;
         while (currentToken.type == TOKEN_MUL)
@@ -5558,22 +5804,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 break;
             }
             // Parse the parameter type (allow extended integer/float keywords)
-            TokenType paramType = TOKEN_INT;
             bool paramUns = false;
-            while (currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
-                   currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT ||
-                   currentToken.type == TOKEN_DOUBLE || currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED)
-            {
-                if (currentToken.type == TOKEN_UNSIGNED) paramUns = true;
-                else if (currentToken.type == TOKEN_SHORT) paramType = TOKEN_SHORT;
-                else if (currentToken.type == TOKEN_LONG) paramType = TOKEN_LONG;
-                else if (currentToken.type == TOKEN_FLOAT) paramType = TOKEN_FLOAT;
-                else if (currentToken.type == TOKEN_DOUBLE) paramType = TOKEN_DOUBLE;
-                else if (currentToken.type == TOKEN_CHAR) paramType = TOKEN_CHAR;
-                else if (currentToken.type == TOKEN_VOID) paramType = TOKEN_VOID;
-                else if (currentToken.type == TOKEN_INT) paramType = TOKEN_INT;
-                eat(currentToken.type);
-            }
+            TokenType paramType = parseTypeSpecifiers(paramUns);
             int ptrLevel = 0;
             while (currentToken.type == TOKEN_MUL)
             {
@@ -5964,12 +6196,8 @@ static std::pair<int,int> bestEffortNodeLocation(const ASTNode* node)
 static bool typesCompatible(const Type& dest, const Type& src)
 {
     if (dest == src) return true;
-    auto isIntLike = [&](const Type& t){
-        return t.pointerLevel == 0 && (t.base == Type::INT || t.base == Type::CHAR || t.base == Type::SHORT || t.base == Type::LONG);
-    };
-    auto isFloatLike = [&](const Type& t){
-        return t.pointerLevel == 0 && (t.base == Type::FLOAT || t.base == Type::DOUBLE);
-    };
+    auto isIntLike = [&](const Type& t){ return isIntegerScalarType(t); };
+    auto isFloatLike = [&](const Type& t){ return isFloatScalarType(t); };
     auto isArithmetic = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
 
     if (isArithmetic(dest) && isArithmetic(src))
@@ -6047,7 +6275,11 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
             return {Type::INT,0};
         return {Type::INT,0};
     }
-    if (dynamic_cast<const NumberNode*>(node)) return {Type::INT,0};
+    if (auto nn = dynamic_cast<const NumberNode*>(node)) {
+        if (nn->value < -2147483648LL || nn->value > 2147483647LL)
+            return {Type::LONG_LONG,0};
+        return {Type::INT,0};
+    }
     if (dynamic_cast<const FloatLiteralNode*>(node)) return {Type::DOUBLE,0};
     if (dynamic_cast<const CharLiteralNode*>(node)) return {Type::CHAR,0};
     if (dynamic_cast<const StringLiteralNode*>(node)) { Type t; t.base=Type::CHAR; t.pointerLevel=1; return t; }
@@ -6103,17 +6335,13 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
         Type tt = computeExprType(tn->trueExpr.get(), scopes, currentFunction);
         Type ft = computeExprType(tn->falseExpr.get(), scopes, currentFunction);
 
-        auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT||t.base==Type::CHAR||t.base==Type::SHORT||t.base==Type::LONG); };
-        auto isFloatLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::FLOAT||t.base==Type::DOUBLE); };
+        auto isIntLike = [&](const Type& t){ return isIntegerScalarType(t); };
+        auto isFloatLike = [&](const Type& t){ return isFloatScalarType(t); };
         auto isNumeric = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
 
         if (isNumeric(tt) && isNumeric(ft))
         {
-            if (tt.base == Type::DOUBLE || ft.base == Type::DOUBLE)
-                return {Type::DOUBLE,0};
-            if (tt.base == Type::FLOAT || ft.base == Type::FLOAT)
-                return {Type::FLOAT,0};
-            return {Type::INT,0};
+            return usualArithmeticConversion(tt, ft);
         }
 
         if (tt == ft)
@@ -6152,8 +6380,8 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
             mutableBin->rightType = rt;
         }
 
-        auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT||t.base==Type::CHAR||t.base==Type::SHORT||t.base==Type::LONG); };
-        auto isFloatLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::FLOAT||t.base==Type::DOUBLE); };
+        auto isIntLike = [&](const Type& t){ return isIntegerScalarType(t); };
+        auto isFloatLike = [&](const Type& t){ return isFloatScalarType(t); };
         auto isNumeric = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
         Type result;
         if (bin->op == ",") {
@@ -6164,13 +6392,7 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
             result = {Type::INT,0};
         }
         else if (isNumeric(lt) && isNumeric(rt)) {
-            // arithmetic promotion: double > float > int
-            if (lt.base == Type::DOUBLE || rt.base == Type::DOUBLE)
-                result = {Type::DOUBLE,0};
-            else if (lt.base == Type::FLOAT || rt.base == Type::FLOAT)
-                result = {Type::FLOAT,0};
-            else
-                result = {Type::INT,0};
+            result = usualArithmeticConversion(lt, rt);
         }
         else if (lt.pointerLevel>0 && rt.pointerLevel>0 && bin->op=="-") {
             // pointer - pointer => integer (difference in elements)
@@ -6291,8 +6513,8 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
                  bin->op == "&" || bin->op == "|" || bin->op == "^" || bin->op == "<<" || bin->op == ">>")
         {
             // arithmetic: integer or float; pointer arithmetic only + or - with integer
-            auto isIntLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::INT || t.base==Type::CHAR || t.base==Type::SHORT || t.base==Type::LONG); };
-            auto isFloatLike = [&](const Type& t){ return t.pointerLevel==0 && (t.base==Type::FLOAT || t.base==Type::DOUBLE); };
+            auto isIntLike = [&](const Type& t){ return isIntegerScalarType(t); };
+            auto isFloatLike = [&](const Type& t){ return isFloatScalarType(t); };
             auto isNumeric = [&](const Type& t){ return isIntLike(t) || isFloatLike(t); };
             if (!( (isNumeric(lt) && isNumeric(rt)) ||
                    (lt.pointerLevel>0 && isIntLike(rt) && (bin->op=="+"||bin->op=="-")) ||
@@ -6327,7 +6549,7 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         semanticCheckExpression(ln->operand.get(), scopes, currentFunction);
         Type t = computeExprType(ln->operand.get(), scopes, currentFunction);
         bool scalar = (t.pointerLevel > 0) ||
-                      (t.pointerLevel == 0 && (t.base == Type::INT || t.base == Type::CHAR || t.base == Type::SHORT || t.base == Type::LONG || t.base == Type::FLOAT || t.base == Type::DOUBLE));
+                      (t.pointerLevel == 0 && (isIntegerScalarType(t) || isFloatScalarType(t)));
         if (!scalar)
         {
             reportError(ln->line, ln->col, "Operator '!' requires a scalar operand");
@@ -6344,7 +6566,7 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
 
         Type ct = computeExprType(tn->conditionExpr.get(), scopes, currentFunction);
         bool condScalar = (ct.pointerLevel > 0) ||
-                          (ct.pointerLevel == 0 && (ct.base == Type::INT || ct.base == Type::CHAR || ct.base == Type::SHORT || ct.base == Type::LONG || ct.base == Type::FLOAT || ct.base == Type::DOUBLE));
+                          (ct.pointerLevel == 0 && (isIntegerScalarType(ct) || isFloatScalarType(ct)));
         if (!condScalar)
         {
             reportError(tn->line, tn->col, "Ternary condition must be a scalar expression");
@@ -6480,7 +6702,7 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
 
         Type it = computeExprType(pi->indexExpr.get(), scopes, currentFunction);
         bool indexIntLike = (it.pointerLevel == 0) &&
-                            (it.base == Type::INT || it.base == Type::CHAR || it.base == Type::SHORT || it.base == Type::LONG);
+                            isIntegerScalarType(it);
         if (!indexIntLike)
         {
             reportError(pi->line, pi->col, "Array subscript must have integer type");
@@ -6493,6 +6715,28 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
 static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, VarInfo>> &scopes, const FunctionNode* currentFunction)
 {
     if (!node) return;
+
+    static int semanticLoopDepth = 0;
+
+    if (auto br = dynamic_cast<const BreakNode*>(node))
+    {
+        if (semanticLoopDepth == 0)
+        {
+            reportError(br->line, br->col, "'break' statement not within a loop");
+            hadError = true;
+        }
+        return;
+    }
+
+    if (auto cont = dynamic_cast<const ContinueNode*>(node))
+    {
+        if (semanticLoopDepth == 0)
+        {
+            reportError(cont->line, cont->col, "'continue' statement not within a loop");
+            hadError = true;
+        }
+        return;
+    }
 
     if (auto declc = dynamic_cast<const DeclarationNode*>(node))
     {
@@ -6590,7 +6834,9 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
         if (forn->initialization) semanticCheckStatement(forn->initialization.get(), scopes, currentFunction);
         if (forn->condition) semanticCheckExpression(forn->condition.get(), scopes, currentFunction);
         if (forn->iteration) semanticCheckStatement(forn->iteration.get(), scopes, currentFunction);
+        semanticLoopDepth++;
         for (const auto& stmt : forn->body) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+        semanticLoopDepth--;
         scopes.pop();
         return;
     }
@@ -6599,7 +6845,9 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
     {
         semanticCheckExpression(whilen->condition.get(), scopes, currentFunction);
         scopes.push({});
+        semanticLoopDepth++;
         for (const auto& stmt : whilen->body) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+        semanticLoopDepth--;
         scopes.pop();
         return;
     }
@@ -6607,7 +6855,9 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
     if (auto dwn = dynamic_cast<const DoWhileLoopNode*>(node))
     {
         scopes.push({});
+        semanticLoopDepth++;
         for (const auto& stmt : dwn->body) semanticCheckStatement(stmt.get(), scopes, currentFunction);
+        semanticLoopDepth--;
         scopes.pop();
         semanticCheckExpression(dwn->condition.get(), scopes, currentFunction);
         return;
