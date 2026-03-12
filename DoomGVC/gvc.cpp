@@ -292,6 +292,16 @@ static std::unordered_map<std::string, int> globalEnumConstants;
 // Track which globals were declared with "extern" so we avoid emitting storage
 static std::set<std::string> externGlobals;
 
+// Assembly symbol used for global storage. Keep extern names unchanged so
+// they still link against external objects; mangle internal globals to avoid
+// collisions with assembler reserved words/register names (e.g. cx, dx).
+static std::string globalAsmSymbol(const std::string& name)
+{
+    if (externGlobals.find(name) != externGlobals.end())
+        return name;
+    return "__g_" + name;
+}
+
 // Function signature tables used during semantic checking
 static std::unordered_map<std::string, Type> functionReturnTypes;
 static std::unordered_map<std::string, std::vector<Type>> functionParamTypes;
@@ -617,7 +627,9 @@ void emitDeferredPostfixOps(std::ofstream& f)
             auto it = globalVariables.find(deferredOp.varName);
             if (it != globalVariables.end())
                 globalType = it->second;
-            emitIncDecAndStore(globalType, "[" + deferredOp.varName + "]", deferredOp.op, deferredOp.varName);
+            std::string globalSym = globalAsmSymbol(deferredOp.varName);
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global base address" << std::endl;
+            emitIncDecAndStore(globalType, "[rcx]", deferredOp.op, deferredOp.varName);
         }
     }
     deferredPostfixOps.clear();
@@ -2051,8 +2063,9 @@ struct GlobalDeclarationNode : ASTNode
         long value = 0;
         if (initializer && initializer->isConstant())
             value = initializer->getConstantValue();
-        
-        std::string string = "\t" + identifier + ": dq " + std::to_string(value); 
+
+        std::string globalSym = globalAsmSymbol(identifier);
+        std::string string = "\t" + globalSym + ": dq " + std::to_string(value);
         f << std::left << std::setw(COMMENT_COLUMN) << string << ";; Declaring global variable" << std::endl;
     }
 
@@ -2119,7 +2132,8 @@ struct AddressOfNode : ASTNode
         }
         else if (isGlobal)
         {
-            std::string instruction = "\tmov rax, " + Identifier;
+            std::string globalSym = globalAsmSymbol(Identifier);
+            std::string instruction = "\tlea rax, [" + globalSym + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of global variable " << Identifier << std::endl; 
         }
         else
@@ -2212,7 +2226,8 @@ struct ArrayDeclarationNode : ASTNode
             initializer->flattenLeaves(flat);
 
         // emit label and data
-        f << "\t" << identifier << ":" << std::endl;
+        std::string globalSym = globalAsmSymbol(identifier);
+        f << "\t" << globalSym << ":" << std::endl;
         if (!flat.empty())
         {
             f << "\t" << dataDirective << " ";
@@ -2443,7 +2458,9 @@ struct ArrayAccessNode : ASTNode
                 // Base expression is a pointer value stored in a variable.
                 if (isGlobal)
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [" + identifier + "]" << ";; Load pointer base" << std::endl;
+                    std::string globalSym = globalAsmSymbol(identifier);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rdx, [" + globalSym + "]" << ";; Load pointer slot address" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rdx]" << ";; Load pointer base" << std::endl;
                 }
                 else
                 {
@@ -2476,30 +2493,32 @@ struct ArrayAccessNode : ASTNode
 
                 if (isGlobal)
                 {
+                    std::string globalSym = globalAsmSymbol(identifier);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global base address" << std::endl;
                     if (elemSize == 1)
                     {
-                        std::string instruction = "\tmovsx rax, byte [" + identifier;
+                        std::string instruction = "\tmovsx rax, byte [rcx";
                         if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
                         instruction += "]";
                         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
                     }
                     else if (elemSize == 2)
                     {
-                        std::string instruction = "\tmovsx rax, word [" + identifier;
+                        std::string instruction = "\tmovsx rax, word [rcx";
                         if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
                         instruction += "]";
                         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
                     }
                     else if (elemSize == 4)
                     {
-                        std::string instruction = "\tmovsxd rax, dword [" + identifier;
+                        std::string instruction = "\tmovsxd rax, dword [rcx";
                         if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
                         instruction += "]";
                         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
                     }
                     else
                     {
-                        std::string instruction = "\tmov rax, [" + identifier;
+                        std::string instruction = "\tmov rax, [rcx";
                         if (totalOffset > 0) instruction += " + " + std::to_string(totalOffset);
                         instruction += "]";
                         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << "[";
@@ -2536,12 +2555,14 @@ struct ArrayAccessNode : ASTNode
                 indices[0]->emitCode(f); // rax = idx0
                 for (size_t i = 1; i < indices.size(); ++i)
                 {
-                    // save rax (current linear) in rcx
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; save linear so far" << std::endl;
+                    // Preserve the running linear index across child evaluation.
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; save linear so far" << std::endl;
                     indices[i]->emitCode(f); // rax = idx_i
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; keep current index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; restore linear so far" << std::endl;
                     size_t dimSize = (i < dims.size() ? dims[i] : 1);
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\timul rcx, " + std::to_string(dimSize) << ";; multiply by dimension size" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; add previous linear*dim" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, " + std::to_string(dimSize) << ";; linear *= dimension size" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; linear += current index" << std::endl;
                 }
             }
 
@@ -2555,7 +2576,11 @@ struct ArrayAccessNode : ASTNode
             if (pointerBase)
             {
                 if (isGlobal)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [" + identifier + "]" << ";; Load pointer base" << std::endl;
+                {
+                    std::string globalSym = globalAsmSymbol(identifier);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rdx, [" + globalSym + "]" << ";; Load pointer slot address" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rdx]" << ";; Load pointer base" << std::endl;
+                }
                 else if (baseIsStackParam)
                 {
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rbp + " + std::to_string(baseIndex + 16) + "]" << ";; Load pointer parameter base" << std::endl;
@@ -2575,7 +2600,9 @@ struct ArrayAccessNode : ASTNode
             else if (isGlobal)
             {
                 // global base is label
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, " + identifier << " ;; add base address" << std::endl;
+                std::string globalSym = globalAsmSymbol(identifier);
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << " ;; load base address" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << " ;; add base address" << std::endl;
                 if (elemSize == 1)
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
                 else if (elemSize == 2)
@@ -2742,7 +2769,9 @@ struct AssignmentNode : ASTNode
                 }
                 else
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [" << identifier << "]" << ";; Load global pointer " << identifier << std::endl;
+                    std::string globalSym = globalAsmSymbol(identifier);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rdx, [" << globalSym << "]" << ";; Load global pointer slot" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rdx]" << ";; Load global pointer " << identifier << std::endl;
                 }
                 for (int i = 1; i < dereferenceLevel; i++)
                 {
@@ -2847,7 +2876,9 @@ struct AssignmentNode : ASTNode
                 {
                     if (isGlobal)
                     {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [" + identifier + "]" << ";; Load pointer base" << std::endl;
+                        std::string globalSym = globalAsmSymbol(identifier);
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rdx, [" + globalSym + "]" << ";; Load pointer slot address" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rdx]" << ";; Load pointer base" << std::endl;
                     }
                     else
                     {
@@ -2871,16 +2902,16 @@ struct AssignmentNode : ASTNode
                 }
                 else if (isGlobal)
                 {
+                    std::string globalSym = globalAsmSymbol(identifier);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global base address" << std::endl;
                     std::string instr;
-                    if (elemSize == 1) instr = "\tmov byte [" + identifier;
-                    else if (elemSize == 2) instr = "\tmov word [" + identifier;
-                    else if (elemSize == 4) instr = "\tmov dword [" + identifier;
-                    else instr = "\tmov qword [" + identifier;
-                    if (offsetBytes > 0) instr += " + " + std::to_string(offsetBytes);
-                    if (elemSize == 1) instr += "], al";
-                    else if (elemSize == 2) instr += "], ax";
-                    else if (elemSize == 4) instr += "], eax";
-                    else instr += "], rax";
+                    std::string addr = "[rcx";
+                    if (offsetBytes > 0) addr += " + " + std::to_string(offsetBytes);
+                    addr += "]";
+                    if (elemSize == 1) instr = "\tmov byte " + addr + ", al";
+                    else if (elemSize == 2) instr = "\tmov word " + addr + ", ax";
+                    else if (elemSize == 4) instr = "\tmov dword " + addr + ", eax";
+                    else instr = "\tmov qword " + addr + ", rax";
                     f << std::left << std::setw(COMMENT_COLUMN) << instr << ";; Store global element" << std::endl;
                 }
                 else
@@ -2898,31 +2929,18 @@ struct AssignmentNode : ASTNode
             }
             else
             {
-                // dynamic computation (borrow from ArrayAccessNode)
-                for (size_t i = 0; i < indices.size(); ++i)
+                // Dynamic multidimensional indexing:
+                // linear = idx0; linear = linear * dim[i] + idxi
+                indices[0]->emitCode(f); // rax = idx0
+                for (size_t i = 1; i < indices.size(); ++i)
                 {
-                    indices[i]->emitCode(f);
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push index " << i << std::endl;
-                    if (i > 0)
-                    {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Pop current index" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Pop accumulated offset" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, rcx" << ";; Multiply by previous dimension" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push updated offset" << std::endl;
-                    }
-                }
-                if (indices.size() > 1)
-                {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Pop final index" << std::endl;
-                    for (size_t i = 1; i < indices.size(); ++i)
-                    {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Pop next index" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; Add to offset" << std::endl;
-                    }
-                }
-                else
-                {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Pop single index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; save linear so far" << std::endl;
+                    indices[i]->emitCode(f); // rax = idx_i
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; keep current index" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; restore linear so far" << std::endl;
+                    size_t dimSize = (i < dims.size() ? dims[i] : 1);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, " + std::to_string(dimSize) << ";; linear *= dimension size" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; linear += current index" << std::endl;
                 }
                 if (elemSize == 1) {
                     // nothing to do
@@ -2932,7 +2950,9 @@ struct AssignmentNode : ASTNode
                 }
                 if (isGlobal)
                 {
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, " + identifier << " ;; add base address" << std::endl;
+                    std::string globalSym = globalAsmSymbol(identifier);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << " ;; load base address" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << " ;; add base address" << std::endl;
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore value" << std::endl;
                     std::string instr;
                     if (elemSize == 1) instr = "\tmov byte [rax], cl";
@@ -2983,7 +3003,9 @@ struct AssignmentNode : ASTNode
             }
             else
             {
-                std::string instruction = "\tmov [" + identifier + "], rax";
+                std::string globalSym = globalAsmSymbol(identifier);
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global target address" << std::endl;
+                std::string instruction = "\tmov [rcx], rax";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in global variable " << identifier << std::endl;
             }
         }
@@ -3953,7 +3975,9 @@ struct UnaryOpNode : ASTNode
                 if (it != globalVariables.end())
                     globalType = it->second;
                 size_t varSize = sizeOfType(globalType);
-                std::string instruction = loadScalarToRaxInstruction(globalType, "[" + name + "]");
+                std::string globalSym = globalAsmSymbol(name);
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global slot address" << std::endl;
+                std::string instruction = loadScalarToRaxInstruction(globalType, "[rcx]");
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << name << " into rax" << std::endl;
                 bool isFloat = (globalType.pointerLevel == 0 && globalType.base == Type::FLOAT);
                 bool isDouble = (globalType.pointerLevel == 0 && globalType.base == Type::DOUBLE);
@@ -3995,17 +4019,17 @@ struct UnaryOpNode : ASTNode
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Decrement" << std::endl;
                 }
                 if (varSize == 1)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov byte [" << name << "], al" << ";; Store result back in " << name << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov byte [rcx], al" << ";; Store result back in " << name << std::endl;
                 else if (varSize == 2)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov word [" << name << "], ax" << ";; Store result back in " << name << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov word [rcx], ax" << ";; Store result back in " << name << std::endl;
                 else if (varSize == 4)
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov dword [" << name << "], eax" << ";; Store result back in " << name << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov dword [rcx], eax" << ";; Store result back in " << name << std::endl;
                 else
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [" << name << "], rax" << ";; Store result back in " << name << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rcx], rax" << ";; Store result back in " << name << std::endl;
 
                 // Prefix ++/-- yields the stored object value after conversion to its type.
                 // Reload to normalize narrow integers (e.g., unsigned char wraps to 0, not 256).
-                instruction = loadScalarToRaxInstruction(globalType, "[" + name + "]");
+                instruction = loadScalarToRaxInstruction(globalType, "[rcx]");
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Reload normalized prefix result" << std::endl;
             }
         }
@@ -4033,7 +4057,9 @@ struct UnaryOpNode : ASTNode
                 if (it != globalVariables.end())
                     globalType = it->second;
                 size_t varSize = sizeOfType(globalType);
-                std::string instruction = loadScalarToRaxInstruction(globalType, "[" + name + "]");
+                std::string globalSym = globalAsmSymbol(name);
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global slot address" << std::endl;
+                std::string instruction = loadScalarToRaxInstruction(globalType, "[rcx]");
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << name << " into rax (postfix value)" << std::endl;
                 deferredPostfixOps.push_back({op, name});
             }
@@ -4392,27 +4418,14 @@ struct IdentifierNode : ASTNode
             // The variable is global (in the .data section).  If it's an array we want
             // its base address; otherwise load the stored value.
             if (globalArrayDimensions.count(name)) {
-                std::string instruction = "\tmov rax, " + name;
+                std::string globalSym = globalAsmSymbol(name);
+                std::string instruction = "\tlea rax, [" + globalSym + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load address of global array " << name << std::endl;
             } else {
-                std::string instruction;
                 Type gt = globalVariables[name];
-                if (gt.pointerLevel > 0 || gt.base == Type::DOUBLE)
-                    instruction = "\tmov rax, [" + name + "]";
-                else if (gt.base == Type::FLOAT || (gt.base == Type::INT && gt.isUnsigned))
-                    instruction = "\tmov eax, dword [" + name + "]";
-                else if (gt.base == Type::INT)
-                    instruction = "\tmovsxd rax, dword [" + name + "]";
-                else if (gt.base == Type::SHORT && gt.isUnsigned)
-                    instruction = "\tmovzx eax, word [" + name + "]";
-                else if (gt.base == Type::SHORT)
-                    instruction = "\tmovsx rax, word [" + name + "]";
-                else if (gt.base == Type::CHAR && gt.isUnsigned)
-                    instruction = "\tmovzx eax, byte [" + name + "]";
-                else if (gt.base == Type::CHAR)
-                    instruction = "\tmovsx rax, byte [" + name + "]";
-                else
-                    instruction = "\tmov rax, [" + name + "]";
+                std::string globalSym = globalAsmSymbol(name);
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global slot address" << std::endl;
+                std::string instruction = loadScalarToRaxInstruction(gt, "[rcx]");
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load global variable " << name << std::endl;
             }
         }
@@ -5819,98 +5832,123 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 reportError(nameToken.line, nameToken.col, "Storage class 'auto' or 'register' is not valid at file scope");
                 hadError = true;
             }
-            int ptrLevel = returnPtrLevel;
-            // parse dimensions (same rules as locals)
-            std::vector<size_t> dimensions;
-            while (currentToken.type == TOKEN_LBRACKET)
+            auto parseGlobalDeclarator = [&](int ptrLevel, Token declaratorToken, const std::string& declaratorName) -> std::unique_ptr<ASTNode>
             {
-                eat(TOKEN_LBRACKET);
-                if (currentToken.type == TOKEN_NUMBER)
+                // parse dimensions (same rules as locals)
+                std::vector<size_t> dimensions;
+                while (currentToken.type == TOKEN_LBRACKET)
                 {
-                    dimensions.push_back(std::stoul(currentToken.value));
-                    eat(TOKEN_NUMBER);
-                }
-                else if (currentToken.type == TOKEN_RBRACKET)
-                {
-                    if (!dimensions.empty())
+                    eat(TOKEN_LBRACKET);
+                    if (currentToken.type == TOKEN_NUMBER)
                     {
-                        reportError(currentToken.line, currentToken.col,
-                                    "Only the first array dimension may be omitted");
-                        hadError = true;
+                        dimensions.push_back(std::stoul(currentToken.value));
+                        eat(TOKEN_NUMBER);
                     }
-                    dimensions.push_back(0);
-                }
-                else
-                {
-                    auto dimExpr = condition(nullptr);
-                    if (!dimExpr || !dimExpr->isConstant())
+                    else if (currentToken.type == TOKEN_RBRACKET)
                     {
-                        reportError(currentToken.line, currentToken.col,
-                                    "Expected constant array size or ']' after [ in global declaration");
-                        hadError = true;
-                        dimensions.push_back(1);
+                        if (!dimensions.empty())
+                        {
+                            reportError(currentToken.line, currentToken.col,
+                                        "Only the first array dimension may be omitted");
+                            hadError = true;
+                        }
+                        dimensions.push_back(0);
                     }
                     else
                     {
-                        int dimValue = dimExpr->getConstantValue();
-                        if (dimValue <= 0)
+                        auto dimExpr = condition(nullptr);
+                        if (!dimExpr || !dimExpr->isConstant())
                         {
                             reportError(currentToken.line, currentToken.col,
-                                        "Array size must be positive in global declaration");
+                                        "Expected constant array size or ']' after [ in global declaration");
                             hadError = true;
                             dimensions.push_back(1);
                         }
                         else
                         {
-                            dimensions.push_back(static_cast<size_t>(dimValue));
+                            int dimValue = dimExpr->getConstantValue();
+                            if (dimValue <= 0)
+                            {
+                                reportError(currentToken.line, currentToken.col,
+                                            "Array size must be positive in global declaration");
+                                hadError = true;
+                                dimensions.push_back(1);
+                            }
+                            else
+                            {
+                                dimensions.push_back(static_cast<size_t>(dimValue));
+                            }
                         }
                     }
+                    eat(TOKEN_RBRACKET);
                 }
-                eat(TOKEN_RBRACKET);
-            }
 
-            std::unique_ptr<ASTNode> init = nullptr;
-            std::unique_ptr<InitNode> arrayInit = nullptr;
-            bool charArrayToPointer = false;
-            if (currentToken.type == TOKEN_ASSIGN)
-            {
-                eat(TOKEN_ASSIGN);
-                // Same simplification for globals:
-                //   char s[] = "abc";  ==> global char* s = "abc";
-                if (!dimensions.empty() && returnType == TOKEN_CHAR && ptrLevel == 0 &&
-                    currentToken.type == TOKEN_STRING_LITERAL)
+                std::unique_ptr<ASTNode> init = nullptr;
+                std::unique_ptr<InitNode> arrayInit = nullptr;
+                bool charArrayToPointer = false;
+                if (currentToken.type == TOKEN_ASSIGN)
                 {
-                    charArrayToPointer = true;
-                    init = expression();
-                }
-                else
-                if (!dimensions.empty())
-                {
-                    if (currentToken.type == TOKEN_STRING_LITERAL && returnType == TOKEN_CHAR && ptrLevel == 0)
-                        arrayInit = std::make_unique<InitNode>(parseStringInitializerList());
+                    eat(TOKEN_ASSIGN);
+                    // Same simplification for globals:
+                    //   char s[] = "abc";  ==> global char* s = "abc";
+                    if (!dimensions.empty() && returnType == TOKEN_CHAR && ptrLevel == 0 &&
+                        currentToken.type == TOKEN_STRING_LITERAL)
+                    {
+                        charArrayToPointer = true;
+                        init = expression();
+                    }
+                    else if (!dimensions.empty())
+                    {
+                        if (currentToken.type == TOKEN_STRING_LITERAL && returnType == TOKEN_CHAR && ptrLevel == 0)
+                            arrayInit = std::make_unique<InitNode>(parseStringInitializerList());
+                        else
+                            arrayInit = std::make_unique<InitNode>(parseInitializerList());
+                    }
                     else
-                        arrayInit = std::make_unique<InitNode>(parseInitializerList());
+                    {
+                        init = expression();
+                    }
                 }
-                else
-                    init = expression();
-            }
-            eat(TOKEN_SEMICOLON);
-            if (dimensions.empty() || charArrayToPointer)
-            {
-                int globalPtrLevel = ptrLevel + (charArrayToPointer ? 1 : 0);
-                auto gd = std::make_unique<GlobalDeclarationNode>(name, makeType(returnType, globalPtrLevel, returnUns, returnConst), std::move(init), isExternal, nameToken.line, nameToken.col);
-                if (charArrayToPointer && gd->initializer)
-                    gd->knownObjectSize = gd->initializer->getKnownObjectSize();
-                return gd;
-            }
-            else
-            {
+
+                if (dimensions.empty() || charArrayToPointer)
+                {
+                    int globalPtrLevel = ptrLevel + (charArrayToPointer ? 1 : 0);
+                    auto gd = std::make_unique<GlobalDeclarationNode>(declaratorName, makeType(returnType, globalPtrLevel, returnUns, returnConst), std::move(init), isExternal, declaratorToken.line, declaratorToken.col);
+                    if (charArrayToPointer && gd->initializer)
+                        gd->knownObjectSize = gd->initializer->getKnownObjectSize();
+                    return gd;
+                }
+
                 // create a temporary ArrayDeclarationNode to hold dimension info, then wrap in GlobalDeclaration
-                auto arrType = makeType(returnType, ptrLevel+1, returnUns, returnConst);
-                auto arrDecl = std::make_unique<ArrayDeclarationNode>(name, arrType, std::move(dimensions), std::move(arrayInit), true, nameToken.line, nameToken.col);
+                auto arrType = makeType(returnType, ptrLevel + 1, returnUns, returnConst);
+                auto arrDecl = std::make_unique<ArrayDeclarationNode>(declaratorName, arrType, std::move(dimensions), std::move(arrayInit), true, declaratorToken.line, declaratorToken.col);
                 // general global handling will later pick up type and dims via semantic pass
                 return arrDecl;
+            };
+
+            std::vector<std::unique_ptr<ASTNode>> globalDecls;
+            globalDecls.push_back(parseGlobalDeclarator(returnPtrLevel, nameToken, name));
+
+            while (currentToken.type == TOKEN_COMMA)
+            {
+                eat(TOKEN_COMMA);
+                int declaratorPtrLevel = 0;
+                while (currentToken.type == TOKEN_MUL)
+                {
+                    eat(TOKEN_MUL);
+                    declaratorPtrLevel++;
+                }
+
+                Token declaratorToken = currentToken;
+                std::string declaratorName = currentToken.value;
+                eat(TOKEN_IDENTIFIER);
+                globalDecls.push_back(parseGlobalDeclarator(declaratorPtrLevel, declaratorToken, declaratorName));
             }
+
+            eat(TOKEN_SEMICOLON);
+            if (globalDecls.size() == 1)
+                return std::move(globalDecls[0]);
+            return std::make_unique<StatementListNode>(std::move(globalDecls));
         }
 
         if (returnAuto || returnRegister)
@@ -6188,15 +6226,17 @@ public:
                 currentToken.type == TOKEN_CONST || currentToken.type == TOKEN_AUTO || currentToken.type == TOKEN_REGISTER)
             {
                 auto node = function();
-                // if (auto gd = dynamic_cast<GlobalDeclarationNode*>(node.get()))
-                // {
-                //     std::cerr << "[debug] parsed global " << gd->identifier << "\n";
-                // }
-                // else if (auto fn = dynamic_cast<FunctionNode*>(node.get()))
-                // {
-                //     std::cerr << "[debug] parsed function " << fn->name << "\n";
-                // }
-                functions.push_back(std::move(node));
+                if (auto listNode = dynamic_cast<StatementListNode*>(node.get()))
+                {
+                    for (auto& item : listNode->statements)
+                    {
+                        functions.push_back(std::move(item));
+                    }
+                }
+                else
+                {
+                    functions.push_back(std::move(node));
+                }
             }
             else
             {
@@ -6479,7 +6519,10 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
         if (git != globalVariables.end()) {
             Type t = git->second;
             if (globalArrayDimensions.count(idn->name)) {
-                t.pointerLevel++;
+                // Array expression decay should happen once. Global array declarators
+                // are already represented as pointer-like types in this compiler.
+                if (t.pointerLevel == 0)
+                    t.pointerLevel++;
             }
             return t;
         }
