@@ -7436,17 +7436,184 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
 
 int main(int argc, char** argv)
 {
-    if (argc != 3)
+    auto printUsage = [&](const char* exe)
     {
-        std::cerr << "Wrong usage!" << std::endl << "Usage: " << argv[0] << " <input file> <output file>" << std::endl;
-        return -1;
+        std::cerr
+            << "Usage:\n"
+            << "  " << exe << " <input.c> <output-base>\n"
+            << "  " << exe << " [options] <input.c>\n\n"
+            << "Options:\n"
+            << "  -S              Compile only to assembly (.asm)\n"
+            << "  -c              Compile and assemble to object (.o)\n"
+            << "                  (without -S/-c, full pipeline to executable)\n"
+            << "  -o <path>       Output path.\n"
+            << "                  -S: asm path\n"
+            << "                  -c: object path\n"
+            << "                  link: executable path\n"
+            << "  --run           Run produced executable (link mode only)\n"
+            << "  --fasm <cmd>    Assembler command (default: fasm)\n"
+            << "  --cc <cmd>      Linker C compiler command (default: gcc)\n"
+            << "  -h, --help      Show this help\n";
+    };
+
+    auto shellQuote = [](const std::string& s) -> std::string
+    {
+        std::string out = "'";
+        for (char c : s)
+        {
+            if (c == '\'') out += "'\\''";
+            else out += c;
+        }
+        out += "'";
+        return out;
+    };
+
+    auto stripExtension = [](const std::string& path) -> std::string
+    {
+        size_t slash = path.find_last_of("/\\");
+        size_t dot = path.find_last_of('.');
+        if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+            return path.substr(0, dot);
+        return path;
+    };
+
+    // Backward-compatible mode: gvc <input file> <output base>
+    if (argc == 3 && argv[1][0] != '-')
+    {
+        sourceFileName = argv[1];
+        std::ifstream inFile(argv[1]);
+        if (!inFile.is_open())
+        {
+            std::cerr << "Error opening file: " << argv[1] << std::endl;
+            return -1;
+        }
+
+        std::stringstream buff;
+        buff << inFile.rdbuf();
+        std::string source = buff.str();
+        inFile.close();
+
+        Preprocessor preprocessor;
+        std::unordered_map<std::string, std::string> defines;
+        source = preprocessor.processCode(source, defines);
+
+        Lexer lexer(source);
+        Parser parser(lexer);
+        auto ast = parser.parse();
+        semanticPass(ast);
+
+        if (!compileErrors.empty())
+        {
+            std::cerr << "Compilation failed with " << compileErrors.size() << " error(s)\n";
+            return 1;
+        }
+
+        std::string asmFileName = std::string(argv[2]) + ".asm";
+        std::ofstream file(asmFileName);
+        if (!file.is_open())
+        {
+            std::cerr << "Error creating output assembly file!" << std::endl;
+            return -1;
+        }
+        generateCode(ast, file);
+        file.close();
+        return 0;
     }
 
-    sourceFileName = argv[1];
-    std::ifstream inFile(argv[1]);
-    if(!inFile.is_open())
+    bool flagS = false;
+    bool flagC = false;
+    bool flagRun = false;
+    std::string inputPath;
+    std::string outputPath;
+    std::string fasmCmd = "fasm";
+    std::string ccCmd = "gcc";
+
+    for (int i = 1; i < argc; ++i)
     {
-        std::cerr << "Error Opening file!" << std::endl;
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help")
+        {
+            printUsage(argv[0]);
+            return 0;
+        }
+        else if (arg == "-S")
+        {
+            flagS = true;
+        }
+        else if (arg == "-c")
+        {
+            flagC = true;
+        }
+        else if (arg == "--run")
+        {
+            flagRun = true;
+        }
+        else if (arg == "-o")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value after -o\n";
+                return 1;
+            }
+            outputPath = argv[++i];
+        }
+        else if (arg == "--fasm")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value after --fasm\n";
+                return 1;
+            }
+            fasmCmd = argv[++i];
+        }
+        else if (arg == "--cc")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value after --cc\n";
+                return 1;
+            }
+            ccCmd = argv[++i];
+        }
+        else if (!arg.empty() && arg[0] == '-')
+        {
+            std::cerr << "Unknown option: " << arg << "\n";
+            return 1;
+        }
+        else
+        {
+            if (!inputPath.empty())
+            {
+                std::cerr << "Multiple input files are not supported\n";
+                return 1;
+            }
+            inputPath = arg;
+        }
+    }
+
+    if (inputPath.empty())
+    {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    if (flagS && flagC)
+    {
+        std::cerr << "Cannot use -S and -c together\n";
+        return 1;
+    }
+
+    if (flagRun && (flagS || flagC))
+    {
+        std::cerr << "--run can only be used in full link mode\n";
+        return 1;
+    }
+
+    sourceFileName = inputPath;
+    std::ifstream inFile(inputPath);
+    if (!inFile.is_open())
+    {
+        std::cerr << "Error opening file: " << inputPath << std::endl;
         return -1;
     }
 
@@ -7455,16 +7622,13 @@ int main(int argc, char** argv)
     std::string source = buff.str();
     inFile.close();
 
-    // Run the preprocessor
     Preprocessor preprocessor;
     std::unordered_map<std::string, std::string> defines;
     source = preprocessor.processCode(source, defines);
 
-    Lexer lexer(source); // Pass the preprocessed source to the lexer
+    Lexer lexer(source);
     Parser parser(lexer);
     auto ast = parser.parse();
-
-    // Run semantic checks to catch undefined-variable/array uses before code generation
     semanticPass(ast);
 
     if (!compileErrors.empty())
@@ -7473,16 +7637,68 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::string asmFileName = argv[2];
-    asmFileName += ".asm";
-    std::ofstream file(asmFileName);
-    if (!file.is_open())
+    std::string base = stripExtension(inputPath);
+    std::string asmFile = base + ".asm";
+    std::string objFile = base + ".o";
+    std::string exeFile = base;
+
+    if (!outputPath.empty())
     {
-        std::cerr << "Error creating output assembly file!" << std::endl;
-        return -1;
+        if (flagS) asmFile = outputPath;
+        else if (flagC) objFile = outputPath;
+        else exeFile = outputPath;
     }
-    generateCode(ast, file);
-    file.close();
+
+    {
+        std::ofstream file(asmFile);
+        if (!file.is_open())
+        {
+            std::cerr << "Error creating output assembly file: " << asmFile << std::endl;
+            return -1;
+        }
+        generateCode(ast, file);
+    }
+
+    if (flagS)
+    {
+        return 0;
+    }
+
+    {
+        std::string cmd = fasmCmd + " " + shellQuote(asmFile) + " " + shellQuote(objFile);
+        int rc = std::system(cmd.c_str());
+        if (rc != 0)
+        {
+            std::cerr << "Assembler command failed: " << cmd << "\n";
+            return rc;
+        }
+    }
+
+    if (flagC)
+    {
+        return 0;
+    }
+
+    {
+        std::string cmd = ccCmd + " " + shellQuote(objFile) + " -o " + shellQuote(exeFile);
+        int rc = std::system(cmd.c_str());
+        if (rc != 0)
+        {
+            std::cerr << "Link command failed: " << cmd << "\n";
+            return rc;
+        }
+    }
+
+    if (flagRun)
+    {
+        std::string cmd = shellQuote(exeFile);
+        int rc = std::system(cmd.c_str());
+        if (rc != 0)
+        {
+            std::cerr << "Run command failed: " << cmd << "\n";
+            return rc;
+        }
+    }
 
     return 0;
 }
