@@ -7453,6 +7453,11 @@ int main(int argc, char** argv)
             << "  --run           Run produced executable (link mode only)\n"
             << "  --fasm <cmd>    Assembler command (default: fasm)\n"
             << "  --cc <cmd>      Linker C compiler command (default: gcc)\n"
+                << "  -l<lib>         Link with library (for example: -lm)\n"
+                << "  -l <lib>        Link with library (for example: -l m)\n"
+                << "  -L<dir>         Add library search path\n"
+                << "  -L <dir>        Add library search path\n"
+                << "  --link-arg <a>  Pass raw argument to linker compiler\n"
             << "  -h, --help      Show this help\n";
     };
 
@@ -7475,6 +7480,17 @@ int main(int argc, char** argv)
         if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
             return path.substr(0, dot);
         return path;
+    };
+
+    auto makeRunnablePath = [](const std::string& path) -> std::string
+    {
+        if (path.empty())
+            return path;
+        // If the user already provided a path (absolute or relative with separator), keep it.
+        if (path[0] == '/' || path[0] == '\\' || path.find('/') != std::string::npos || path.find('\\') != std::string::npos)
+            return path;
+        // Bare file name in current directory must be prefixed with ./ for shell execution.
+        return "./" + path;
     };
 
     // Backward-compatible mode: gvc <input file> <output base>
@@ -7527,6 +7543,7 @@ int main(int argc, char** argv)
     std::string outputPath;
     std::string fasmCmd = "fasm";
     std::string ccCmd = "gcc";
+    std::vector<std::string> linkArgs;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -7574,6 +7591,37 @@ int main(int argc, char** argv)
                 return 1;
             }
             ccCmd = argv[++i];
+        }
+        else if (arg == "--link-arg")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value after --link-arg\n";
+                return 1;
+            }
+            linkArgs.push_back(argv[++i]);
+        }
+        else if (arg == "-l")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value after -l\n";
+                return 1;
+            }
+            linkArgs.push_back("-l" + std::string(argv[++i]));
+        }
+        else if (arg == "-L")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value after -L\n";
+                return 1;
+            }
+            linkArgs.push_back("-L" + std::string(argv[++i]));
+        }
+        else if (arg.rfind("-l", 0) == 0 || arg.rfind("-L", 0) == 0 || arg.rfind("-Wl,", 0) == 0)
+        {
+            linkArgs.push_back(arg);
         }
         else if (!arg.empty() && arg[0] == '-')
         {
@@ -7681,6 +7729,8 @@ int main(int argc, char** argv)
 
     {
         std::string cmd = ccCmd + " " + shellQuote(objFile) + " -o " + shellQuote(exeFile);
+        for (const auto& a : linkArgs)
+            cmd += " " + shellQuote(a);
         int rc = std::system(cmd.c_str());
         if (rc != 0)
         {
@@ -7691,7 +7741,7 @@ int main(int argc, char** argv)
 
     if (flagRun)
     {
-        std::string cmd = shellQuote(exeFile);
+        std::string cmd = shellQuote(makeRunnablePath(exeFile));
         int rc = std::system(cmd.c_str());
         if (rc != 0)
         {
