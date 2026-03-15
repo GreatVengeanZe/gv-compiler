@@ -1,0 +1,7 @@
+#ifndef PP_SHOWCASE_HEADER_H
+#define PP_SHOWCASE_HEADER_H
+
+#define FROM_HEADER 77
+#define HEADER_NUMBER 1234
+
+#endif

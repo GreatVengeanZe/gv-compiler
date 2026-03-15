@@ -14,9 +14,10 @@
 #include <string>
 #include <vector>
 #include <stack>
-#include <regex>
+#include <ctime>
 #include <set>
 #include <map>
+#include <unordered_set>
 
 // Define fixed column position for comments
 #define COMMENT_COLUMN 32
@@ -6254,94 +6255,1408 @@ public:
 class Preprocessor
 {
 private:
+    struct Macro {
+        bool functionLike = false;
+        bool variadic = false;
+        std::vector<std::string> params;
+        std::vector<std::string> replacement;
+    };
 
-    std::string readFile(const std::string& fileName, int includeLine = 0, int includeCol = 1)
+    struct ConditionalFrame {
+        bool parentActive = true;
+        bool branchTaken = false;
+        bool currentActive = true;
+        bool sawElse = false;
+    };
+
+    std::unordered_map<std::string, Macro> macros;
+    std::vector<ConditionalFrame> conditionalStack;
+    int counterMacro = 0;
+    int includeDepth = 0;
+    bool initialized = false;
+    bool inBlockComment = false;
+
+    static bool isIdentifierStart(char ch)
+    {
+        unsigned char uch = static_cast<unsigned char>(ch);
+        return std::isalpha(uch) || ch == '_';
+    }
+
+    static bool isIdentifierChar(char ch)
+    {
+        unsigned char uch = static_cast<unsigned char>(ch);
+        return std::isalnum(uch) || ch == '_';
+    }
+
+    static std::string ltrim(const std::string& s)
+    {
+        size_t i = 0;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t'))
+            ++i;
+        return s.substr(i);
+    }
+
+    static std::string rtrim(const std::string& s)
+    {
+        size_t end = s.size();
+        while (end > 0 && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r'))
+            --end;
+        return s.substr(0, end);
+    }
+
+    static std::string trim(const std::string& s)
+    {
+        return rtrim(ltrim(s));
+    }
+
+    static std::string joinTokens(const std::vector<std::string>& tokens)
+    {
+        std::string out;
+        auto needsSpace = [](const std::string& a, const std::string& b) {
+            if (a.empty() || b.empty())
+                return false;
+            char la = a.back();
+            char fb = b.front();
+            bool leftWord = isIdentifierChar(la);
+            bool rightWord = isIdentifierChar(fb);
+            if (leftWord && rightWord)
+                return true;
+            if (std::isdigit(static_cast<unsigned char>(la)) && (std::isalpha(static_cast<unsigned char>(fb)) || fb == '_'))
+                return true;
+            if ((la == '"' || la == '\'') && isIdentifierStart(fb))
+                return true;
+            return false;
+        };
+
+        for (const auto& tok : tokens)
+        {
+            if (needsSpace(out, tok))
+                out.push_back(' ');
+            out += tok;
+        }
+        return out;
+    }
+
+    static std::string dirnameOf(const std::string& path)
+    {
+        size_t pos = path.find_last_of("/\\");
+        if (pos == std::string::npos)
+            return ".";
+        return path.substr(0, pos);
+    }
+
+    static std::string normalizeSlashes(std::string path)
+    {
+        for (char& c : path)
+            if (c == '\\')
+                c = '/';
+        return path;
+    }
+
+    static bool fileExists(const std::string& path)
+    {
+        std::ifstream f(path);
+        return f.good();
+    }
+
+    static std::string readWholeFile(const std::string& fileName)
     {
         std::ifstream file(fileName);
-        if (!file.is_open()) {
-            reportError(includeLine, includeCol, "Can't open file: " + fileName);
-            hadError = true;
-        }
-
+        if (!file.is_open())
+            return "";
         std::ostringstream content;
         content << file.rdbuf();
         return content.str();
     }
 
-    void parseDefine(const std::string& line, std::unordered_map<std::string, std::string>& defines)
+    std::string readFile(const std::string& fileName, int includeLine = 0, int includeCol = 1)
     {
-        std::regex defineRegex("#define\\s+(\\w+)\\s+(.+)");
-        std::smatch match;
-
-        if (std::regex_search(line, match, defineRegex))
+        std::string content = readWholeFile(fileName);
+        if (content.empty() && !fileExists(fileName))
         {
-            std::string name = match[1].str();
-            std::string value = match[2].str();
-            defines[name] = value;
+            reportError(includeLine, includeCol, "Can't open file: " + fileName);
+            hadError = true;
         }
+        return content;
     }
 
-    std::string replaceDefines(const std::string& text, const std::unordered_map<std::string, std::string>& defines)
+    static std::string stripComments(const std::string& line)
     {
-        std::string result = text;
-        for (const auto& define : defines)
+        std::string out;
+        bool inString = false;
+        bool inChar = false;
+        bool escape = false;
+        for (size_t i = 0; i < line.size(); ++i)
         {
-            std::regex defineRegex("\\b" + define.first + "\\b");
-            result = std::regex_replace(result, defineRegex, define.second);
+            char c = line[i];
+            char n = (i + 1 < line.size()) ? line[i + 1] : '\0';
+
+            if (!inString && !inChar && c == '/' && n == '/')
+                break;
+            if (!inString && !inChar && c == '/' && n == '*')
+            {
+                i += 2;
+                while (i < line.size())
+                {
+                    if (line[i] == '*' && i + 1 < line.size() && line[i + 1] == '/')
+                    {
+                        ++i;
+                        break;
+                    }
+                    ++i;
+                }
+                continue;
+            }
+
+            out.push_back(c);
+            if (escape)
+            {
+                escape = false;
+                continue;
+            }
+            if (c == '\\' && (inString || inChar))
+            {
+                escape = true;
+                continue;
+            }
+            if (c == '"' && !inChar)
+                inString = !inString;
+            else if (c == '\'' && !inString)
+                inChar = !inChar;
         }
-        return result;
+        return out;
     }
 
-    std::string cleanString(const std::string& input)
+    std::vector<std::pair<std::string, int>> buildLogicalLines(const std::string& code)
     {
-        std::string cleaned;
-        for (char ch : input)
-            if (ch != '\0')
-                cleaned += ch;
-        return cleaned;
+        std::vector<std::pair<std::string, int>> logical;
+        std::istringstream stream(code);
+        std::string line;
+        std::string current;
+        int lineNo = 0;
+        int logicalStart = 1;
+        bool continuing = false;
+
+        while (std::getline(stream, line))
+        {
+            ++lineNo;
+            if (!continuing)
+                logicalStart = lineNo;
+
+            std::string cleaned = rtrim(line);
+            bool hasContinuation = !cleaned.empty() && cleaned.back() == '\\';
+            if (hasContinuation)
+                cleaned.pop_back();
+
+            current += cleaned;
+            if (hasContinuation)
+            {
+                continuing = true;
+                continue;
+            }
+
+            logical.push_back({current, logicalStart});
+            current.clear();
+            continuing = false;
+        }
+
+        if (!current.empty())
+            logical.push_back({current, logicalStart});
+
+        return logical;
+    }
+
+    static std::vector<std::string> tokenize(const std::string& text)
+    {
+        std::vector<std::string> tokens;
+        size_t i = 0;
+
+        auto startsWith = [&](const std::string& pat) {
+            if (i + pat.size() > text.size())
+                return false;
+            for (size_t k = 0; k < pat.size(); ++k)
+                if (text[i + k] != pat[k])
+                    return false;
+            return true;
+        };
+
+        while (i < text.size())
+        {
+            char c = text[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+            {
+                ++i;
+                continue;
+            }
+
+            if (isIdentifierStart(c))
+            {
+                size_t start = i++;
+                while (i < text.size() && isIdentifierChar(text[i]))
+                    ++i;
+                tokens.push_back(text.substr(start, i - start));
+                continue;
+            }
+
+            if (std::isdigit(static_cast<unsigned char>(c)))
+            {
+                size_t start = i++;
+                while (i < text.size())
+                {
+                    char d = text[i];
+                    if (std::isalnum(static_cast<unsigned char>(d)) || d == '.' || d == '_')
+                    {
+                        ++i;
+                        continue;
+                    }
+                    if ((d == '+' || d == '-') && i > start)
+                    {
+                        char p = text[i - 1];
+                        if (p == 'e' || p == 'E' || p == 'p' || p == 'P')
+                        {
+                            ++i;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                tokens.push_back(text.substr(start, i - start));
+                continue;
+            }
+
+            if (c == '"' || c == '\'')
+            {
+                char quote = c;
+                size_t start = i++;
+                bool escape = false;
+                while (i < text.size())
+                {
+                    char d = text[i++];
+                    if (escape)
+                    {
+                        escape = false;
+                        continue;
+                    }
+                    if (d == '\\')
+                    {
+                        escape = true;
+                        continue;
+                    }
+                    if (d == quote)
+                        break;
+                }
+                tokens.push_back(text.substr(start, i - start));
+                continue;
+            }
+
+            if (startsWith("##")) { tokens.push_back("##"); i += 2; continue; }
+            if (startsWith("...")) { tokens.push_back("..."); i += 3; continue; }
+            if (startsWith("<<=") || startsWith(">>="))
+            {
+                tokens.push_back(text.substr(i, 3));
+                i += 3;
+                continue;
+            }
+            if (startsWith("==") || startsWith("!=") ||
+                startsWith("<=") || startsWith(">=") || startsWith("&&") || startsWith("||") ||
+                startsWith("++") || startsWith("--") || startsWith("->") || startsWith("<<") ||
+                startsWith(">>") || startsWith("+=") || startsWith("-=") || startsWith("*=") ||
+                startsWith("/=") || startsWith("%=") || startsWith("&=") || startsWith("|=") ||
+                startsWith("^="))
+            {
+                tokens.push_back(text.substr(i, 2));
+                i += 2;
+                continue;
+            }
+
+            tokens.push_back(std::string(1, c));
+            ++i;
+        }
+
+        return tokens;
+    }
+
+    static bool isIdentifierToken(const std::string& tok)
+    {
+        if (tok.empty() || !isIdentifierStart(tok[0]))
+            return false;
+        for (size_t i = 1; i < tok.size(); ++i)
+            if (!isIdentifierChar(tok[i]))
+                return false;
+        return true;
+    }
+
+    static std::string escapeStringForLiteral(const std::string& s)
+    {
+        std::string out;
+        for (char c : s)
+        {
+            switch (c)
+            {
+                case '\\': out += "\\\\"; break;
+                case '"': out += "\\\""; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default: out.push_back(c); break;
+            }
+        }
+        return out;
+    }
+
+    static std::string stringifyTokens(const std::vector<std::string>& toks)
+    {
+        std::string joined = joinTokens(toks);
+        return std::string("\"") + escapeStringForLiteral(joined) + "\"";
+    }
+
+    std::string stripCommentsPreserveNewlines(const std::string& text)
+    {
+        std::string out;
+        bool inString = false;
+        bool inChar = false;
+        bool escape = false;
+
+        for (size_t i = 0; i < text.size(); ++i)
+        {
+            char c = text[i];
+            char n = (i + 1 < text.size()) ? text[i + 1] : '\0';
+
+            if (inBlockComment)
+            {
+                if (c == '*' && n == '/')
+                {
+                    inBlockComment = false;
+                    ++i;
+                    continue;
+                }
+                if (c == '\n')
+                    out.push_back('\n');
+                continue;
+            }
+
+            if (!inString && !inChar && c == '/' && n == '*')
+            {
+                inBlockComment = true;
+                ++i;
+                continue;
+            }
+
+            if (!inString && !inChar && c == '/' && n == '/')
+            {
+                while (i < text.size() && text[i] != '\n')
+                    ++i;
+                if (i < text.size() && text[i] == '\n')
+                    out.push_back('\n');
+                continue;
+            }
+
+            out.push_back(c);
+            if (escape)
+            {
+                escape = false;
+                continue;
+            }
+            if ((inString || inChar) && c == '\\')
+            {
+                escape = true;
+                continue;
+            }
+            if (!inChar && c == '"')
+                inString = !inString;
+            else if (!inString && c == '\'')
+                inChar = !inChar;
+        }
+
+        return out;
+    }
+
+    std::string currentDateLiteral() const
+    {
+        std::time_t now = std::time(nullptr);
+        std::tm tmNow{};
+        std::tm* p = std::localtime(&now);
+        if (p)
+            tmNow = *p;
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%b %d %Y", &tmNow);
+        return std::string("\"") + buf + "\"";
+    }
+
+    std::string currentTimeLiteral() const
+    {
+        std::time_t now = std::time(nullptr);
+        std::tm tmNow{};
+        std::tm* p = std::localtime(&now);
+        if (p)
+            tmNow = *p;
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%H:%M:%S", &tmNow);
+        return std::string("\"") + buf + "\"";
+    }
+
+    bool isActive() const
+    {
+        if (conditionalStack.empty())
+            return true;
+        return conditionalStack.back().currentActive;
+    }
+
+    std::pair<std::vector<std::vector<std::string>>, size_t> parseMacroArguments(const std::vector<std::string>& tokens, size_t lparenIndex)
+    {
+        std::vector<std::vector<std::string>> args;
+        std::vector<std::string> current;
+        int depth = 0;
+
+        for (size_t i = lparenIndex + 1; i < tokens.size(); ++i)
+        {
+            const std::string& t = tokens[i];
+            if (t == "(")
+            {
+                ++depth;
+                current.push_back(t);
+            }
+            else if (t == ")")
+            {
+                if (depth == 0)
+                {
+                    if (!current.empty() || !args.empty())
+                        args.push_back(current);
+                    return {args, i};
+                }
+                --depth;
+                current.push_back(t);
+            }
+            else if (t == "," && depth == 0)
+            {
+                args.push_back(current);
+                current.clear();
+            }
+            else
+            {
+                current.push_back(t);
+            }
+        }
+
+        return {{}, tokens.size()};
+    }
+
+    std::vector<std::string> substituteMacro(const Macro& macro,
+                                             const std::vector<std::vector<std::string>>& rawArgs,
+                                             const std::vector<std::vector<std::string>>& expandedArgs)
+    {
+        std::unordered_map<std::string, std::vector<std::string>> argRawMap;
+        std::unordered_map<std::string, std::vector<std::string>> argExpandedMap;
+
+        for (size_t i = 0; i < macro.params.size(); ++i)
+        {
+            argRawMap[macro.params[i]] = (i < rawArgs.size()) ? rawArgs[i] : std::vector<std::string>{};
+            argExpandedMap[macro.params[i]] = (i < expandedArgs.size()) ? expandedArgs[i] : std::vector<std::string>{};
+        }
+
+        if (macro.variadic)
+        {
+            std::vector<std::string> rawVar;
+            std::vector<std::string> expandedVar;
+            size_t fixed = macro.params.size();
+            for (size_t i = fixed; i < rawArgs.size(); ++i)
+            {
+                if (i > fixed)
+                {
+                    rawVar.push_back(",");
+                    expandedVar.push_back(",");
+                }
+                rawVar.insert(rawVar.end(), rawArgs[i].begin(), rawArgs[i].end());
+                expandedVar.insert(expandedVar.end(), expandedArgs[i].begin(), expandedArgs[i].end());
+            }
+            argRawMap["__VA_ARGS__"] = rawVar;
+            argExpandedMap["__VA_ARGS__"] = expandedVar;
+        }
+
+        std::vector<std::string> out;
+        for (size_t i = 0; i < macro.replacement.size(); ++i)
+        {
+            const std::string& t = macro.replacement[i];
+            bool hasLeftPaste = (i > 0 && macro.replacement[i - 1] == "##");
+            bool hasRightPaste = (i + 1 < macro.replacement.size() && macro.replacement[i + 1] == "##");
+
+            if (t == "#" && i + 1 < macro.replacement.size())
+            {
+                const std::string& p = macro.replacement[i + 1];
+                if (argRawMap.find(p) != argRawMap.end())
+                {
+                    out.push_back(stringifyTokens(argRawMap[p]));
+                    ++i;
+                    continue;
+                }
+            }
+
+            if (t == "##" && !out.empty() && i + 1 < macro.replacement.size())
+            {
+                const std::string& nextTok = macro.replacement[i + 1];
+                std::vector<std::string> repl;
+                if (argRawMap.find(nextTok) != argRawMap.end())
+                    repl = argRawMap[nextTok];
+                else
+                    repl.push_back(nextTok);
+
+                if (!repl.empty())
+                {
+                    out.back() += repl.front();
+                    for (size_t k = 1; k < repl.size(); ++k)
+                        out.push_back(repl[k]);
+                }
+                else
+                {
+                    if (!out.empty() && out.back() == ",")
+                        out.pop_back();
+                }
+                ++i;
+                continue;
+            }
+
+            auto itExp = argExpandedMap.find(t);
+            auto itRaw = argRawMap.find(t);
+            if (itExp != argExpandedMap.end() || itRaw != argRawMap.end())
+            {
+                const std::vector<std::string>& src = (hasLeftPaste || hasRightPaste)
+                                                        ? itRaw->second
+                                                        : itExp->second;
+                out.insert(out.end(), src.begin(), src.end());
+                continue;
+            }
+
+            out.push_back(t);
+        }
+
+        return out;
+    }
+
+    std::vector<std::string> expandTokens(const std::vector<std::string>& tokens,
+                                          int lineNo,
+                                          const std::string& filePath,
+                                          std::unordered_set<std::string> disabled,
+                                          int depth = 0)
+    {
+        if (depth > 128)
+            return tokens;
+
+        std::vector<std::string> out;
+        for (size_t i = 0; i < tokens.size(); ++i)
+        {
+            const std::string& tok = tokens[i];
+            if (!isIdentifierToken(tok))
+            {
+                out.push_back(tok);
+                continue;
+            }
+
+            if (tok == "__LINE__")
+            {
+                out.push_back(std::to_string(lineNo));
+                continue;
+            }
+            if (tok == "__FILE__")
+            {
+                out.push_back("\"" + escapeStringForLiteral(filePath) + "\"");
+                continue;
+            }
+            if (tok == "__COUNTER__")
+            {
+                out.push_back(std::to_string(counterMacro++));
+                continue;
+            }
+            if (tok == "__DATE__")
+            {
+                out.push_back(currentDateLiteral());
+                continue;
+            }
+            if (tok == "__TIME__")
+            {
+                out.push_back(currentTimeLiteral());
+                continue;
+            }
+            if (tok == "__STDC__")
+            {
+                out.push_back("1");
+                continue;
+            }
+            if (tok == "__STDC_VERSION__")
+            {
+                out.push_back("201710L");
+                continue;
+            }
+
+            auto mit = macros.find(tok);
+            if (mit == macros.end() || disabled.find(tok) != disabled.end())
+            {
+                out.push_back(tok);
+                continue;
+            }
+
+            const Macro& macro = mit->second;
+            if (macro.functionLike)
+            {
+                if (i + 1 >= tokens.size() || tokens[i + 1] != "(")
+                {
+                    out.push_back(tok);
+                    continue;
+                }
+
+                auto parsed = parseMacroArguments(tokens, i + 1);
+                auto args = parsed.first;
+                size_t endIndex = parsed.second;
+                if (endIndex >= tokens.size())
+                {
+                    out.push_back(tok);
+                    continue;
+                }
+
+                if (!macro.variadic && args.size() != macro.params.size())
+                {
+                    out.push_back(tok);
+                    continue;
+                }
+                if (macro.variadic && args.size() < macro.params.size())
+                {
+                    out.push_back(tok);
+                    continue;
+                }
+
+                std::vector<std::vector<std::string>> expandedArgs;
+                expandedArgs.reserve(args.size());
+                for (const auto& arg : args)
+                    expandedArgs.push_back(expandTokens(arg, lineNo, filePath, {}, depth + 1));
+
+                std::vector<std::string> replaced = substituteMacro(macro, args, expandedArgs);
+                auto nextDisabled = disabled;
+                nextDisabled.insert(tok);
+                std::vector<std::string> expanded = expandTokens(replaced, lineNo, filePath, nextDisabled, depth + 1);
+                out.insert(out.end(), expanded.begin(), expanded.end());
+                i = endIndex;
+                continue;
+            }
+
+            auto nextDisabled = disabled;
+            nextDisabled.insert(tok);
+            std::vector<std::string> replaced = expandTokens(macro.replacement, lineNo, filePath, nextDisabled, depth + 1);
+            out.insert(out.end(), replaced.begin(), replaced.end());
+        }
+
+        return out;
+    }
+
+    class IfExpressionParser {
+    private:
+        const std::vector<std::string>& tokens;
+        size_t pos = 0;
+
+    public:
+
+        static long long parseIntegerLiteral(const std::string& tok)
+        {
+            if (tok.empty())
+                return 0;
+
+            size_t end = tok.size();
+            while (end > 0)
+            {
+                char c = tok[end - 1];
+                if (c == 'u' || c == 'U' || c == 'l' || c == 'L')
+                {
+                    --end;
+                    continue;
+                }
+                break;
+            }
+            std::string core = tok.substr(0, end);
+            if (core.empty())
+                return 0;
+
+            try
+            {
+                if (core.size() > 2 && core[0] == '0' && (core[1] == 'b' || core[1] == 'B'))
+                {
+                    long long v = 0;
+                    for (size_t i = 2; i < core.size(); ++i)
+                    {
+                        if (core[i] != '0' && core[i] != '1')
+                            return 0;
+                        v = (v << 1) + (core[i] - '0');
+                    }
+                    return v;
+                }
+                size_t idx = 0;
+                long long v = std::stoll(core, &idx, 0);
+                if (idx == core.size())
+                    return v;
+            }
+            catch (...) {}
+            return 0;
+        }
+
+        static long long parseCharLiteral(const std::string& t)
+        {
+            if (t.size() < 3 || t.front() != '\'' || t.back() != '\'')
+                return 0;
+            if (t[1] != '\\')
+                return static_cast<unsigned char>(t[1]);
+            if (t.size() < 4)
+                return 0;
+            switch (t[2])
+            {
+                case 'n': return '\n';
+                case 'r': return '\r';
+                case 't': return '\t';
+                case 'v': return '\v';
+                case '0': return '\0';
+                case '\\': return '\\';
+                case '\'': return '\'';
+                case '"': return '"';
+                default: return static_cast<unsigned char>(t[2]);
+            }
+        }
+
+    private:
+
+        long long parsePrimary()
+        {
+            if (pos >= tokens.size())
+                return 0;
+
+            if (tokens[pos] == "(")
+            {
+                ++pos;
+                long long v = parseLogicalOr();
+                if (pos < tokens.size() && tokens[pos] == ")")
+                    ++pos;
+                return v;
+            }
+
+            const std::string& t = tokens[pos++];
+            if (!t.empty() && t.front() == '\'' && t.back() == '\'' && t.size() >= 3)
+                return parseCharLiteral(t);
+
+            return parseIntegerLiteral(t);
+        }
+
+        long long parseUnary()
+        {
+            if (pos < tokens.size() && (tokens[pos] == "+" || tokens[pos] == "-" || tokens[pos] == "!" || tokens[pos] == "~"))
+            {
+                std::string op = tokens[pos++];
+                long long v = parseUnary();
+                if (op == "+") return v;
+                if (op == "-") return -v;
+                if (op == "!") return !v;
+                return ~v;
+            }
+            return parsePrimary();
+        }
+
+        long long parseMul()
+        {
+            long long lhs = parseUnary();
+            while (pos < tokens.size() && (tokens[pos] == "*" || tokens[pos] == "/" || tokens[pos] == "%"))
+            {
+                std::string op = tokens[pos++];
+                long long rhs = parseUnary();
+                if (op == "*") lhs = lhs * rhs;
+                else if (op == "/") lhs = (rhs == 0) ? 0 : (lhs / rhs);
+                else lhs = (rhs == 0) ? 0 : (lhs % rhs);
+            }
+            return lhs;
+        }
+
+        long long parseAdd()
+        {
+            long long lhs = parseMul();
+            while (pos < tokens.size() && (tokens[pos] == "+" || tokens[pos] == "-"))
+            {
+                std::string op = tokens[pos++];
+                long long rhs = parseMul();
+                lhs = (op == "+") ? (lhs + rhs) : (lhs - rhs);
+            }
+            return lhs;
+        }
+
+        long long parseShift()
+        {
+            long long lhs = parseAdd();
+            while (pos < tokens.size() && (tokens[pos] == "<<" || tokens[pos] == ">>"))
+            {
+                std::string op = tokens[pos++];
+                long long rhs = parseAdd();
+                lhs = (op == "<<") ? (lhs << rhs) : (lhs >> rhs);
+            }
+            return lhs;
+        }
+
+        long long parseRel()
+        {
+            long long lhs = parseShift();
+            while (pos < tokens.size() && (tokens[pos] == "<" || tokens[pos] == ">" || tokens[pos] == "<=" || tokens[pos] == ">="))
+            {
+                std::string op = tokens[pos++];
+                long long rhs = parseShift();
+                if (op == "<") lhs = lhs < rhs;
+                else if (op == ">") lhs = lhs > rhs;
+                else if (op == "<=") lhs = lhs <= rhs;
+                else lhs = lhs >= rhs;
+            }
+            return lhs;
+        }
+
+        long long parseEq()
+        {
+            long long lhs = parseRel();
+            while (pos < tokens.size() && (tokens[pos] == "==" || tokens[pos] == "!="))
+            {
+                std::string op = tokens[pos++];
+                long long rhs = parseRel();
+                lhs = (op == "==") ? (lhs == rhs) : (lhs != rhs);
+            }
+            return lhs;
+        }
+
+        long long parseBitAnd()
+        {
+            long long lhs = parseEq();
+            while (pos < tokens.size() && tokens[pos] == "&")
+            {
+                ++pos;
+                lhs &= parseEq();
+            }
+            return lhs;
+        }
+
+        long long parseBitXor()
+        {
+            long long lhs = parseBitAnd();
+            while (pos < tokens.size() && tokens[pos] == "^")
+            {
+                ++pos;
+                lhs ^= parseBitAnd();
+            }
+            return lhs;
+        }
+
+        long long parseBitOr()
+        {
+            long long lhs = parseBitXor();
+            while (pos < tokens.size() && tokens[pos] == "|")
+            {
+                ++pos;
+                lhs |= parseBitXor();
+            }
+            return lhs;
+        }
+
+        long long parseLogicalAnd()
+        {
+            long long lhs = parseBitOr();
+            while (pos < tokens.size() && tokens[pos] == "&&")
+            {
+                ++pos;
+                lhs = (lhs && parseBitOr()) ? 1 : 0;
+            }
+            return lhs;
+        }
+
+        long long parseLogicalOr()
+        {
+            long long lhs = parseLogicalAnd();
+            while (pos < tokens.size() && tokens[pos] == "||")
+            {
+                ++pos;
+                lhs = (lhs || parseLogicalAnd()) ? 1 : 0;
+            }
+            return lhs;
+        }
+
+        long long parseConditional()
+        {
+            long long cond = parseLogicalOr();
+            if (pos < tokens.size() && tokens[pos] == "?")
+            {
+                ++pos;
+                long long whenTrue = parseConditional();
+                if (pos < tokens.size() && tokens[pos] == ":")
+                    ++pos;
+                long long whenFalse = parseConditional();
+                return cond ? whenTrue : whenFalse;
+            }
+            return cond;
+        }
+
+    public:
+        explicit IfExpressionParser(const std::vector<std::string>& toks) : tokens(toks) {}
+        long long parse() { return parseConditional(); }
+    };
+
+    long long evaluateIfExpression(const std::string& expr, int lineNo, const std::string& filePath)
+    {
+        std::vector<std::string> tokens = tokenize(expr);
+        std::vector<std::string> definedProcessed;
+
+        for (size_t i = 0; i < tokens.size(); ++i)
+        {
+            if (tokens[i] == "defined")
+            {
+                std::string name;
+                if (i + 1 < tokens.size() && tokens[i + 1] == "(")
+                {
+                    if (i + 2 < tokens.size() && isIdentifierToken(tokens[i + 2]))
+                    {
+                        name = tokens[i + 2];
+                        i += 2;
+                        if (i + 1 < tokens.size() && tokens[i + 1] == ")")
+                            ++i;
+                    }
+                }
+                else if (i + 1 < tokens.size() && isIdentifierToken(tokens[i + 1]))
+                {
+                    name = tokens[i + 1];
+                    ++i;
+                }
+
+                definedProcessed.push_back(macros.find(name) != macros.end() ? "1" : "0");
+                continue;
+            }
+
+            definedProcessed.push_back(tokens[i]);
+        }
+
+        std::vector<std::string> expanded = expandTokens(definedProcessed, lineNo, filePath, {});
+        for (std::string& t : expanded)
+            if (isIdentifierToken(t))
+                t = "0";
+
+        IfExpressionParser parser(expanded);
+        return parser.parse();
+    }
+
+    void ensureBuiltinMacros()
+    {
+        if (initialized)
+            return;
+        initialized = true;
+
+        Macro stdc;
+        stdc.replacement = {"1"};
+        macros["__STDC__"] = stdc;
+
+        Macro stdcver;
+        stdcver.replacement = {"201710L"};
+        macros["__STDC_VERSION__"] = stdcver;
+
+        Macro stdchost;
+        stdchost.replacement = {"1"};
+        macros["__STDC_HOSTED__"] = stdchost;
+    }
+
+    bool parseDefineDirective(const std::string& rest, int lineNo, int col,
+                              std::unordered_map<std::string, std::string>& defines)
+    {
+        size_t i = 0;
+        while (i < rest.size() && (rest[i] == ' ' || rest[i] == '\t')) ++i;
+        if (i >= rest.size() || !isIdentifierStart(rest[i]))
+        {
+            reportError(lineNo, col, "Invalid #define directive");
+            hadError = true;
+            return false;
+        }
+
+        size_t nameStart = i++;
+        while (i < rest.size() && isIdentifierChar(rest[i])) ++i;
+        std::string name = rest.substr(nameStart, i - nameStart);
+
+        Macro macro;
+        bool functionLike = (i < rest.size() && rest[i] == '(');
+        if (functionLike)
+        {
+            macro.functionLike = true;
+            ++i; // (
+            std::string param;
+            while (i < rest.size())
+            {
+                while (i < rest.size() && (rest[i] == ' ' || rest[i] == '\t')) ++i;
+                if (i < rest.size() && rest[i] == ')')
+                {
+                    ++i;
+                    break;
+                }
+
+                if (i + 2 < rest.size() && rest[i] == '.' && rest[i + 1] == '.' && rest[i + 2] == '.')
+                {
+                    macro.variadic = true;
+                    i += 3;
+                    while (i < rest.size() && (rest[i] == ' ' || rest[i] == '\t')) ++i;
+                    if (i < rest.size() && rest[i] == ')')
+                        ++i;
+                    break;
+                }
+
+                if (i >= rest.size() || !isIdentifierStart(rest[i]))
+                {
+                    reportError(lineNo, col, "Invalid #define parameter list");
+                    hadError = true;
+                    return false;
+                }
+
+                size_t pstart = i++;
+                while (i < rest.size() && isIdentifierChar(rest[i])) ++i;
+                std::string pname = rest.substr(pstart, i - pstart);
+                macro.params.push_back(pname);
+
+                while (i < rest.size() && (rest[i] == ' ' || rest[i] == '\t')) ++i;
+                if (i < rest.size() && rest[i] == ',')
+                {
+                    ++i;
+                    while (i < rest.size() && (rest[i] == ' ' || rest[i] == '\t')) ++i;
+                    if (i + 2 < rest.size() && rest[i] == '.' && rest[i + 1] == '.' && rest[i + 2] == '.')
+                    {
+                        macro.variadic = true;
+                        i += 3;
+                        while (i < rest.size() && (rest[i] == ' ' || rest[i] == '\t')) ++i;
+                        if (i < rest.size() && rest[i] == ')')
+                            ++i;
+                        break;
+                    }
+                    continue;
+                }
+                if (i < rest.size() && rest[i] == ')')
+                {
+                    ++i;
+                    break;
+                }
+            }
+        }
+
+        std::string replacement = (i < rest.size()) ? rest.substr(i) : "";
+        replacement = trim(stripComments(replacement));
+        macro.replacement = tokenize(replacement);
+        macros[name] = macro;
+
+        if (!macro.functionLike)
+            defines[name] = joinTokens(macro.replacement);
+        return true;
+    }
+
+    std::string resolveIncludePath(const std::string& includeName, bool angled, const std::string& currentFile)
+    {
+        std::vector<std::string> candidates;
+        std::string currentDir = dirnameOf(normalizeSlashes(currentFile));
+        std::string rootDir = dirnameOf(normalizeSlashes(sourceFileName));
+
+        if (!angled)
+            candidates.push_back(currentDir + "/" + includeName);
+        candidates.push_back(rootDir + "/" + includeName);
+        candidates.push_back(rootDir + "/lib/" + includeName);
+        candidates.push_back("lib/" + includeName);
+        candidates.push_back(includeName);
+
+        for (const auto& c : candidates)
+            if (fileExists(c))
+                return c;
+        return "";
+    }
+
+    std::string processCodeInternal(const std::string& code,
+                                    std::unordered_map<std::string, std::string>& defines,
+                                    const std::string& currentFile)
+    {
+        if (++includeDepth > 128)
+        {
+            reportError(0, 1, "Exceeded include depth limit");
+            hadError = true;
+            --includeDepth;
+            return "";
+        }
+
+        std::ostringstream output;
+        std::string commentFree = stripCommentsPreserveNewlines(code);
+        std::vector<std::pair<std::string, int>> logicalLines = buildLogicalLines(commentFree);
+        int lineBase = 1;
+        int physicalBase = 1;
+        std::string displayFile = currentFile;
+
+        for (const auto& entry : logicalLines)
+        {
+            std::string line = entry.first;
+            int lineNo = entry.second;
+            int effectiveLine = lineBase + (lineNo - physicalBase);
+
+            std::string trimmedLeft = ltrim(line);
+            if (!trimmedLeft.empty() && trimmedLeft[0] == '#')
+            {
+                size_t pos = 1;
+                while (pos < trimmedLeft.size() && (trimmedLeft[pos] == ' ' || trimmedLeft[pos] == '\t'))
+                    ++pos;
+                size_t start = pos;
+                while (pos < trimmedLeft.size() && isIdentifierChar(trimmedLeft[pos]))
+                    ++pos;
+                std::string directive = trimmedLeft.substr(start, pos - start);
+                std::string rest = (pos < trimmedLeft.size()) ? trimmedLeft.substr(pos) : "";
+                int col = static_cast<int>(line.find('#')) + 1;
+
+                if (directive == "if")
+                {
+                    bool parent = conditionalStack.empty() ? true : conditionalStack.back().currentActive;
+                    long long value = parent ? evaluateIfExpression(rest, effectiveLine, displayFile) : 0;
+                    ConditionalFrame frame;
+                    frame.parentActive = parent;
+                    frame.currentActive = parent && (value != 0);
+                    frame.branchTaken = frame.currentActive;
+                    conditionalStack.push_back(frame);
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "ifdef")
+                {
+                    std::string name = trim(rest);
+                    bool parent = conditionalStack.empty() ? true : conditionalStack.back().currentActive;
+                    bool cond = macros.find(name) != macros.end();
+                    ConditionalFrame frame;
+                    frame.parentActive = parent;
+                    frame.currentActive = parent && cond;
+                    frame.branchTaken = frame.currentActive;
+                    conditionalStack.push_back(frame);
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "ifndef")
+                {
+                    std::string name = trim(rest);
+                    bool parent = conditionalStack.empty() ? true : conditionalStack.back().currentActive;
+                    bool cond = macros.find(name) == macros.end();
+                    ConditionalFrame frame;
+                    frame.parentActive = parent;
+                    frame.currentActive = parent && cond;
+                    frame.branchTaken = frame.currentActive;
+                    conditionalStack.push_back(frame);
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "elif")
+                {
+                    if (conditionalStack.empty())
+                    {
+                        reportError(lineNo, col, "#elif without matching #if");
+                        hadError = true;
+                    }
+                    else
+                    {
+                        ConditionalFrame& frame = conditionalStack.back();
+                        if (frame.sawElse)
+                        {
+                            reportError(effectiveLine, col, "#elif after #else");
+                            hadError = true;
+                        }
+                        if (!frame.parentActive || frame.branchTaken)
+                        {
+                            frame.currentActive = false;
+                        }
+                        else
+                        {
+                            long long value = evaluateIfExpression(rest, effectiveLine, displayFile);
+                            frame.currentActive = (value != 0);
+                            if (frame.currentActive)
+                                frame.branchTaken = true;
+                        }
+                    }
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "else")
+                {
+                    if (conditionalStack.empty())
+                    {
+                        reportError(lineNo, col, "#else without matching #if");
+                        hadError = true;
+                    }
+                    else
+                    {
+                        ConditionalFrame& frame = conditionalStack.back();
+                        if (frame.sawElse)
+                        {
+                            reportError(effectiveLine, col, "Multiple #else in conditional block");
+                            hadError = true;
+                        }
+                        frame.currentActive = frame.parentActive && !frame.branchTaken;
+                        frame.branchTaken = true;
+                        frame.sawElse = true;
+                    }
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "endif")
+                {
+                    if (conditionalStack.empty())
+                    {
+                        reportError(lineNo, col, "#endif without matching #if");
+                        hadError = true;
+                    }
+                    else
+                    {
+                        conditionalStack.pop_back();
+                    }
+                    output << "\n";
+                    continue;
+                }
+
+                if (!isActive())
+                {
+                    output << "\n";
+                    continue;
+                }
+
+                if (directive == "line")
+                {
+                    std::vector<std::string> toks = tokenize(rest);
+                    if (toks.empty())
+                    {
+                        reportError(effectiveLine, col, "Invalid #line directive");
+                        hadError = true;
+                    }
+                    else
+                    {
+                        long long newLine = IfExpressionParser::parseIntegerLiteral(toks[0]);
+                        if (newLine <= 0)
+                        {
+                            reportError(effectiveLine, col, "Invalid #line number");
+                            hadError = true;
+                        }
+                        else
+                        {
+                            lineBase = static_cast<int>(newLine);
+                            physicalBase = lineNo + 1;
+                        }
+                        if (toks.size() >= 2 && toks[1].size() >= 2 && toks[1].front() == '"' && toks[1].back() == '"')
+                        {
+                            displayFile = toks[1].substr(1, toks[1].size() - 2);
+                        }
+                    }
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "error")
+                {
+                    reportError(effectiveLine, col, trim(rest));
+                    hadError = true;
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "warning")
+                {
+                    std::cerr << displayFile << ":" << effectiveLine << ":" << col << ": warning: " << trim(rest) << std::endl;
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "pragma")
+                {
+                    output << "\n";
+                    continue;
+                }
+
+                if (directive == "define")
+                {
+                    parseDefineDirective(rest, effectiveLine, col, defines);
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "undef")
+                {
+                    std::string name = trim(rest);
+                    macros.erase(name);
+                    defines.erase(name);
+                    output << "\n";
+                    continue;
+                }
+                if (directive == "include")
+                {
+                    std::vector<std::string> includeToks = tokenize(rest);
+                    includeToks = expandTokens(includeToks, effectiveLine, displayFile, {});
+                    std::string arg = trim(joinTokens(includeToks));
+                    bool angled = false;
+                    std::string includeName;
+                    if (arg.size() >= 2 && arg.front() == '"')
+                    {
+                        size_t endq = arg.find('"', 1);
+                        if (endq != std::string::npos)
+                            includeName = arg.substr(1, endq - 1);
+                    }
+                    else if (arg.size() >= 3 && arg.front() == '<')
+                    {
+                        angled = true;
+                        size_t enda = arg.find('>');
+                        if (enda != std::string::npos)
+                            includeName = arg.substr(1, enda - 1);
+                    }
+
+                    if (includeName.empty())
+                    {
+                        reportError(effectiveLine, col, "Invalid #include directive");
+                        hadError = true;
+                        output << "\n";
+                        continue;
+                    }
+
+                    std::string resolved = resolveIncludePath(includeName, angled, currentFile);
+                    if (resolved.empty())
+                    {
+                        reportError(effectiveLine, col, "Can't resolve include: " + includeName);
+                        hadError = true;
+                        output << "\n";
+                        continue;
+                    }
+
+                    std::string included = readFile(resolved, effectiveLine, col);
+                    output << processCodeInternal(included, defines, resolved);
+                    output << "\n";
+                    continue;
+                }
+
+                if (!directive.empty())
+                {
+                    reportError(lineNo, col, "Unsupported preprocessor directive: #" + directive);
+                    hadError = true;
+                }
+                output << "\n";
+                continue;
+            }
+
+            if (!isActive())
+            {
+                output << "\n";
+                continue;
+            }
+
+            std::vector<std::string> toks = tokenize(line);
+            std::vector<std::string> expanded = expandTokens(toks, effectiveLine, displayFile, {});
+            output << joinTokens(expanded) << "\n";
+        }
+
+        --includeDepth;
+        return output.str();
     }
 
 public:
     std::string processCode(const std::string& code, std::unordered_map<std::string, std::string>& defines)
     {
-        std::istringstream stream(code);
-        std::ostringstream processedCode;
-        std::string line;
-        int lineNo = 0;
+        ensureBuiltinMacros();
+        conditionalStack.clear();
+        includeDepth = 0;
 
-        while (std::getline(stream, line))
+        std::string entryFile = sourceFileName.empty() ? "<input>" : sourceFileName;
+        std::string out = processCodeInternal(code, defines, entryFile);
+        if (!conditionalStack.empty())
         {
-            lineNo++;
-            size_t firstNonWs = line.find_first_not_of(" \t");
-            bool isDefine = (firstNonWs != std::string::npos) && (line.compare(firstNonWs, 7, "#define") == 0);
-            bool isInclude = (firstNonWs != std::string::npos) && (line.compare(firstNonWs, 8, "#include") == 0);
-
-            if (isDefine)
-                parseDefine(line, defines);
-
-            else if (isInclude)
-            {
-                std::regex includeRegex("#include\\s+\"(.+?)\"");
-                std::smatch match;
-                int includeCol = static_cast<int>(firstNonWs) + 1;
-
-                if (std::regex_search(line, match, includeRegex))
-                {
-                    std::string fileName = match[1].str();
-                    std::string includedContent = readFile(fileName, lineNo, includeCol);
-                    processedCode << processCode(includedContent, defines) << '\n';
-                }
-                else
-                {
-                    reportError(lineNo, includeCol, "Incorrect directory #include: " + line);
-                    hadError = true;
-                }
-            }
-            else
-                processedCode << replaceDefines(line, defines) << '\n';
+            reportError(0, 1, "Unterminated conditional compilation block");
+            hadError = true;
+            conditionalStack.clear();
         }
-
-        return cleanString(processedCode.str());
+        return out;
     }
 };
 
