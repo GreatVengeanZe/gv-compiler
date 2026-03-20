@@ -1,4 +1,5 @@
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <stdexcept>
 #include <algorithm>
@@ -17,20 +18,21 @@
 #include <ctime>
 #include <set>
 #include <map>
-#include <unordered_set>
 
 // Define fixed column position for comments
 #define COMMENT_COLUMN 32
 
 // Type system used for static checking
 struct Type {
-    enum Base { INT, CHAR, VOID, SHORT, LONG, LONG_LONG, FLOAT, DOUBLE } base;
+    enum Base { INT, CHAR, VOID, SHORT, LONG, LONG_LONG, FLOAT, DOUBLE, STRUCT, UNION } base;
     int pointerLevel = 0; // number of '*' qualifiers
     bool isUnsigned = false; // type qualifier
     bool isConst = false; // top-level const qualifier
+    std::string structName; // valid when base == STRUCT or UNION
 
     bool operator==(const Type& o) const {
-        return base == o.base && pointerLevel == o.pointerLevel && isUnsigned == o.isUnsigned && isConst == o.isConst;
+        return base == o.base && pointerLevel == o.pointerLevel && isUnsigned == o.isUnsigned &&
+               isConst == o.isConst && structName == o.structName;
     }
     bool operator!=(const Type& o) const {
         return !(*this == o);
@@ -50,11 +52,54 @@ struct Type {
             case LONG_LONG: s += "long long"; break;
             case FLOAT: s += "float"; break;
             case DOUBLE: s += "double"; break;
+            case STRUCT: s += "struct " + structName; break;
         }
         for (int i = 0; i < pointerLevel; ++i) s += "*";
         return s;
     }
 };
+
+struct StructMemberInfo {
+    std::string name;
+    Type type;
+    size_t offset = 0;
+    size_t size = 0;
+    std::vector<size_t> dimensions;  // for array members: size of each dimension, empty for scalars
+    bool isFlexibleArray = false;    // true if last dimension is empty (flexible array member)
+    int bitFieldWidth = 0;           // 0 if not a bit field; 1-64 for bit field width
+    int bitFieldOffset = 0;          // bit position within the storage unit (0 = LSB)
+    int bitFieldStorageIndex = 0;    // which storage unit this bit field uses (for tracking packed fields)
+};
+
+struct StructTypeInfo {
+    bool isComplete = false;
+    size_t size = 0;
+    size_t align = 1;
+    std::vector<StructMemberInfo> members;
+};
+
+static std::unordered_map<std::string, StructTypeInfo> structTypes;
+static int anonymousStructCounter = 0;
+
+static size_t alignUp(size_t value, size_t alignment)
+{
+    if (alignment == 0)
+        return value;
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+static const StructMemberInfo* findStructMember(const std::string& structName, const std::string& memberName)
+{
+    auto it = structTypes.find(structName);
+    if (it == structTypes.end())
+        return nullptr;
+    for (const auto& m : it->second.members)
+    {
+        if (m.name == memberName)
+            return &m;
+    }
+    return nullptr;
+}
 
 // -- helpers used for pointer arithmetic -----------------------------
 // compute the size (in bytes) of a type; we now try to give each base type
@@ -83,8 +128,47 @@ static size_t sizeOfType(const Type &t)
         case Type::FLOAT:  return 4;
         case Type::DOUBLE: return 8;
         case Type::VOID:   return 1; // sizeof(void) is not used in C but we pick 1
+        case Type::STRUCT:
+        case Type::UNION:
+        {
+            auto it = structTypes.find(t.structName);
+            if (it != structTypes.end() && it->second.isComplete)
+                return it->second.size;
+            return 0;
+        }
         default:           return 8;
     }
+}
+
+static bool isSmallStructValueType(const Type &t)
+{
+    if (t.pointerLevel != 0 || (t.base != Type::STRUCT && t.base != Type::UNION))
+        return false;
+    size_t sz = sizeOfType(t);
+    return sz > 0 && sz <= 16;
+}
+
+static size_t stackPassSize(const Type &t)
+{
+    if (isSmallStructValueType(t))
+        return alignUp(sizeOfType(t), 8);
+    return 8;
+}
+
+static void emitLoadSmallStructFromAddress(std::ofstream& f, const Type& t, const std::string& addrReg, const std::string& comment)
+{
+    size_t sz = sizeOfType(t);
+    f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov rax, [" + addrReg + "]") << ";; Load first struct slot for " << comment << std::endl;
+    if (sz > 8)
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov rdx, [" + addrReg + " + 8]") << ";; Load second struct slot for " << comment << std::endl;
+}
+
+static void emitStoreSmallStructToAddress(std::ofstream& f, const Type& t, const std::string& addrReg, const std::string& comment)
+{
+    size_t sz = sizeOfType(t);
+    f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov qword [" + addrReg + "], rax") << ";; Store first struct slot for " << comment << std::endl;
+    if (sz > 8)
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov qword [" + addrReg + " + 8], rdx") << ";; Store second struct slot for " << comment << std::endl;
 }
 
 static bool isIntegerScalarType(const Type &t)
@@ -343,6 +427,8 @@ enum TokenType
     TOKEN_INT,
     TOKEN_CHAR,
     TOKEN_VOID,
+    TOKEN_STRUCT,
+    TOKEN_UNION,
     TOKEN_ENUM,
     TOKEN_EXTERN,
     TOKEN_ELLIPSIS,
@@ -411,6 +497,8 @@ enum TokenType
     TOKEN_QUESTION,
     TOKEN_COLON,
     TOKEN_COMMA,
+    TOKEN_DOT,
+    TOKEN_ARROW,
     TOKEN_EOF
 };
 
@@ -422,6 +510,8 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_INT: return "int";
         case TOKEN_CHAR: return "char";
         case TOKEN_VOID: return "void";
+        case TOKEN_STRUCT: return "struct";
+        case TOKEN_UNION: return "union";
         case TOKEN_ENUM: return "enum";
         case TOKEN_EXTERN: return "extern";
         case TOKEN_ELLIPSIS: return "...";
@@ -491,13 +581,15 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_QUESTION: return "?";
         case TOKEN_COLON: return ":";
         case TOKEN_COMMA: return ",";
+        case TOKEN_DOT: return ".";
+        case TOKEN_ARROW: return "->";
         case TOKEN_EOF: return "EOF";
         default: return "<unknown>";
     }
 }
 
 // utility to construct a Type value from a TokenType and optional pointer count
-Type makeType(TokenType tok, int ptrLevel = 0, bool isUnsigned = false, bool isConst = false)
+Type makeType(TokenType tok, int ptrLevel = 0, bool isUnsigned = false, bool isConst = false, const std::string& structName = "")
 {
     Type t;
     switch (tok)
@@ -509,12 +601,18 @@ Type makeType(TokenType tok, int ptrLevel = 0, bool isUnsigned = false, bool isC
         case TOKEN_LONG_LONG: t.base = Type::LONG_LONG; break;
         case TOKEN_FLOAT: t.base = Type::FLOAT; break;
         case TOKEN_DOUBLE:t.base = Type::DOUBLE; break;
+        case TOKEN_STRUCT:t.base = Type::STRUCT; break;
+        case TOKEN_UNION:t.base = Type::UNION; break;
         case TOKEN_INT:   t.base = Type::INT;  break;
         default:          t.base = Type::INT;  break; // fallback for signed/unsigned etc
     }
     t.pointerLevel = ptrLevel;
     t.isUnsigned = isUnsigned;
-    t.isConst = isConst;
+    // This type model only tracks top-level const. For declarations like
+    // `const char* p`, the const applies to the pointee, not to the pointer
+    // object itself, so do not mark the resulting pointer type as const.
+    t.isConst = (ptrLevel == 0) ? isConst : false;
+    t.structName = structName;
     return t;
 }
 
@@ -932,6 +1030,8 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             if (ident == "for")     return Token{ TOKEN_FOR   , ident, tokenLine, tokenCol };
             if (ident == "char")    return Token{ TOKEN_CHAR  , ident, tokenLine, tokenCol };
             if (ident == "void")    return Token{ TOKEN_VOID  , ident, tokenLine, tokenCol };
+            if (ident == "struct")  return Token{ TOKEN_STRUCT, ident, tokenLine, tokenCol };
+            if (ident == "union")   return Token{ TOKEN_UNION , ident, tokenLine, tokenCol };
             if (ident == "enum")    return Token{ TOKEN_ENUM  , ident, tokenLine, tokenCol };
             if (ident == "else")    return Token{ TOKEN_ELSE  , ident, tokenLine, tokenCol };
             if (ident == "do")      return Token{ TOKEN_DO    , ident, tokenLine, tokenCol };
@@ -984,6 +1084,11 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             {
                 advance();
                 return Token{ TOKEN_DECREMENT, "--", tokenLine, tokenCol };
+            }
+            if (peek() == '>')
+            {
+                advance();
+                return Token{ TOKEN_ARROW, "->", tokenLine, tokenCol };
             }
             if (peek() == '=')
             {
@@ -1075,6 +1180,12 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
         {
             advance();
             return Token{TOKEN_COMMA, ",", tokenLine, tokenCol};
+        }
+
+        else if (ch == '.')
+        {
+            advance();
+            return Token{ TOKEN_DOT, ".", tokenLine, tokenCol };
         }
 
         else if (ch == '?')
@@ -1558,13 +1669,26 @@ struct FunctionCallNode : ASTNode
         // xmm registers are used in AL.
         std::vector<std::string> argRegisters = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
         
-        // Determine argument types if they were recorded during semantic checking
+        // Determine argument types if they were recorded during semantic checking.
         size_t argCount = arguments.size();
-        // calculate how many arguments go on the stack (those beyond the first 6 registers)
-        int stackArgs = (argCount > 6) ? (argCount - 6) : 0;
-        
-        // alignment logic same as before
-        int bytesToPush = stackArgs * 8;
+        std::vector<Type> passTypes(argCount, Type{Type::INT,0});
+        auto sigItAll = functionParamTypes.find(functionName);
+        for (size_t i = 0; i < argCount; ++i)
+        {
+            Type actual = (i < argTypes.size()) ? argTypes[i] : Type{Type::INT,0};
+            passTypes[i] = actual;
+            if (sigItAll != functionParamTypes.end() && i < sigItAll->second.size())
+                passTypes[i] = sigItAll->second[i];
+        }
+
+        int bytesToPush = 0;
+        for (size_t i = 0; i < argCount; ++i)
+        {
+            bool stackPass = isSmallStructValueType(passTypes[i]) || i >= 6;
+            if (stackPass)
+                bytesToPush += static_cast<int>(stackPassSize(passTypes[i]));
+        }
+
         int alignmentNeeded = (16 - (bytesToPush % 16)) % 16;
         if (alignmentNeeded > 0)
         {
@@ -1572,11 +1696,27 @@ struct FunctionCallNode : ASTNode
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Align stack for function call" << std::endl;
         }
         
-        // push stack arguments in reverse order
-        for (size_t i = argCount; i > 6; --i)
+        // push stack-passed arguments in reverse order
+        for (size_t i = argCount; i > 0; --i)
         {
-            arguments[i-1]->emitCode(f);
-            f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push argument " << i-1 << " onto stack" << std::endl;
+            size_t argIndex = i - 1;
+            bool stackPass = isSmallStructValueType(passTypes[argIndex]) || argIndex >= 6;
+            if (!stackPass)
+                continue;
+
+            arguments[argIndex]->emitCode(f);
+            size_t passSize = stackPassSize(passTypes[argIndex]);
+            if (isSmallStructValueType(passTypes[argIndex]))
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tsub rsp, " + std::to_string(passSize)) << ";; Reserve stack space for struct argument " << argIndex << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rsp], rax" << ";; Store first struct arg slot" << std::endl;
+                if (passSize > 8)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rsp + 8], rdx" << ";; Store second struct arg slot" << std::endl;
+            }
+            else
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push argument " << argIndex << " onto stack" << std::endl;
+            }
         }
 
         int floatRegCount = 0;
@@ -1590,6 +1730,9 @@ struct FunctionCallNode : ASTNode
         int floatRegsUsed = 0;
         for (size_t i = 0; i < argCount && i < 6; ++i)
         {
+            if (isSmallStructValueType(passTypes[i]))
+                continue;
+
             // save integer registers currently in use
             for (int j = 0; j < intRegsUsed; ++j) {
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tpush " + argRegisters[j]
@@ -1611,10 +1754,7 @@ struct FunctionCallNode : ASTNode
             // Determine argument type to pass and convert value accordingly.
             Type actual = {Type::INT,0};
             if (i < argTypes.size()) actual = argTypes[i];
-            Type passType = actual;
-            auto sigIt = functionParamTypes.find(functionName);
-            if (sigIt != functionParamTypes.end() && i < sigIt->second.size())
-                passType = sigIt->second[i];
+            Type passType = passTypes[i];
             // only convert non-pointer arithmetic types
             auto isNum = [&](const Type &tt){ return isIntegerScalarType(tt) || isFloatScalarType(tt); };
             if (isNum(actual) && isNum(passType) && !(actual == passType)) {
@@ -1813,6 +1953,8 @@ struct FunctionNode : ASTNode
         for (size_t i = 0; i < parameters.size() && i < 6; ++i)
         {
             Type pt = parameters[i].first;
+            if (isSmallStructValueType(pt))
+                continue;
             bool isFloatParam = (pt.pointerLevel == 0 && (pt.base == Type::FLOAT || pt.base == Type::DOUBLE));
             size_t offset = (i + 1) * 8;
             if (isFloatParam) {
@@ -1841,26 +1983,29 @@ struct FunctionNode : ASTNode
         // byte offsets manually rather than using `functionVariableIndex`, since
         // the latter is meant for locals and was previously producing tiny values
         // (1,2,3) which led to incorrect loads at offsets -1,-2 etc.
+        size_t stackParamOffset = 0;
         for (size_t i = 0; i < parameters.size(); i++)
         {
             std::string paramName = parameters[i].second;
             std::string uniqueName = generateUniqueName(paramName);
 
             size_t index;
-            if (i < 6)
+            bool stackPassed = isSmallStructValueType(parameters[i].first) || i >= 6;
+            if (!stackPassed)
             {
                 // register parameters saved at (i+1)*8 bytes below rbp
                 index = (i + 1) * 8;
             }
             else
             {
-                // stack parameters: positive offset from rbp, using slot index
-                index = (i - 6) * 8;
+                // stack parameters: positive offset from rbp, cumulative by pass size
+                index = stackParamOffset;
+                stackParamOffset += stackPassSize(parameters[i].first);
             }
 
             // Add the parameter to the current scope (record its type as well)
             scopes.top()[paramName] = {uniqueName, index, parameters[i].first};
-            if (i >= 6)
+            if (stackPassed)
                 scopes.top()[paramName].isStackParameter = true;
             if (i < parameterDimensions.size())
                 scopes.top()[paramName].dimensions = parameterDimensions[i];
@@ -1899,6 +2044,79 @@ struct FunctionNode : ASTNode
  ************************************************************/
 
 
+struct StructLiteralNode : ASTNode
+{
+    std::string structName;
+    std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> initializers;
+    int line = 0;
+    int col = 0;
+
+    StructLiteralNode(std::string name,
+                      std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> inits,
+                      int l = 0,
+                      int c = 0)
+        : structName(std::move(name)), initializers(std::move(inits)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        for (const auto& init : initializers)
+        {
+            if (init.second)
+                init.second->emitData(f);
+        }
+    }
+
+    void emitIntoAddress(std::ofstream& f, const std::string& baseAddressReg) const
+    {
+        auto it = structTypes.find(structName);
+        if (it == structTypes.end())
+            return;
+
+        // Save the base address on the stack for the duration of this loop.
+        // emitCode() for expressions freely clobbers rcx (and other caller-saved
+        // registers), so we cannot rely on baseAddressReg staying valid after the
+        // call.  We peek at [rsp] (the saved base) after each emitCode(); emitCode()
+        // is always stack-balanced, so [rsp] reliably contains our saved address.
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tpush " + baseAddressReg) << ";; Save struct base address across member init expressions" << std::endl;
+
+        for (const auto& member : it->second.members)
+        {
+            for (const auto& init : initializers)
+            {
+                if (init.first != member.name || !init.second)
+                    continue;
+
+                init.second->emitCode(f);
+                // rax = member value; rsp is back-balanced — peek saved base into rcx.
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rsp]" << ";; Peek saved struct base address" << std::endl;
+                if (member.offset != 0)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tadd rcx, " + std::to_string(member.offset)) << ";; Struct member offset" << std::endl;
+
+                std::string store;
+                size_t memberSize = sizeOfType(member.type);
+                if (memberSize == 1)
+                    store = "\tmov byte [rcx], al";
+                else if (memberSize == 2)
+                    store = "\tmov word [rcx], ax";
+                else if (memberSize == 4)
+                    store = "\tmov dword [rcx], eax";
+                else
+                    store = "\tmov qword [rcx], rax";
+                f << std::left << std::setw(COMMENT_COLUMN) << store << ";; Initialize struct member " << member.name << std::endl;
+                break;
+            }
+        }
+
+        // Discard the saved base address.
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rsp, 8" << ";; Discard saved struct base address" << std::endl;
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rax" << ";; Struct literal address materialization is not implemented here" << std::endl;
+    }
+};
+
 struct ReturnNode : ASTNode
 {
     std::unique_ptr<ASTNode> expression; // Can be nullptr for void returns
@@ -1921,11 +2139,41 @@ struct ReturnNode : ASTNode
     {
         if (expression)
         {
-            expression->emitCode(f);
-            // Return expression is a full-expression boundary.
-            emitDeferredPostfixOps(f);
+            if (currentFunction && currentFunction->returnType.pointerLevel == 0 &&
+                (currentFunction->returnType.base == Type::STRUCT || currentFunction->returnType.base == Type::UNION))
+            {
+                if (auto sl = dynamic_cast<const StructLiteralNode*>(expression.get()))
+                {
+                    size_t structSize = sizeOfType(currentFunction->returnType);
+                    if (structSize > 0 && structSize <= 16)
+                    {
+                        size_t tempSize = alignUp(structSize, 8);
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tsub rsp, " + std::to_string(tempSize)) << ";; Temporary storage for struct return" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rsp" << ";; Struct return temp base" << std::endl;
+                        sl->emitIntoAddress(f, "rcx");
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rsp]" << ";; Return first struct slot" << std::endl;
+                        if (structSize > 8)
+                            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, [rsp + 8]" << ";; Return second struct slot" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tadd rsp, " + std::to_string(tempSize)) << ";; Release struct return temp" << std::endl;
+                    }
+                    else
+                    {
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rax" << ";; Unsupported large struct return" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\txor rdx, rdx" << ";; Unsupported large struct return" << std::endl;
+                    }
+                }
+                else
+                {
+                    expression->emitCode(f);
+                    emitDeferredPostfixOps(f);
+                }
+            }
+            else
+            {
+                expression->emitCode(f);
+                emitDeferredPostfixOps(f);
+            }
         }
-        // Emit function epilogue for all returns
         f << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rsp, rbp " << ";; Restore stack pointer" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rbp " << ";; Restore base pointer" << std::endl;
@@ -1957,6 +2205,7 @@ struct EnumDeclarationNode : ASTNode
 };
 
 
+
 /**************************************************************************************************
  *      _____   ______  _____  _                 _____          _______  _____  ____   _   _      *
  *     |  __ \ |  ____|/ ____|| |         /\    |  __ \     /\ |__   __||_   _|/ __ \ | \ | |     *
@@ -1982,7 +2231,13 @@ struct DeclarationNode : ASTNode
 
     // report stack space required for this declaration (scalar)
     size_t getArraySpaceNeeded() const override {
-        return sizeOfType(varType);
+        size_t varSize = sizeOfType(varType);
+        size_t align = (varType.pointerLevel > 0) ? 8 : varSize;
+        if (align == 0) align = 1;
+        if (align > 8) align = 8;
+        // Conservative per-declaration estimate for frame pre-allocation.
+        // This absorbs alignment padding introduced during emitCode().
+        return alignUp(varSize, align);
     }
 
     void emitData(std::ofstream& f) const override
@@ -2008,27 +2263,47 @@ struct DeclarationNode : ASTNode
         // round up current index to the alignment boundary
         functionVariableIndex = ((functionVariableIndex + align - 1) / align) * align;
 
+        // Reserve this variable's storage first, then use the resulting index as
+        // the stack base address ([rbp - offset]). This avoids overlapping slots
+        // when later accesses add positive in-object offsets (e.g. struct fields).
+        functionVariableIndex += varSize;
         size_t offset = functionVariableIndex;
-        functionVariableIndex += varSize; // advance by its size
         scopes.top()[identifier] = {uniqueName, offset, varType, {}, 0, false, isRegisterStorage};
         scopes.top()[identifier].knownObjectSize = knownObjectSize;
 
         if (initializer)
         {
-            initializer->emitCode(f);
-            emitScalarConversion(f, varType, initType);
-            // use size-specific store so we don't accidentally write extra garbage bytes
-            std::string instruction;
-            if (varSize == 1) {
-                instruction = "\tmov byte [rbp - " + std::to_string(offset) + "], al";
-            } else if (varSize == 2) {
-                instruction = "\tmov word [rbp - " + std::to_string(offset) + "], ax";
-            } else if (varSize == 4) {
-                instruction = "\tmov dword [rbp - " + std::to_string(offset) + "], eax";
-            } else {
-                instruction = "\tmov [rbp - " + std::to_string(offset) + "], rax";
+            if (varType.pointerLevel == 0 && (varType.base == Type::STRUCT || varType.base == Type::UNION))
+            {
+                if (auto sl = dynamic_cast<const StructLiteralNode*>(initializer.get()))
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(offset) + "]") << ";; Address of local struct initializer" << std::endl;
+                    sl->emitIntoAddress(f, "rcx");
+                }
+                else
+                {
+                    initializer->emitCode(f);
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(offset) + "]") << ";; Address of local struct " << uniqueName << std::endl;
+                    emitStoreSmallStructToAddress(f, varType, "rcx", uniqueName);
+                }
             }
-            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Initialize " << uniqueName << std::endl;
+            else
+            {
+                initializer->emitCode(f);
+                emitScalarConversion(f, varType, initType);
+                // use size-specific store so we don't accidentally write extra garbage bytes
+                std::string instruction;
+                if (varSize == 1) {
+                    instruction = "\tmov byte [rbp - " + std::to_string(offset) + "], al";
+                } else if (varSize == 2) {
+                    instruction = "\tmov word [rbp - " + std::to_string(offset) + "], ax";
+                } else if (varSize == 4) {
+                    instruction = "\tmov dword [rbp - " + std::to_string(offset) + "], eax";
+                } else {
+                    instruction = "\tmov [rbp - " + std::to_string(offset) + "], rax";
+                }
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Initialize " << uniqueName << std::endl;
+            }
         }
     }
 };
@@ -2127,8 +2402,11 @@ struct AddressOfNode : ASTNode
             VarInfo info = lookupResult.second;
             std::string uniqueName = info.uniqueName;
             size_t index = info.index;
-            // All variables (parameters and locals) are now on the stack relative to rbp
-            std::string instruction = "\tlea rax, [rbp - " + std::to_string(index) + "]";
+            std::string instruction;
+            if (info.isStackParameter)
+                instruction = "\tlea rax, [rbp + " + std::to_string(index + 16) + "]";
+            else
+                instruction = "\tlea rax, [rbp - " + std::to_string(index) + "]";
             f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of variable " << uniqueName << std::endl;
         }
         else if (isGlobal)
@@ -2187,7 +2465,12 @@ struct ArrayDeclarationNode : ASTNode
         Type elemType = varType;
         if (elemType.pointerLevel > 0) elemType.pointerLevel--;
         size_t elemSize = sizeOfType(elemType);
-        return totalElements * elemSize;
+        size_t totalSize = totalElements * elemSize;
+        size_t elemAlign = elemSize;
+        if (elemAlign == 0) elemAlign = 1;
+        if (elemAlign > 8) elemAlign = 8;
+        // Conservative estimate includes alignment padding.
+        return alignUp(totalSize, elemAlign);
     }
 
     void emitData(std::ofstream& f) const override
@@ -2297,9 +2580,9 @@ struct ArrayDeclarationNode : ASTNode
         if (elemAlign > 8) elemAlign = 8;
         functionVariableIndex = ((functionVariableIndex + elemAlign - 1) / elemAlign) * elemAlign;
 
-        // Keep baseOffset as the first element address (lowest address in the
-        // allocated block), so element i lives at [base + i*elemSize].
-        size_t baseOffset = functionVariableIndex + totalSize - elemSize;
+        // Keep baseOffset as element 0 address, then element i is at
+        // [rbp - (baseOffset - i*elemSize)].
+        size_t baseOffset = functionVariableIndex + totalSize;
         functionVariableIndex += totalSize; // allocate entire block
         VarInfo info{uniqueName, baseOffset, varType};
         info.dimensions = dims; // record dims
@@ -2572,7 +2855,7 @@ struct ArrayAccessNode : ASTNode
                 // no change
             } else {
                 f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, " + std::to_string(elemSize)
-                  << " ;; scale offset by element size" << std::endl;
+                  << ";; scale offset by element size" << std::endl;
             }
             if (pointerBase)
             {
@@ -2602,8 +2885,8 @@ struct ArrayAccessNode : ASTNode
             {
                 // global base is label
                 std::string globalSym = globalAsmSymbol(identifier);
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << " ;; load base address" << std::endl;
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << " ;; add base address" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; load base address" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; add base address" << std::endl;
                 if (elemSize == 1)
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tmovsx rax, byte [rax]" << ";; Load " << uniqueName << "[dynamic]" << std::endl;
                 else if (elemSize == 2)
@@ -2639,6 +2922,9 @@ struct PostfixIndexNode : ASTNode
     std::unique_ptr<ASTNode> indexExpr;
     Type baseType{Type::INT,1};
     Type resultType{Type::INT,0};
+    size_t customElemSize = 0;
+    bool yieldsPointer = false;
+    std::vector<size_t> remainingArrayDims;
     int line = 0;
     int col = 0;
 
@@ -2658,13 +2944,19 @@ struct PostfixIndexNode : ASTNode
         indexExpr->emitCode(f);
         f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore base pointer" << std::endl;
 
-        size_t elemSize = pointeeSize(baseType);
+        size_t elemSize = customElemSize ? customElemSize : pointeeSize(baseType);
         if (elemSize > 1)
         {
             f << std::left << std::setw(COMMENT_COLUMN) << ("\timul rax, " + std::to_string(elemSize))
               << ";; Scale index by element size" << std::endl;
         }
         f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, rax" << ";; Compute indexed address" << std::endl;
+
+        if (yieldsPointer)
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Intermediate multidim index yields pointer" << std::endl;
+            return;
+        }
 
         std::string instruction;
         if (resultType.pointerLevel > 0 || resultType.base == Type::DOUBLE)
@@ -2688,6 +2980,150 @@ struct PostfixIndexNode : ASTNode
     }
 };
 
+struct MemberAccessNode : ASTNode
+{
+    std::unique_ptr<ASTNode> baseExpr;
+    std::string memberName;
+    bool throughPointer = false; // true for '->', false for '.'
+    Type resultType{Type::INT, 0};
+    size_t memberOffset = 0;
+    bool isArrayMember = false; // true if member is an array (decayed to pointer)
+    bool isBitField = false;
+    int bitFieldWidth = 0;
+    int bitFieldOffset = 0;
+    std::vector<size_t> memberDimensions;
+    int line = 0;
+    int col = 0;
+
+    MemberAccessNode(std::unique_ptr<ASTNode> b, const std::string& m, bool ptr, int l = 0, int c = 0)
+        : baseExpr(std::move(b)), memberName(m), throughPointer(ptr), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        baseExpr->emitData(f);
+    }
+
+    void emitAddress(std::ofstream& f) const
+    {
+        if (throughPointer)
+        {
+            baseExpr->emitCode(f);
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; Load struct pointer base" << std::endl;
+        }
+        else
+        {
+            if (const std::string* nm = baseExpr->getIdentifierName())
+            {
+                auto lookupResult = lookupVariable(*nm);
+                if (lookupResult.first)
+                {
+                    const VarInfo& info = lookupResult.second;
+                    if (info.isStackParameter)
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp + " + std::to_string(info.index + 16) + "]") << ";; Address of local struct parameter" << std::endl;
+                    else
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(info.index) + "]") << ";; Address of local struct" << std::endl;
+                }
+                else if (globalVariables.find(*nm) != globalVariables.end())
+                {
+                    std::string globalSym = globalAsmSymbol(*nm);
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [" + globalSym + "]") << ";; Address of global struct" << std::endl;
+                }
+                else
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\txor rcx, rcx" << ";; Invalid struct base" << std::endl;
+                }
+            }
+            else if (auto ma = dynamic_cast<const MemberAccessNode*>(baseExpr.get()))
+            {
+                ma->emitAddress(f);
+            }
+            else if (auto dn = dynamic_cast<const DereferenceNode*>(baseExpr.get()))
+            {
+                dn->operand->emitCode(f);
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; Address via dereference" << std::endl;
+            }
+            else
+            {
+                baseExpr->emitCode(f);
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; Fallback struct base address" << std::endl;
+            }
+        }
+
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tadd rcx, " + std::to_string(memberOffset)) << ";; Add member offset" << std::endl;
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        emitAddress(f);
+
+        if (resultType.pointerLevel == 0 && (resultType.base == Type::STRUCT || resultType.base == Type::UNION))
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Struct/union member expression yields address" << std::endl;
+            return;
+        }
+
+        // Array members decay to pointers, so just return the address
+        if (isArrayMember && resultType.pointerLevel == 1)
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Array member decayed to pointer" << std::endl;
+            return;
+        }
+
+        if (isBitField && bitFieldWidth > 0)
+        {
+            // Load containing storage unit first.
+            std::string storageLoad = loadScalarToRaxInstruction(resultType, "[rcx]");
+            f << std::left << std::setw(COMMENT_COLUMN) << storageLoad << ";; Load bit-field storage" << std::endl;
+
+            if (bitFieldOffset > 0)
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tshr rax, " + std::to_string(bitFieldOffset)) << ";; Align bit field to LSB" << std::endl;
+
+            if (bitFieldWidth < 64)
+            {
+                uint64_t mask = (1ULL << bitFieldWidth) - 1ULL;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rax, " + std::to_string(mask)) << ";; Mask bit field width" << std::endl;
+
+                if (!resultType.isUnsigned && resultType.base != Type::CHAR)
+                {
+                    int signShift = 64 - bitFieldWidth;
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tshl rax, " + std::to_string(signShift)) << ";; Prepare sign extension" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tsar rax, " + std::to_string(signShift)) << ";; Sign-extend bit field" << std::endl;
+                }
+            }
+
+            return;
+        }
+
+        std::string instruction = loadScalarToRaxInstruction(resultType, "[rcx]");
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load struct member" << std::endl;
+    }
+};
+
+struct MemberAddressNode : ASTNode
+{
+    std::unique_ptr<ASTNode> memberExpr;
+
+    explicit MemberAddressNode(std::unique_ptr<ASTNode> m)
+        : memberExpr(std::move(m)) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        memberExpr->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        if (auto ma = dynamic_cast<MemberAccessNode*>(memberExpr.get()))
+        {
+            ma->emitAddress(f);
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Materialize member address" << std::endl;
+        }
+        else
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rax" << ";; Invalid member address expression" << std::endl;
+        }
+    }
+};
 
 /********************************************************************************************
  *                 _____   _____  _____   _____  _   _  __  __  ______  _   _  _______      *
@@ -2720,7 +3156,7 @@ struct AssignmentNode : ASTNode
  
     void emitData(std::ofstream& f) const override
     {
-        // ADDED, BUT I DON'T IF IT WILL NOT BREAK EVERYTHING
+        // ADDED, BUT I DON'T KNOW IF IT WILL NOT BREAK EVERYTHING
         expression.get()->emitData(f);
         for (const auto& stmt : indices)
         {
@@ -2947,13 +3383,13 @@ struct AssignmentNode : ASTNode
                     // nothing to do
                 } else {
                     f << std::left << std::setw(COMMENT_COLUMN) << "\timul rax, " + std::to_string(elemSize)
-                      << " ;; scale offset by element size" << std::endl;
+                      << ";; scale offset by element size" << std::endl;
                 }
                 if (isGlobal)
                 {
                     std::string globalSym = globalAsmSymbol(identifier);
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << " ;; load base address" << std::endl;
-                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << " ;; add base address" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; load base address" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rax, rcx" << ";; add base address" << std::endl;
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore value" << std::endl;
                     std::string instr;
                     if (elemSize == 1) instr = "\tmov byte [rax], cl";
@@ -2988,26 +3424,41 @@ struct AssignmentNode : ASTNode
                 std::string uniqueName = infoC.uniqueName;
                 size_t offset = infoC.index;
                 size_t varSize = sizeOfType(infoC.type);
-                emitScalarConversion(f, infoC.type, rhsType);
-                // store to local variable using correct width
-                std::string instruction;
-                if (varSize == 1) {
-                    instruction = "\tmov byte [rbp - " + std::to_string(offset) + "], al";
-                } else if (varSize == 2) {
-                    instruction = "\tmov word [rbp - " + std::to_string(offset) + "], ax";
-                } else if (varSize == 4) {
-                    instruction = "\tmov dword [rbp - " + std::to_string(offset) + "], eax";
-                } else {
-                    instruction = "\tmov [rbp - " + std::to_string(offset) + "], rax";
+                if (isSmallStructValueType(infoC.type))
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(offset) + "]") << ";; Address of local struct " << uniqueName << std::endl;
+                    emitStoreSmallStructToAddress(f, infoC.type, "rcx", uniqueName);
                 }
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in local variable " << uniqueName << std::endl;
+                else
+                {
+                    emitScalarConversion(f, infoC.type, rhsType);
+                    // store to local variable using correct width
+                    std::string instruction;
+                    if (varSize == 1) {
+                        instruction = "\tmov byte [rbp - " + std::to_string(offset) + "], al";
+                    } else if (varSize == 2) {
+                        instruction = "\tmov word [rbp - " + std::to_string(offset) + "], ax";
+                    } else if (varSize == 4) {
+                        instruction = "\tmov dword [rbp - " + std::to_string(offset) + "], eax";
+                    } else {
+                        instruction = "\tmov [rbp - " + std::to_string(offset) + "], rax";
+                    }
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in local variable " << uniqueName << std::endl;
+                }
             }
             else
             {
                 std::string globalSym = globalAsmSymbol(identifier);
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global target address" << std::endl;
-                std::string instruction = "\tmov [rcx], rax";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in global variable " << identifier << std::endl;
+                if (globalVariables.count(identifier) && isSmallStructValueType(globalVariables[identifier]))
+                {
+                    emitStoreSmallStructToAddress(f, globalVariables[identifier], "rcx", identifier);
+                }
+                else
+                {
+                    std::string instruction = "\tmov [rcx], rax";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in global variable " << identifier << std::endl;
+                }
             }
         }
         // Apply all deferred postfix operations at the end of assignment
@@ -3034,6 +3485,56 @@ struct IndirectAssignmentNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
+        if (auto mad = dynamic_cast<MemberAddressNode*>(pointerExpr.get()))
+        {
+            if (auto ma = dynamic_cast<MemberAccessNode*>(mad->memberExpr.get()))
+            {
+                if (ma->isBitField && ma->bitFieldWidth > 0)
+                {
+                    expression->emitCode(f);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r8, rax" << ";; Save RHS for bit-field assignment" << std::endl;
+
+                    mad->emitCode(f);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, rax" << ";; Address of bit-field storage" << std::endl;
+
+                    size_t storeSize = sizeOfType(ma->resultType);
+                    if (storeSize == 1)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, byte [rdx]" << ";; Load existing bit-field storage" << std::endl;
+                    else if (storeSize == 2)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, word [rdx]" << ";; Load existing bit-field storage" << std::endl;
+                    else if (storeSize == 4)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov eax, dword [rdx]" << ";; Load existing bit-field storage" << std::endl;
+                    else
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, qword [rdx]" << ";; Load existing bit-field storage" << std::endl;
+
+                    uint64_t baseMask = (ma->bitFieldWidth >= 64) ? ~0ULL : ((1ULL << ma->bitFieldWidth) - 1ULL);
+                    uint64_t shiftedMask = (ma->bitFieldOffset == 0) ? baseMask : (baseMask << ma->bitFieldOffset);
+                    uint64_t clearMask = ~shiftedMask;
+
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tand r8, " + std::to_string(baseMask)) << ";; Truncate RHS to bit-field width" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, r8" << ";; Preserve assignment result value" << std::endl;
+                    if (ma->bitFieldOffset > 0)
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tshl r8, " + std::to_string(ma->bitFieldOffset)) << ";; Position RHS bits" << std::endl;
+
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rax, " + std::to_string(clearMask)) << ";; Clear destination bit-field bits" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tor rax, r8" << ";; Merge new bit-field value" << std::endl;
+
+                    if (storeSize == 1)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov byte [rdx], al" << ";; Store updated bit-field storage" << std::endl;
+                    else if (storeSize == 2)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov word [rdx], ax" << ";; Store updated bit-field storage" << std::endl;
+                    else if (storeSize == 4)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov dword [rdx], eax" << ";; Store updated bit-field storage" << std::endl;
+                    else
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rdx], rax" << ";; Store updated bit-field storage" << std::endl;
+
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Assignment expression result" << std::endl;
+                    emitDeferredPostfixOps(f);
+                    return;
+                }
+            }
+        }
+
         expression->emitCode(f);
         f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save assigned value" << std::endl;
         pointerExpr->emitCode(f);
@@ -4044,7 +4545,7 @@ struct UnaryOpNode : ASTNode
                 std::string uniqueName = info.uniqueName;
                 size_t offset = info.index;
                 // Load the current value and save it
-                size_t varSize = sizeOfType(info.type);
+                // size_t varSize = sizeOfType(info.type);
                 std::string instruction = loadScalarToRaxInstruction(info.type, "[rbp - " + std::to_string(offset) + "]");
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load " << uniqueName << " into rax (postfix value)" << std::endl;
                 // Don't apply the operation yet - defer it for later
@@ -4057,7 +4558,7 @@ struct UnaryOpNode : ASTNode
                 auto it = globalVariables.find(name);
                 if (it != globalVariables.end())
                     globalType = it->second;
-                size_t varSize = sizeOfType(globalType);
+                // size_t varSize = sizeOfType(globalType);
                 std::string globalSym = globalAsmSymbol(name);
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global slot address" << std::endl;
                 std::string instruction = loadScalarToRaxInstruction(globalType, "[rcx]");
@@ -4360,6 +4861,12 @@ struct IdentifierNode : ASTNode
                     std::string instruction = "\tmov rax, [rbp + " + std::to_string(offset + 16) + "]";
                     f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load pointer parameter " << uniqueName << std::endl;
                 }
+                else if (isSmallStructValueType(infoResult.type))
+                {
+                    std::string instruction = "\tlea rcx, [rbp + " + std::to_string(offset + 16) + "]";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of stack struct parameter " << uniqueName << std::endl;
+                    emitLoadSmallStructFromAddress(f, infoResult.type, "rcx", uniqueName);
+                }
                 else
                 {
                     std::string instruction;
@@ -4389,6 +4896,12 @@ struct IdentifierNode : ASTNode
                     // for a local array, we need the address of its first element, not its value
                     std::string instruction = "\tlea rax, [rbp - " + std::to_string(index) + "]";
                     f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load address of array " << uniqueName << std::endl;
+                }
+                else if (isSmallStructValueType(infoResult.type))
+                {
+                    std::string instruction = "\tlea rcx, [rbp - " + std::to_string(index) + "]";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Address of local struct " << uniqueName << std::endl;
+                    emitLoadSmallStructFromAddress(f, infoResult.type, "rcx", uniqueName);
                 }
                 else
                 {
@@ -4426,8 +4939,15 @@ struct IdentifierNode : ASTNode
                 Type gt = globalVariables[name];
                 std::string globalSym = globalAsmSymbol(name);
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global slot address" << std::endl;
-                std::string instruction = loadScalarToRaxInstruction(gt, "[rcx]");
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load global variable " << name << std::endl;
+                if (isSmallStructValueType(gt))
+                {
+                    emitLoadSmallStructFromAddress(f, gt, "rcx", name);
+                }
+                else
+                {
+                    std::string instruction = loadScalarToRaxInstruction(gt, "[rcx]");
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load global variable " << name << std::endl;
+                }
             }
         }
         else
@@ -4551,7 +5071,34 @@ class Parser
             return std::make_unique<ArrayAccessNode>(aa->identifier, std::move(idx), currentFunction, aa->line, aa->col);
         }
         if (auto pi = dynamic_cast<const PostfixIndexNode*>(node))
-            return std::make_unique<PostfixIndexNode>(cloneExpr(pi->baseExpr.get(), currentFunction), cloneExpr(pi->indexExpr.get(), currentFunction), pi->line, pi->col);
+        {
+            auto cloned = std::make_unique<PostfixIndexNode>(cloneExpr(pi->baseExpr.get(), currentFunction), cloneExpr(pi->indexExpr.get(), currentFunction), pi->line, pi->col);
+            cloned->baseType = pi->baseType;
+            cloned->resultType = pi->resultType;
+            cloned->customElemSize = pi->customElemSize;
+            cloned->yieldsPointer = pi->yieldsPointer;
+            cloned->remainingArrayDims = pi->remainingArrayDims;
+            return cloned;
+        }
+        if (auto ma = dynamic_cast<const MemberAccessNode*>(node))
+        {
+            auto cloned = std::make_unique<MemberAccessNode>(cloneExpr(ma->baseExpr.get(), currentFunction), ma->memberName, ma->throughPointer, ma->line, ma->col);
+            cloned->resultType = ma->resultType;
+            cloned->memberOffset = ma->memberOffset;
+            cloned->isArrayMember = ma->isArrayMember;
+            cloned->isBitField = ma->isBitField;
+            cloned->bitFieldWidth = ma->bitFieldWidth;
+            cloned->bitFieldOffset = ma->bitFieldOffset;
+            cloned->memberDimensions = ma->memberDimensions;
+            return cloned;
+        }
+        if (auto sl = dynamic_cast<const StructLiteralNode*>(node))
+        {
+            std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> inits;
+            for (const auto& init : sl->initializers)
+                inits.push_back({init.first, cloneExpr(init.second.get(), currentFunction)});
+            return std::make_unique<StructLiteralNode>(sl->structName, std::move(inits), sl->line, sl->col);
+        }
         if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
         {
             std::vector<std::unique_ptr<ASTNode>> args;
@@ -4591,12 +5138,12 @@ class Parser
     bool isTypeSpecifierToken(TokenType t) const
     {
         return t == TOKEN_INT || t == TOKEN_CHAR || t == TOKEN_VOID || t == TOKEN_SHORT ||
-               t == TOKEN_LONG || t == TOKEN_FLOAT || t == TOKEN_DOUBLE ||
-               t == TOKEN_UNSIGNED || t == TOKEN_SIGNED || t == TOKEN_CONST ||
+               t == TOKEN_LONG || t == TOKEN_FLOAT || t == TOKEN_DOUBLE || t == TOKEN_STRUCT ||
+               t == TOKEN_UNION || t == TOKEN_UNSIGNED || t == TOKEN_SIGNED || t == TOKEN_CONST ||
                t == TOKEN_AUTO || t == TOKEN_REGISTER;
     }
 
-    TokenType parseTypeSpecifiers(bool &isUnsignedOut, bool &isConstOut, bool &isAutoOut, bool &isRegisterOut)
+    TokenType parseTypeSpecifiers(bool &isUnsignedOut, bool &isConstOut, bool &isAutoOut, bool &isRegisterOut, std::string* structNameOut = nullptr)
     {
         bool sawUnsigned = false;
         bool sawSigned = false;
@@ -4610,22 +5157,435 @@ class Parser
         bool sawVoid = false;
         bool sawFloat = false;
         bool sawDouble = false;
+        bool sawStruct = false;
+        bool sawUnion = false;
+        std::string structName;
+        bool isUnion = false;  // Track if the aggregate is a union vs struct
 
         while (isTypeSpecifierToken(currentToken.type))
         {
-            if (currentToken.type == TOKEN_UNSIGNED) sawUnsigned = true;
-            else if (currentToken.type == TOKEN_SIGNED) sawSigned = true;
-            else if (currentToken.type == TOKEN_CONST) sawConst = true;
-            else if (currentToken.type == TOKEN_AUTO) sawAuto = true;
-            else if (currentToken.type == TOKEN_REGISTER) sawRegister = true;
-            else if (currentToken.type == TOKEN_SHORT) sawShort = true;
-            else if (currentToken.type == TOKEN_LONG) longCount++;
-            else if (currentToken.type == TOKEN_INT) sawInt = true;
-            else if (currentToken.type == TOKEN_CHAR) sawChar = true;
-            else if (currentToken.type == TOKEN_VOID) sawVoid = true;
-            else if (currentToken.type == TOKEN_FLOAT) sawFloat = true;
-            else if (currentToken.type == TOKEN_DOUBLE) sawDouble = true;
-            eat(currentToken.type);
+            if (currentToken.type == TOKEN_UNSIGNED) { sawUnsigned = true; eat(TOKEN_UNSIGNED); }
+            else if (currentToken.type == TOKEN_SIGNED) { sawSigned = true; eat(TOKEN_SIGNED); }
+            else if (currentToken.type == TOKEN_CONST) { sawConst = true; eat(TOKEN_CONST); }
+            else if (currentToken.type == TOKEN_AUTO) { sawAuto = true; eat(TOKEN_AUTO); }
+            else if (currentToken.type == TOKEN_REGISTER) { sawRegister = true; eat(TOKEN_REGISTER); }
+            else if (currentToken.type == TOKEN_SHORT) { sawShort = true; eat(TOKEN_SHORT); }
+            else if (currentToken.type == TOKEN_LONG) { longCount++; eat(TOKEN_LONG); }
+            else if (currentToken.type == TOKEN_INT) { sawInt = true; eat(TOKEN_INT); }
+            else if (currentToken.type == TOKEN_CHAR) { sawChar = true; eat(TOKEN_CHAR); }
+            else if (currentToken.type == TOKEN_VOID) { sawVoid = true; eat(TOKEN_VOID); }
+            else if (currentToken.type == TOKEN_FLOAT) { sawFloat = true; eat(TOKEN_FLOAT); }
+            else if (currentToken.type == TOKEN_DOUBLE) { sawDouble = true; eat(TOKEN_DOUBLE); }
+            else if (currentToken.type == TOKEN_STRUCT)
+            {
+                sawStruct = true;
+                eat(TOKEN_STRUCT);
+
+                std::string tag;
+                Token tagTok = currentToken;
+                if (currentToken.type == TOKEN_IDENTIFIER)
+                {
+                    tag = currentToken.value;
+                    eat(TOKEN_IDENTIFIER);
+                }
+
+                if (currentToken.type == TOKEN_LBRACE)
+                {
+                    eat(TOKEN_LBRACE);
+                    StructTypeInfo info;
+                    info.isComplete = true;
+
+                    while (currentToken.type != TOKEN_RBRACE && currentToken.type != TOKEN_EOF)
+                    {
+                        bool mu = false, mc = false, ma = false, mr = false;
+                        std::string memberStructName;
+                        if (!isTypeSpecifierToken(currentToken.type))
+                        {
+                            reportError(currentToken.line, currentToken.col, "Expected member type in struct definition");
+                            hadError = true;
+                            break;
+                        }
+                        TokenType mtok = parseTypeSpecifiers(mu, mc, ma, mr, &memberStructName);
+                        int ptrLevel = 0;
+                        while (currentToken.type == TOKEN_MUL)
+                        {
+                            ++ptrLevel;
+                            eat(TOKEN_MUL);
+                        }
+
+                        if (currentToken.type != TOKEN_IDENTIFIER)
+                        {
+                            reportError(currentToken.line, currentToken.col, "Expected member name in struct definition");
+                            hadError = true;
+                            break;
+                        }
+
+                        std::string memberName = currentToken.value;
+                        eat(TOKEN_IDENTIFIER);
+
+                        // Parse array dimensions for struct members
+                        std::vector<size_t> memberDimensions;
+                        bool isFlexible = false;
+                        while (currentToken.type == TOKEN_LBRACKET)
+                        {
+                            eat(TOKEN_LBRACKET);
+                            if (currentToken.type == TOKEN_RBRACKET)
+                            {
+                                // Flexible array member (must be last and only one)
+                                if (!memberDimensions.empty())
+                                {
+                                    reportError(currentToken.line, currentToken.col, "Only unsized array allowed for flexible member");
+                                    hadError = true;
+                                }
+                                memberDimensions.push_back(0);
+                                isFlexible = true;
+                            }
+                            else if (currentToken.type == TOKEN_NUMBER)
+                            {
+                                memberDimensions.push_back(std::stoul(currentToken.value));
+                                eat(TOKEN_NUMBER);
+                            }
+                            else
+                            {
+                                reportError(currentToken.line, currentToken.col, "Struct array member size must be constant");
+                                hadError = true;
+                                memberDimensions.push_back(1);
+                            }
+                            eat(TOKEN_RBRACKET);
+                        }
+
+                        // Parse bit field width (if present)
+                        int bitFieldWidth = 0;
+                        if (currentToken.type == TOKEN_COLON)
+                        {
+                            // Bit field declaration
+                            if (!memberDimensions.empty())
+                            {
+                                reportError(currentToken.line, currentToken.col, "Bit field cannot be an array");
+                                hadError = true;
+                                eat(TOKEN_COLON);
+                                if (currentToken.type == TOKEN_NUMBER) eat(TOKEN_NUMBER);
+                            }
+                            else if (ptrLevel > 0)
+                            {
+                                reportError(currentToken.line, currentToken.col, "Bit field cannot be a pointer");
+                                hadError = true;
+                                eat(TOKEN_COLON);
+                                if (currentToken.type == TOKEN_NUMBER) eat(TOKEN_NUMBER);
+                            }
+                            else if (!isIntegerScalarType(makeType(mtok, ptrLevel, mu, mc, memberStructName)))
+                            {
+                                reportError(currentToken.line, currentToken.col, "Bit field must have integer type");
+                                hadError = true;
+                                eat(TOKEN_COLON);
+                                if (currentToken.type == TOKEN_NUMBER) eat(TOKEN_NUMBER);
+                            }
+                            else
+                            {
+                                eat(TOKEN_COLON);
+                                if (currentToken.type == TOKEN_NUMBER)
+                                {
+                                    bitFieldWidth = std::stoi(currentToken.value);
+                                    eat(TOKEN_NUMBER);
+                                    if (bitFieldWidth < 1 || bitFieldWidth > 64)
+                                    {
+                                        reportError(currentToken.line, currentToken.col, "Bit field width must be between 1 and 64");
+                                        hadError = true;
+                                        bitFieldWidth = 1;
+                                    }
+                                }
+                                else
+                                {
+                                    reportError(currentToken.line, currentToken.col, "Expected bit field width");
+                                    hadError = true;
+                                    bitFieldWidth = 1;
+                                }
+                            }
+                        }
+
+                        Type memberType = makeType(mtok, ptrLevel, mu, mc, memberStructName);
+                        StructMemberInfo member;
+                        member.name = memberName;
+                        member.type = memberType;
+                        member.dimensions = memberDimensions;
+                        member.isFlexibleArray = isFlexible;
+                        member.bitFieldWidth = bitFieldWidth;
+                        
+                        if (bitFieldWidth > 0)
+                        {
+                            // Bit field packing
+                            size_t storageSize = sizeOfType(memberType);
+                            int maxBits = storageSize * 8;
+                            
+                            // Check if we can pack with the previous member
+                            bool canPack = false;
+                            if (!info.members.empty())
+                            {
+                                auto& prevMember = info.members.back();
+                                if (prevMember.bitFieldWidth > 0 &&
+                                    prevMember.type.base == memberType.base &&
+                                    prevMember.type.pointerLevel == memberType.pointerLevel)
+                                {
+                                    // Can pack: same type, both are bit fields--
+                                    int bitsUsed = prevMember.bitFieldOffset + prevMember.bitFieldWidth;
+                                    if (bitsUsed + bitFieldWidth <= maxBits)
+                                    {
+                                        canPack = true;
+                                    }
+                                }
+                            }
+                            
+                            if (canPack)
+                            {
+                                // Reuse previous storage unit
+                                auto& prevMember = info.members.back();
+                                member.offset = prevMember.offset;
+                                member.bitFieldStorageIndex = prevMember.bitFieldStorageIndex;
+                                member.bitFieldOffset = prevMember.bitFieldOffset + prevMember.bitFieldWidth;
+                                member.size = storageSize;
+                            }
+                            else
+                            {
+                                // New storage unit
+                                if (info.members.empty() || info.members.back().bitFieldWidth == 0)
+                                {
+                                    // First bit field or after non-bit-field
+                                    member.offset = info.size;
+                                    info.size += storageSize;
+                                }
+                                else
+                                {
+                                    // Different type, need new storage
+                                    member.offset = info.size;
+                                    info.size += storageSize;
+                                }
+                                member.bitFieldStorageIndex = info.members.size();
+                                member.bitFieldOffset = 0;
+                                member.size = storageSize;
+                            }
+                            info.align = std::max(info.align, std::min<size_t>(8, storageSize));
+                        }
+                        else
+                        {
+                            // Regular member: calculate size × product of all dimensions
+                            // Flexible arrays (last dimension = 0) contribute 0 to struct size
+                            member.size = sizeOfType(memberType);
+                            for (size_t dim : memberDimensions)
+                            {
+                                if (dim == 0) break;  // Flexible array contributes 0
+                                member.size *= dim;
+                            }
+                            
+                            size_t memberAlign = std::min<size_t>(8, std::max<size_t>(1, sizeOfType(memberType)));
+                            member.offset = alignUp(info.size, memberAlign);
+                            info.size = member.offset + member.size;
+                            info.align = std::max(info.align, memberAlign);
+                        }
+                        info.members.push_back(member);
+
+                        eat(TOKEN_SEMICOLON);
+                    }
+                    eat(TOKEN_RBRACE);
+
+                    if (tag.empty())
+                        tag = "__anon_struct_" + std::to_string(anonymousStructCounter++);
+
+                    info.size = alignUp(info.size, info.align);
+                    structTypes[tag] = info;
+                }
+                else if (tag.empty())
+                {
+                    reportError(tagTok.line, tagTok.col, "Expected struct tag or struct body");
+                    hadError = true;
+                    tag = "__invalid_struct";
+                }
+
+                structName = tag;
+            }
+            else if (currentToken.type == TOKEN_UNION)
+            {
+                sawUnion = true;
+                isUnion = true;
+                eat(TOKEN_UNION);
+
+                std::string tag;
+                Token tagTok = currentToken;
+                if (currentToken.type == TOKEN_IDENTIFIER)
+                {
+                    tag = currentToken.value;
+                    eat(TOKEN_IDENTIFIER);
+                }
+
+                if (currentToken.type == TOKEN_LBRACE)
+                {
+                    eat(TOKEN_LBRACE);
+                    StructTypeInfo info;
+                    info.isComplete = true;
+
+                    // For unions, all members start at offset 0, size is max member size
+                    while (currentToken.type != TOKEN_RBRACE && currentToken.type != TOKEN_EOF)
+                    {
+                        bool mu = false, mc = false, ma = false, mr = false;
+                        std::string memberStructName;
+                        if (!isTypeSpecifierToken(currentToken.type))
+                        {
+                            reportError(currentToken.line, currentToken.col, "Expected member type in union definition");
+                            hadError = true;
+                            break;
+                        }
+                        TokenType mtok = parseTypeSpecifiers(mu, mc, ma, mr, &memberStructName);
+                        int ptrLevel = 0;
+                        while (currentToken.type == TOKEN_MUL)
+                        {
+                            ++ptrLevel;
+                            eat(TOKEN_MUL);
+                        }
+
+                        if (currentToken.type != TOKEN_IDENTIFIER)
+                        {
+                            reportError(currentToken.line, currentToken.col, "Expected member name in union definition");
+                            hadError = true;
+                            break;
+                        }
+
+                        std::string memberName = currentToken.value;
+                        eat(TOKEN_IDENTIFIER);
+
+                        // Parse array dimensions for union members
+                        std::vector<size_t> memberDimensions;
+                        bool isFlexible = false;
+                        while (currentToken.type == TOKEN_LBRACKET)
+                        {
+                            eat(TOKEN_LBRACKET);
+                            if (currentToken.type == TOKEN_RBRACKET)
+                            {
+                                // Flexible array member (must be last and only one)
+                                if (!memberDimensions.empty())
+                                {
+                                    reportError(currentToken.line, currentToken.col, "Only unsized array allowed for flexible member");
+                                    hadError = true;
+                                }
+                                memberDimensions.push_back(0);
+                                isFlexible = true;
+                            }
+                            else if (currentToken.type == TOKEN_NUMBER)
+                            {
+                                memberDimensions.push_back(std::stoul(currentToken.value));
+                                eat(TOKEN_NUMBER);
+                            }
+                            else
+                            {
+                                reportError(currentToken.line, currentToken.col, "Union array member size must be constant");
+                                hadError = true;
+                                memberDimensions.push_back(1);
+                            }
+                            eat(TOKEN_RBRACKET);
+                        }
+
+                        // Parse bit field width (if present)
+                        int bitFieldWidth = 0;
+                        if (currentToken.type == TOKEN_COLON)
+                        {
+                            // Bit field declaration in union
+                            if (!memberDimensions.empty())
+                            {
+                                reportError(currentToken.line, currentToken.col, "Bit field cannot be an array");
+                                hadError = true;
+                                eat(TOKEN_COLON);
+                                if (currentToken.type == TOKEN_NUMBER) eat(TOKEN_NUMBER);
+                            }
+                            else if (ptrLevel > 0)
+                            {
+                                reportError(currentToken.line, currentToken.col, "Bit field cannot be a pointer");
+                                hadError = true;
+                                eat(TOKEN_COLON);
+                                if (currentToken.type == TOKEN_NUMBER) eat(TOKEN_NUMBER);
+                            }
+                            else if (!isIntegerScalarType(makeType(mtok, ptrLevel, mu, mc, memberStructName)))
+                            {
+                                reportError(currentToken.line, currentToken.col, "Bit field must have integer type");
+                                hadError = true;
+                                eat(TOKEN_COLON);
+                                if (currentToken.type == TOKEN_NUMBER) eat(TOKEN_NUMBER);
+                            }
+                            else
+                            {
+                                eat(TOKEN_COLON);
+                                if (currentToken.type == TOKEN_NUMBER)
+                                {
+                                    bitFieldWidth = std::stoi(currentToken.value);
+                                    eat(TOKEN_NUMBER);
+                                    if (bitFieldWidth < 1 || bitFieldWidth > 64)
+                                    {
+                                        reportError(currentToken.line, currentToken.col, "Bit field width must be between 1 and 64");
+                                        hadError = true;
+                                        bitFieldWidth = 1;
+                                    }
+                                }
+                                else
+                                {
+                                    reportError(currentToken.line, currentToken.col, "Expected bit field width");
+                                    hadError = true;
+                                    bitFieldWidth = 1;
+                                }
+                            }
+                        }
+
+                        Type memberType = makeType(mtok, ptrLevel, mu, mc, memberStructName);
+                        StructMemberInfo member;
+                        member.name = memberName;
+                        member.type = memberType;
+                        member.dimensions = memberDimensions;
+                        member.isFlexibleArray = isFlexible;
+                        member.bitFieldWidth = bitFieldWidth;
+                        
+                        if (bitFieldWidth > 0)
+                        {
+                            // Bit field in union: all at offset 0, size is the storage size
+                            size_t storageSize = sizeOfType(memberType);
+                            member.offset = 0;
+                            member.bitFieldOffset = 0;
+                            member.size = storageSize;
+                            info.size = std::max(info.size, member.size);
+                        }
+                        else
+                        {
+                            // Regular member: calculate size × product of all dimensions
+                            member.size = sizeOfType(memberType);
+                            for (size_t dim : memberDimensions)
+                            {
+                                if (dim == 0) break;  // Flexible array contributes 0
+                                member.size *= dim;
+                            }
+                            
+                            size_t memberAlign = std::min<size_t>(8, std::max<size_t>(1, sizeOfType(memberType)));
+                            // All union members start at offset 0
+                            member.offset = 0;
+                            // Union size is maximum of all member sizes
+                            info.size = std::max(info.size, member.size);
+                            info.align = std::max(info.align, memberAlign);
+                        }
+                        info.members.push_back(member);
+
+                        eat(TOKEN_SEMICOLON);
+                    }
+                    eat(TOKEN_RBRACE);
+
+                    if (tag.empty())
+                        tag = "__anon_union_" + std::to_string(anonymousStructCounter++);
+
+                    info.size = alignUp(info.size, info.align);
+                    structTypes[tag] = info;
+                }
+                else if (tag.empty())
+                {
+                    reportError(tagTok.line, tagTok.col, "Expected union tag or union body");
+                    hadError = true;
+                    tag = "__invalid_union";
+                }
+
+                structName = tag;
+            }
         }
 
         if (sawUnsigned && sawSigned)
@@ -4644,7 +5604,17 @@ class Parser
         TokenType baseTok = TOKEN_INT;
         bool integerLike = true;
 
-        if (sawFloat || sawDouble)
+        if (sawStruct)
+        {
+            baseTok = TOKEN_STRUCT;
+            integerLike = false;
+        }
+        else if (sawUnion)
+        {
+            baseTok = TOKEN_UNION;
+            integerLike = false;
+        }
+        else if (sawFloat || sawDouble)
         {
             integerLike = false;
             if (sawFloat)
@@ -4684,11 +5654,14 @@ class Parser
             baseTok = TOKEN_INT;
         }
 
-        if ((sawFloat || sawDouble || sawVoid) && (sawUnsigned || sawSigned || sawShort || longCount > 0 || sawChar))
+        if ((sawFloat || sawDouble || sawVoid) && (sawUnsigned || sawSigned || sawShort || longCount > 0 || sawChar || sawStruct))
         {
             reportError(currentToken.line, currentToken.col, "Invalid type specifier combination");
             hadError = true;
         }
+
+        if (structNameOut)
+            *structNameOut = structName;
 
         isUnsignedOut = integerLike && sawUnsigned;
         isConstOut = sawConst;
@@ -4697,12 +5670,12 @@ class Parser
         return baseTok;
     }
 
-    TokenType parseTypeSpecifiers(bool &isUnsignedOut)
+    TokenType parseTypeSpecifiers(bool &isUnsignedOut, std::string* structNameOut = nullptr)
     {
         bool ignoredConst = false;
         bool ignoredAuto = false;
         bool ignoredRegister = false;
-        TokenType t = parseTypeSpecifiers(isUnsignedOut, ignoredConst, ignoredAuto, ignoredRegister);
+        TokenType t = parseTypeSpecifiers(isUnsignedOut, ignoredConst, ignoredAuto, ignoredRegister, structNameOut);
         if (ignoredAuto || ignoredRegister)
         {
             reportError(currentToken.line, currentToken.col, "Storage class specifier is not valid in this type-name context");
@@ -4711,6 +5684,87 @@ class Parser
         return t;
     }
 
+    std::unique_ptr<ASTNode> parseStructInitializerBody(const std::string& structName,
+                                                        int startLine,
+                                                        int startCol,
+                                                        const FunctionNode* currentFunction = nullptr)
+    {
+        eat(TOKEN_LBRACE);
+        std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> initializers;
+        size_t positionalIndex = 0;
+
+        auto sit = structTypes.find(structName);
+        if (sit == structTypes.end())
+        {
+            reportError(startLine, startCol, "Unknown struct type '" + structName + "'");
+            hadError = true;
+        }
+
+        while (currentToken.type != TOKEN_RBRACE && currentToken.type != TOKEN_EOF)
+        {
+            std::string memberName;
+            if (currentToken.type == TOKEN_DOT)
+            {
+                eat(TOKEN_DOT);
+                if (currentToken.type != TOKEN_IDENTIFIER)
+                {
+                    reportError(currentToken.line, currentToken.col, "Expected member name after '.' in struct initializer");
+                    hadError = true;
+                    break;
+                }
+                memberName = currentToken.value;
+                eat(TOKEN_IDENTIFIER);
+                eat(TOKEN_ASSIGN);
+            }
+            else
+            {
+                if (sit != structTypes.end() && positionalIndex < sit->second.members.size())
+                    memberName = sit->second.members[positionalIndex].name;
+                ++positionalIndex;
+            }
+
+            auto expr = assignmentExpression(currentFunction);
+            if (!memberName.empty())
+                initializers.push_back({memberName, std::move(expr)});
+
+            if (currentToken.type == TOKEN_COMMA)
+                eat(TOKEN_COMMA);
+        }
+
+        eat(TOKEN_RBRACE);
+        return std::make_unique<StructLiteralNode>(structName, std::move(initializers), startLine, startCol);
+    }
+
+    std::unique_ptr<ASTNode> parseStructCompoundLiteral(const FunctionNode* currentFunction = nullptr)
+    {
+        Token openParen = currentToken;
+        eat(TOKEN_LPAREN);
+
+        bool typeUnsigned = false;
+        bool typeConst = false;
+        bool typeAuto = false;
+        bool typeRegister = false;
+        std::string structName;
+        TokenType typeTok = parseTypeSpecifiers(typeUnsigned, typeConst, typeAuto, typeRegister, &structName);
+
+        int ptrLevel = 0;
+        while (currentToken.type == TOKEN_MUL)
+        {
+            ++ptrLevel;
+            eat(TOKEN_MUL);
+        }
+
+        eat(TOKEN_RPAREN);
+
+        if (typeTok != TOKEN_STRUCT || ptrLevel != 0 || currentToken.type != TOKEN_LBRACE)
+        {
+            reportError(openParen.line, openParen.col, "Only struct compound literals are supported in this context");
+            hadError = true;
+            return std::make_unique<NumberNode>(0);
+        }
+
+        return parseStructInitializerBody(structName, openParen.line, openParen.col, currentFunction);
+    }
     /********************************************************************
      *      ______        _____  _______  ____   _____     __  __       *
      *     |  ____|/\    / ____||__   __|/ __ \ |  __ \   / /  \ \      *
@@ -4725,14 +5779,30 @@ class Parser
     std::unique_ptr<ASTNode> factor(const FunctionNode* currentFunction = nullptr)
     {
         Token token = currentToken;
-        auto applyPostfixIndex = [&](std::unique_ptr<ASTNode> node, int l, int c) -> std::unique_ptr<ASTNode>
+        auto applyPostfix = [&](std::unique_ptr<ASTNode> node, int l, int c) -> std::unique_ptr<ASTNode>
         {
-            while (currentToken.type == TOKEN_LBRACKET)
+            while (currentToken.type == TOKEN_LBRACKET || currentToken.type == TOKEN_DOT || currentToken.type == TOKEN_ARROW)
             {
-                eat(TOKEN_LBRACKET);
-                auto idx = condition(currentFunction);
-                eat(TOKEN_RBRACKET);
-                node = std::make_unique<PostfixIndexNode>(std::move(node), std::move(idx), l, c);
+                if (currentToken.type == TOKEN_LBRACKET)
+                {
+                    eat(TOKEN_LBRACKET);
+                    auto idx = condition(currentFunction);
+                    eat(TOKEN_RBRACKET);
+                    node = std::make_unique<PostfixIndexNode>(std::move(node), std::move(idx), l, c);
+                    continue;
+                }
+
+                bool throughPointer = (currentToken.type == TOKEN_ARROW);
+                eat(currentToken.type);
+                if (currentToken.type != TOKEN_IDENTIFIER)
+                {
+                    reportError(currentToken.line, currentToken.col, "Expected member name after '.' or '->'");
+                    hadError = true;
+                    break;
+                }
+                std::string member = currentToken.value;
+                eat(TOKEN_IDENTIFIER);
+                node = std::make_unique<MemberAccessNode>(std::move(node), member, throughPointer, l, c);
             }
             return node;
         };
@@ -4771,13 +5841,14 @@ class Parser
                 bool sawType = isTypeSpecifierToken(currentToken.type);
                 TokenType tt = TOKEN_INT;
                 bool sawUnsigned = false;
+                std::string sizeofStructName;
                 if (sawType)
-                    tt = parseTypeSpecifiers(sawUnsigned);
+                    tt = parseTypeSpecifiers(sawUnsigned, &sizeofStructName);
                 if (sawType)
                 {
                     int ptrLevel = 0;
                     while (currentToken.type == TOKEN_MUL) { ptrLevel++; eat(TOKEN_MUL); }
-                    Type t = makeType(tt, ptrLevel, sawUnsigned);
+                    Type t = makeType(tt, ptrLevel, sawUnsigned, false, sizeofStructName);
                     eat(TOKEN_RPAREN);
                     return std::make_unique<SizeofNode>(t, currentFunction);
                 }
@@ -4853,7 +5924,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 eat(TOKEN_STRING_LITERAL);
             }
             auto node = std::make_unique<StringLiteralNode>(combined);
-            return applyPostfixIndex(std::move(node), token.line, token.col);
+            return applyPostfix(std::move(node), token.line, token.col);
         }
 
         else if (token.type == TOKEN_IDENTIFIER)
@@ -4879,7 +5950,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
             if (!indices.empty())
             {
-                return std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction, token.line, token.col);
+                auto node = std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction, token.line, token.col);
+                return applyPostfix(std::move(node), token.line, token.col);
             }
 
             if (currentToken.type == TOKEN_INCREMENT || currentToken.type == TOKEN_DECREMENT)
@@ -4893,11 +5965,12 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             if (currentToken.type == TOKEN_LPAREN)
             {
                 auto node = functionCall(identifier, token.line, token.col, currentFunction);
-                return applyPostfixIndex(std::move(node), token.line, token.col);
+                return applyPostfix(std::move(node), token.line, token.col);
             }
 
             // Otherwise it's a variable or parameter
-            return std::make_unique<IdentifierNode>(identifier, token.line, token.col, currentFunction);
+            auto node = std::make_unique<IdentifierNode>(identifier, token.line, token.col, currentFunction);
+            return applyPostfix(std::move(node), token.line, token.col);
         }
 
         else if (token.type == TOKEN_LPAREN)
@@ -4905,7 +5978,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             eat(TOKEN_LPAREN);
             auto node = condition(currentFunction);
             eat(TOKEN_RPAREN);
-            return applyPostfixIndex(std::move(node), token.line, token.col);
+            return applyPostfix(std::move(node), token.line, token.col);
         }
         reportError(token.line, token.col, "Unexpected token in factor " + token.value);
         // try to recover by advancing one token
@@ -5056,7 +6129,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
     {
         auto additiveExpression = [&](auto&& self) -> std::unique_ptr<ASTNode>
         {
-            auto node = term(currentFunction);
+            auto node = this->term(currentFunction);
             while (currentToken.type == TOKEN_ADD || currentToken.type == TOKEN_SUB)
             {
                 Token token = currentToken;
@@ -5064,7 +6137,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     this->eat(TOKEN_ADD);
                 else
                     this->eat(TOKEN_SUB);
-                node = std::make_unique<BinaryOpNode>(token.value, std::move(node), term(currentFunction));
+                node = std::make_unique<BinaryOpNode>(token.value, std::move(node), this->term(currentFunction));
             }
             return node;
         };
@@ -5215,6 +6288,47 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 }
                 return std::make_unique<IndirectAssignmentNode>(std::move(ptrExpr), std::move(expr), tok.line, tok.col);
             }
+            else if (auto ma = dynamic_cast<MemberAccessNode*>(node.get()))
+            {
+                std::unique_ptr<ASTNode> ptrExpr = std::make_unique<MemberAddressNode>(cloneExpr(ma, currentFunction));
+                std::unique_ptr<ASTNode> expr;
+                if (assignTok == TOKEN_ASSIGN)
+                {
+                    expr = std::move(rhs);
+                }
+                else
+                {
+                    auto lhs = cloneExpr(ma, currentFunction);
+                    expr = std::make_unique<BinaryOpNode>(compoundToBinary(assignTok), std::move(lhs), std::move(rhs));
+                }
+                return std::make_unique<IndirectAssignmentNode>(std::move(ptrExpr), std::move(expr), tok.line, tok.col);
+            }
+            else if (auto pi = dynamic_cast<PostfixIndexNode*>(node.get()))
+            {
+                // Handle subscript of pointer/array (e.g., a.arr[0] where arr is an array member)
+                // Convert to: *(ptr_expr + index_expr) = rhs
+                std::unique_ptr<ASTNode> basePtr = cloneExpr(pi->baseExpr.get(), currentFunction);
+                std::unique_ptr<ASTNode> idxExpr = cloneExpr(pi->indexExpr.get(), currentFunction);
+                
+                // Create pointer arithmetic: basePtr + indexExpr
+                // But actually we can just use the PostfixIndexNode as the dereference base
+                // since *(a.arr + 0) is what we want, but easier is to use pi->baseExpr directly
+                // and let the emission handle the indexing
+                std::unique_ptr<ASTNode> ptrExpr = std::move(basePtr);
+                std::unique_ptr<ASTNode> expr;
+                if (assignTok == TOKEN_ASSIGN)
+                {
+                    expr = std::move(rhs);
+                }
+                else
+                {
+                    auto lhs = cloneExpr(pi, currentFunction);
+                    expr = std::make_unique<BinaryOpNode>(compoundToBinary(assignTok), std::move(lhs), std::move(rhs));
+                }
+                // Use IndirectAssignmentNode with a constructed pointer expression (base + index)
+                auto ptrAddExpr = std::make_unique<BinaryOpNode>("+", std::move(ptrExpr), std::move(idxExpr));
+                return std::make_unique<IndirectAssignmentNode>(std::move(ptrAddExpr), std::move(expr), tok.line, tok.col);
+            }
             else
             {
                 reportError(tok.line, tok.col, "Left side of assignment must be assignable");
@@ -5285,8 +6399,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         }
 
 // declaration begins with a type keyword
-        if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID ||
-            token.type == TOKEN_SHORT || token.type == TOKEN_LONG || token.type == TOKEN_FLOAT ||
+        if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID || token.type == TOKEN_STRUCT ||
+            token.type == TOKEN_UNION || token.type == TOKEN_SHORT || token.type == TOKEN_LONG || token.type == TOKEN_FLOAT ||
             token.type == TOKEN_DOUBLE || token.type == TOKEN_UNSIGNED || token.type == TOKEN_SIGNED ||
             token.type == TOKEN_CONST || token.type == TOKEN_AUTO || token.type == TOKEN_REGISTER)
         {
@@ -5295,7 +6409,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             bool seenConst = false;
             bool seenAuto = false;
             bool seenRegister = false;
-            TokenType typeTok = parseTypeSpecifiers(seenUnsigned, seenConst, seenAuto, seenRegister);
+            std::string declStructName;
+            TokenType typeTok = parseTypeSpecifiers(seenUnsigned, seenConst, seenAuto, seenRegister, &declStructName);
             bool isUns = seenUnsigned;
             std::vector<std::unique_ptr<ASTNode>> declNodes;
 
@@ -5365,7 +6480,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     eat(TOKEN_RBRACKET);
                 }
 
-                Type baseType = makeType(typeTok, pointerLevel, isUns, seenConst);
+                Type baseType = makeType(typeTok, pointerLevel, isUns, seenConst, declStructName);
                 if (!dimensions.empty())
                 {
                     if (typeTok == TOKEN_CHAR && pointerLevel == 0 && currentToken.type == TOKEN_ASSIGN)
@@ -5414,7 +6529,10 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     if (currentToken.type == TOKEN_ASSIGN)
                     {
                         eat(TOKEN_ASSIGN);
-                        initializer = assignmentExpression(currentFunction);
+                        if (baseType.pointerLevel == 0 && (baseType.base == Type::STRUCT || baseType.base == Type::UNION) && currentToken.type == TOKEN_LBRACE)
+                            initializer = parseStructInitializerBody(baseType.structName, idToken.line, idToken.col, currentFunction);
+                        else
+                            initializer = assignmentExpression(currentFunction);
                     }
                     declNodes.push_back(std::make_unique<DeclarationNode>(identifier, baseType, std::move(initializer), seenRegister));
                 }
@@ -5681,7 +6799,18 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             std::unique_ptr<ASTNode> expr = nullptr;
             if (currentToken.type != TOKEN_SEMICOLON)
             {
-                expr = condition(currentFunction); // Parse the expression if present
+                if (currentToken.type == TOKEN_LPAREN)
+                {
+                    Token lookahead = lexer.peekToken();
+                    if (isTypeSpecifierToken(lookahead.type))
+                        expr = parseStructCompoundLiteral(currentFunction);
+                    else
+                        expr = condition(currentFunction);
+                }
+                else
+                {
+                    expr = condition(currentFunction); // Parse the expression if present
+                }
             }
             eat(TOKEN_SEMICOLON);
             return std::make_unique<ReturnNode>(std::move(expr), currentFunction, returnToken.line, returnToken.col);
@@ -5811,7 +6940,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         bool returnConst = false;
         bool returnAuto = false;
         bool returnRegister = false;
-        TokenType returnType = parseTypeSpecifiers(returnUns, returnConst, returnAuto, returnRegister);
+        std::string returnStructName;
+        TokenType returnType = parseTypeSpecifiers(returnUns, returnConst, returnAuto, returnRegister, &returnStructName);
 
         int returnPtrLevel = 0;
         while (currentToken.type == TOKEN_MUL)
@@ -5819,7 +6949,15 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             eat(TOKEN_MUL);
             returnPtrLevel++;
         }
-        
+
+        // standalone type declaration: `struct Foo { ... };` or `struct Foo;` — no variable name
+        if (currentToken.type == TOKEN_SEMICOLON && returnPtrLevel == 0)
+        {
+            eat(TOKEN_SEMICOLON);
+            // The struct was registered in structTypes during parseTypeSpecifiers; nothing else to do.
+            return std::make_unique<StatementListNode>(std::vector<std::unique_ptr<ASTNode>>());
+        }
+
         // Parse the function/variable name
         Token nameToken = currentToken;
         std::string name = currentToken.value;
@@ -5914,14 +7052,14 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 if (dimensions.empty() || charArrayToPointer)
                 {
                     int globalPtrLevel = ptrLevel + (charArrayToPointer ? 1 : 0);
-                    auto gd = std::make_unique<GlobalDeclarationNode>(declaratorName, makeType(returnType, globalPtrLevel, returnUns, returnConst), std::move(init), isExternal, declaratorToken.line, declaratorToken.col);
+                    auto gd = std::make_unique<GlobalDeclarationNode>(declaratorName, makeType(returnType, globalPtrLevel, returnUns, returnConst, returnStructName), std::move(init), isExternal, declaratorToken.line, declaratorToken.col);
                     if (charArrayToPointer && gd->initializer)
                         gd->knownObjectSize = gd->initializer->getKnownObjectSize();
                     return gd;
                 }
 
                 // create a temporary ArrayDeclarationNode to hold dimension info, then wrap in GlobalDeclaration
-                auto arrType = makeType(returnType, ptrLevel + 1, returnUns, returnConst);
+                auto arrType = makeType(returnType, ptrLevel + 1, returnUns, returnConst, returnStructName);
                 auto arrDecl = std::make_unique<ArrayDeclarationNode>(declaratorName, arrType, std::move(dimensions), std::move(arrayInit), true, declaratorToken.line, declaratorToken.col);
                 // general global handling will later pick up type and dims via semantic pass
                 return arrDecl;
@@ -5977,7 +7115,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             bool paramConst = false;
             bool paramAuto = false;
             bool paramRegister = false;
-            TokenType paramType = parseTypeSpecifiers(paramUns, paramConst, paramAuto, paramRegister);
+            std::string paramStructName;
+            TokenType paramType = parseTypeSpecifiers(paramUns, paramConst, paramAuto, paramRegister, &paramStructName);
             if (paramAuto)
             {
                 reportError(currentToken.line, currentToken.col, "'auto' is not valid for function parameters");
@@ -6019,7 +7158,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 eat(TOKEN_RBRACKET);
             }
 
-            Type ptype = makeType(paramType, ptrLevel, paramUns, paramConst);
+            Type ptype = makeType(paramType, ptrLevel, paramUns, paramConst, paramStructName);
             if (!paramDims.empty())
                 ptype.pointerLevel += 1;
 
@@ -6047,13 +7186,13 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         if (currentToken.type == TOKEN_SEMICOLON)
         {
             // create node with empty body and return
-            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType, returnPtrLevel, returnUns, returnConst), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, true, nameToken.line, nameToken.col);
+            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType, returnPtrLevel, returnUns, returnConst, returnStructName), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, true, nameToken.line, nameToken.col);
             eat(TOKEN_SEMICOLON);
             return functionNode;
         }
 
         // Create the FunctionNode; body will be filled in below
-        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType, returnPtrLevel, returnUns, returnConst), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, false, nameToken.line, nameToken.col);
+        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType, returnPtrLevel, returnUns, returnConst, returnStructName), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, false, nameToken.line, nameToken.col);
 
         if (isExternal)
         {
@@ -6221,7 +7360,7 @@ public:
         while (currentToken.type != TOKEN_EOF)
 	    {
             // allow any of the basic type specifiers or 'extern' at file scope
-            if (currentToken.type == TOKEN_ENUM || currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
+            if (currentToken.type == TOKEN_ENUM || currentToken.type == TOKEN_STRUCT || currentToken.type == TOKEN_UNION || currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
                 currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT || currentToken.type == TOKEN_DOUBLE ||
                 currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED ||
                 currentToken.type == TOKEN_CONST || currentToken.type == TOKEN_AUTO || currentToken.type == TOKEN_REGISTER)
@@ -7732,6 +8871,8 @@ static std::pair<int,int> bestEffortNodeLocation(const ASTNode* node)
     if (auto call = dynamic_cast<const FunctionCallNode*>(node)) return {call->line, call->col};
     if (auto aa = dynamic_cast<const ArrayAccessNode*>(node)) return {aa->line, aa->col};
     if (auto pi = dynamic_cast<const PostfixIndexNode*>(node)) return {pi->line, pi->col};
+    if (auto ma = dynamic_cast<const MemberAccessNode*>(node)) return {ma->line, ma->col};
+    if (auto sl = dynamic_cast<const StructLiteralNode*>(node)) return {sl->line, sl->col};
     if (auto asg = dynamic_cast<const AssignmentNode*>(node)) return {asg->line, asg->col};
     if (auto iasg = dynamic_cast<const IndirectAssignmentNode*>(node)) return {iasg->line, iasg->col};
     if (auto un = dynamic_cast<const UnaryOpNode*>(node)) return {un->line, un->col};
@@ -8009,12 +9150,90 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
         else
             rt = {Type::INT,0};
 
+        size_t customElemSize = 0;
+        bool yieldsPointer = false;
+        std::vector<size_t> nextDims;
+
+        std::vector<size_t> baseDims;
+        if (auto maBase = dynamic_cast<const MemberAccessNode*>(pi->baseExpr.get()))
+            baseDims = maBase->memberDimensions;
+        else if (auto piBase = dynamic_cast<const PostfixIndexNode*>(pi->baseExpr.get()))
+            baseDims = piBase->remainingArrayDims;
+
+        if (baseDims.size() >= 2 && bt.pointerLevel > 0)
+        {
+            size_t stride = pointeeSize(bt);
+            for (size_t i = 1; i < baseDims.size(); ++i)
+                stride *= baseDims[i];
+
+            customElemSize = stride;
+            yieldsPointer = true;
+            rt = bt;
+            nextDims.assign(baseDims.begin() + 1, baseDims.end());
+        }
+
         if (auto mpi = dynamic_cast<PostfixIndexNode*>(const_cast<ASTNode*>(node)))
         {
             mpi->baseType = bt;
             mpi->resultType = rt;
+            mpi->customElemSize = customElemSize;
+            mpi->yieldsPointer = yieldsPointer;
+            mpi->remainingArrayDims = nextDims;
         }
         return rt;
+    }
+    if (auto ma = dynamic_cast<const MemberAccessNode*>(node))
+    {
+        Type bt = computeExprType(ma->baseExpr.get(), scopes, currentFunction);
+        Type st = bt;
+        if (ma->throughPointer)
+        {
+            if (st.pointerLevel > 0)
+                st.pointerLevel--;
+            else
+                st = {Type::INT, 0};
+        }
+
+        if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
+            return {Type::INT, 0};
+
+        auto member = findStructMember(st.structName, ma->memberName);
+        if (!member)
+            return {Type::INT, 0};
+
+        Type resultType = member->type;
+        bool isArrayMember = false;
+        bool isBitField = false;
+        // Array decay: if member is an array, decay to pointer to element
+        if (!member->dimensions.empty())
+        {
+            resultType.pointerLevel++;
+            isArrayMember = true;
+        }
+        if (member->bitFieldWidth > 0)
+            isBitField = true;
+
+        if (auto mma = dynamic_cast<MemberAccessNode*>(const_cast<ASTNode*>(node)))
+        {
+            mma->resultType = resultType;
+            mma->memberOffset = member->offset;
+            mma->isArrayMember = isArrayMember;
+            mma->isBitField = isBitField;
+            mma->bitFieldWidth = member->bitFieldWidth;
+            mma->bitFieldOffset = member->bitFieldOffset;
+            mma->memberDimensions = member->dimensions;
+        }
+        return resultType;
+    }
+    if (auto mad = dynamic_cast<const MemberAddressNode*>(node))
+    {
+        Type mt = computeExprType(mad->memberExpr.get(), scopes, currentFunction);
+        mt.pointerLevel++;
+        return mt;
+    }
+    if (auto sl = dynamic_cast<const StructLiteralNode*>(node))
+    {
+        return makeType(TOKEN_STRUCT, 0, false, false, sl->structName);
     }
     return {Type::INT,0};
 }
@@ -8330,6 +9549,84 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         {
             reportError(pi->line, pi->col, "Array subscript must have integer type");
             hadError = true;
+        }
+        return;
+    }
+
+    if (auto ma = dynamic_cast<const MemberAccessNode*>(node))
+    {
+        semanticCheckExpression(ma->baseExpr.get(), scopes, currentFunction);
+        Type bt = computeExprType(ma->baseExpr.get(), scopes, currentFunction);
+        Type st = bt;
+        if (ma->throughPointer)
+        {
+            if (st.pointerLevel == 0)
+            {
+                reportError(ma->line, ma->col, "Operator '->' requires a pointer operand");
+                hadError = true;
+                return;
+            }
+            st.pointerLevel--;
+        }
+
+        if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
+        {
+            reportError(ma->line, ma->col, "Member access requires a struct or union object");
+            hadError = true;
+            return;
+        }
+
+        auto member = findStructMember(st.structName, ma->memberName);
+        if (!member)
+        {
+            reportError(ma->line, ma->col, (st.base == Type::UNION ? "Union" : "Struct") + std::string("'") + st.structName + std::string("' has no member named '") + ma->memberName + std::string("'"));
+            hadError = true;
+            return;
+        }
+
+        if (auto mma = const_cast<MemberAccessNode*>(ma))
+        {
+            mma->resultType = member->type;
+            mma->memberOffset = member->offset;
+        }
+        return;
+    }
+
+    if (auto mad = dynamic_cast<const MemberAddressNode*>(node))
+    {
+        semanticCheckExpression(mad->memberExpr.get(), scopes, currentFunction);
+        return;
+    }
+
+    if (auto sl = dynamic_cast<const StructLiteralNode*>(node))
+    {
+        auto sit = structTypes.find(sl->structName);
+        if (sit == structTypes.end())
+        {
+            reportError(sl->line, sl->col, "Unknown struct type '" + sl->structName + "'");
+            hadError = true;
+            return;
+        }
+
+        for (const auto& init : sl->initializers)
+        {
+            auto member = findStructMember(sl->structName, init.first);
+            if (!member)
+            {
+                reportError(sl->line, sl->col, "Struct '" + sl->structName + "' has no member named '" + init.first + "'");
+                hadError = true;
+                continue;
+            }
+
+            semanticCheckExpression(init.second.get(), scopes, currentFunction);
+            Type rhs = computeExprType(init.second.get(), scopes, currentFunction);
+            if (!typesCompatible(member->type, rhs))
+            {
+                reportError(sl->line, sl->col,
+                            "Type mismatch in struct initializer: cannot assign '" + rhs.toString() +
+                            "' to member '" + init.first + "' of type '" + member->type.toString() + "'");
+                hadError = true;
+            }
         }
         return;
     }
