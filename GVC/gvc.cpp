@@ -18,6 +18,7 @@
 #include <ctime>
 #include <set>
 #include <map>
+#include <filesystem>
 
 // Define fixed column position for comments
 #define COMMENT_COLUMN 32
@@ -57,6 +58,7 @@ struct Type {
             case FLOAT: s += "float"; break;
             case DOUBLE: s += "double"; break;
             case STRUCT: s += "struct " + structName; break;
+            case UNION: s += "union " + structName; break;
         }
         for (int i = 0; i < pointerLevel; ++i) s += "*";
         if (isFunctionPointer)
@@ -397,6 +399,9 @@ static std::string globalAsmSymbol(const std::string& name)
 static std::unordered_map<std::string, Type> functionReturnTypes;
 static std::unordered_map<std::string, std::vector<Type>> functionParamTypes;
 static std::unordered_map<std::string, bool> functionIsVariadic; // whether function declared with ...
+static std::unordered_set<std::string> emittedExternalFunctions;
+static std::unordered_set<std::string> declaredExternalFunctions;
+static std::unordered_set<std::string> referencedExternalFunctions;
 
 // Function-pointer signature registries keyed by canonical signature strings.
 static std::unordered_map<std::string, Type> fnPtrReturnTypes;
@@ -1911,6 +1916,8 @@ struct FunctionCallNode : ASTNode
             }
             else if (functionReturnTypes.count(functionName))
             {
+                if (declaredExternalFunctions.count(functionName))
+                    referencedExternalFunctions.insert(functionName);
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rax, [" + functionName + "]" << ";; Load function address" << std::endl;
             }
             else
@@ -1922,6 +1929,8 @@ struct FunctionCallNode : ASTNode
         }
         else
         {
+            if (declaredExternalFunctions.count(functionName))
+                referencedExternalFunctions.insert(functionName);
             std::string instrCall = "\tcall " + functionName;
             f << std::left << std::setw(COMMENT_COLUMN) << instrCall << ";; Call function " << functionName << std::endl;
         }
@@ -1998,8 +2007,6 @@ struct FunctionNode : ASTNode
     {
         if (isExternal)
         {
-            f << std::endl << "extrn '" << name << "' as _" << name << std::endl;
-            f << name << " = PLT _" << name << std::endl;
             return;
         }
         if (isPrototype) return;
@@ -3216,6 +3223,122 @@ struct MemberAddressNode : ASTNode
     }
 };
 
+struct PostfixUpdateNode : ASTNode
+{
+    std::unique_ptr<ASTNode> target;
+    std::string op;
+    Type valueType{Type::INT,0};
+    int line = 0;
+    int col = 0;
+
+    PostfixUpdateNode(std::unique_ptr<ASTNode> t, std::string oper, int l = 0, int c = 0)
+        : target(std::move(t)), op(std::move(oper)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        target->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        Type t = valueType;
+
+        if (const std::string* idName = target->getIdentifierName())
+        {
+            auto lookupResult = lookupVariable(*idName);
+            if (lookupResult.first)
+            {
+                const VarInfo& info = lookupResult.second;
+                t = info.type;
+                if (info.isStackParameter)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp + " + std::to_string(info.index + 16) + "]") << ";; Address of local parameter" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(info.index) + "]") << ";; Address of local variable" << std::endl;
+            }
+            else
+            {
+                auto git = globalVariables.find(*idName);
+                if (git != globalVariables.end())
+                    t = git->second;
+                std::string globalSym = globalAsmSymbol(*idName);
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [" + globalSym + "]") << ";; Address of global variable" << std::endl;
+            }
+        }
+        else if (auto ma = dynamic_cast<const MemberAccessNode*>(target.get()))
+        {
+            ma->emitAddress(f);
+            t = ma->resultType;
+            if (ma->isBitField)
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rax" << ";; Postfix update on bit-fields is not supported" << std::endl;
+                return;
+            }
+        }
+        else
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rax" << ";; Invalid postfix update target" << std::endl;
+            return;
+        }
+
+        std::string instruction = loadScalarToRaxInstruction(t, "[rcx]");
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load postfix old value" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Preserve old value for expression result" << std::endl;
+
+        bool isFloat = (t.pointerLevel == 0 && t.base == Type::FLOAT);
+        bool isDouble = (t.pointerLevel == 0 && t.base == Type::DOUBLE);
+        if (isFloat)
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd xmm0, eax" << ";; current float value" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, 1" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2ss xmm1, rdx" << ";; 1.0f" << std::endl;
+            if (op == "++")
+                f << std::left << std::setw(COMMENT_COLUMN) << "\taddss xmm0, xmm1" << ";; Increment float" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsubss xmm0, xmm1" << ";; Decrement float" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << std::endl;
+        }
+        else if (isDouble)
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; current double value" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, 1" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsi2sd xmm1, rdx" << ";; 1.0" << std::endl;
+            if (op == "++")
+                f << std::left << std::setw(COMMENT_COLUMN) << "\taddsd xmm0, xmm1" << ";; Increment double" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsubsd xmm0, xmm1" << ";; Decrement double" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq rax, xmm0" << std::endl;
+        }
+        else if (t.pointerLevel > 0)
+        {
+            size_t scale = pointeeSize(t);
+            if (op == "++")
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tadd rax, " + std::to_string(scale)) << ";; Increment pointer" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tsub rax, " + std::to_string(scale)) << ";; Decrement pointer" << std::endl;
+        }
+        else
+        {
+            if (op == "++")
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Increment" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Decrement" << std::endl;
+        }
+
+        size_t varSize = sizeOfType(t);
+        if (varSize == 1)
+            instruction = "\tmov byte [rcx], al";
+        else if (varSize == 2)
+            instruction = "\tmov word [rcx], ax";
+        else if (varSize == 4)
+            instruction = "\tmov dword [rcx], eax";
+        else
+            instruction = "\tmov qword [rcx], rax";
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store updated postfix value" << std::endl;
+
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Restore old postfix result" << std::endl;
+    }
+};
+
 
 // forward declaration for expression type computation used by codegen
 static Type computeExprType(const ASTNode*, const std::stack<std::map<std::string, VarInfo>>&, const FunctionNode*);
@@ -3571,6 +3694,8 @@ struct IndirectAssignmentNode : ASTNode
                 if (ma->isBitField && ma->bitFieldWidth > 0)
                 {
                     expression->emitCode(f);
+                    Type rhsType = computeExprType(expression.get(), scopes, nullptr);
+                    emitScalarConversion(f, ma->resultType, rhsType);
                     f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r8, rax" << ";; Save RHS for bit-field assignment" << std::endl;
 
                     mad->emitCode(f);
@@ -3615,6 +3740,8 @@ struct IndirectAssignmentNode : ASTNode
         }
 
         expression->emitCode(f);
+        Type rhsType = computeExprType(expression.get(), scopes, nullptr);
+        emitScalarConversion(f, valueType, rhsType);
         f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save assigned value" << std::endl;
         pointerExpr->emitCode(f);
         f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rcx" << ";; Restore assigned value" << std::endl;
@@ -4028,6 +4155,31 @@ struct ContinueNode : ASTNode
         const std::string& continueLabel = loopControlStack.back().first;
         f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + continueLabel) << ";; continue" << std::endl;
     }
+};
+
+
+// floating-point literal (parsed as double)
+struct FloatLiteralNode : ASTNode
+{
+    double value;
+    FloatLiteralNode(double v) : value(v) {}
+
+    void emitData(std::ofstream& f) const override {}
+    void emitCode(std::ofstream& f) const override
+    {
+        // move the bit pattern of the double into rax via hex immediate
+        uint64_t bits;
+        static_assert(sizeof(bits) == sizeof(value), "size mismatch");
+        std::memcpy(&bits, &value, sizeof(bits));
+        std::stringstream ss;
+        ss << "0x" << std::hex << bits;
+        std::string hexbits = ss.str();
+        std::string instruction = "\tmov rax, " + hexbits;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load float constant " << value << " into rax" << std::endl;
+    }
+
+    bool isConstant() const override { return true; }
+    int getConstantValue() const override { return (int)value; }
 };
 
 
@@ -4656,29 +4808,6 @@ struct NumberNode : ASTNode
     int getConstantValue() const override { return static_cast<int>(value); }
 };
 
-// floating-point literal (parsed as double)
-struct FloatLiteralNode : ASTNode
-{
-    double value;
-    FloatLiteralNode(double v) : value(v) {}
-
-    void emitData(std::ofstream& f) const override {}
-    void emitCode(std::ofstream& f) const override
-    {
-        // move the bit pattern of the double into rax via hex immediate
-        uint64_t bits;
-        static_assert(sizeof(bits) == sizeof(value), "size mismatch");
-        std::memcpy(&bits, &value, sizeof(bits));
-        std::stringstream ss;
-        ss << "0x" << std::hex << bits;
-        std::string hexbits = ss.str();
-        std::string instruction = "\tmov rax, " + hexbits;
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load float constant " << value << " into rax" << std::endl;
-    }
-
-    bool isConstant() const override { return true; }
-    int getConstantValue() const override { return (int)value; }
-};
 
 // sizeof node: either stores a type or an expression.  Result is always an int constant.
 struct SizeofNode : ASTNode
@@ -5356,6 +5485,12 @@ class Parser
             return std::make_unique<IdentifierNode>(id->name, id->line, id->col, currentFunction);
         if (auto un = dynamic_cast<const UnaryOpNode*>(node))
             return std::make_unique<UnaryOpNode>(un->op, un->name, un->isPrefix, un->line, un->col);
+        if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node))
+        {
+            auto cloned = std::make_unique<PostfixUpdateNode>(cloneExpr(pu->target.get(), currentFunction), pu->op, pu->line, pu->col);
+            cloned->valueType = pu->valueType;
+            return cloned;
+        }
         if (auto ln = dynamic_cast<const LogicalNotNode*>(node))
             return std::make_unique<LogicalNotNode>(cloneExpr(ln->operand.get(), currentFunction), ln->line, ln->col);
         if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
@@ -5563,16 +5698,30 @@ class Parser
                                 memberDimensions.push_back(0);
                                 isFlexible = true;
                             }
-                            else if (currentToken.type == TOKEN_NUMBER)
-                            {
-                                memberDimensions.push_back(std::stoul(currentToken.value));
-                                eat(TOKEN_NUMBER);
-                            }
                             else
                             {
-                                reportError(currentToken.line, currentToken.col, "Struct array member size must be constant");
-                                hadError = true;
-                                memberDimensions.push_back(1);
+                                auto dimExpr = condition(nullptr);
+                                if (!dimExpr || !dimExpr->isConstant())
+                                {
+                                    reportError(currentToken.line, currentToken.col, "Struct array member size must be constant");
+                                    hadError = true;
+                                    memberDimensions.push_back(1);
+                                }
+                                else
+                                {
+                                    int dimValue = dimExpr->getConstantValue();
+                                    if (dimValue <= 0)
+                                    {
+                                        reportError(currentToken.line, currentToken.col,
+                                                    "Struct array member size must be positive");
+                                        hadError = true;
+                                        memberDimensions.push_back(1);
+                                    }
+                                    else
+                                    {
+                                        memberDimensions.push_back(static_cast<size_t>(dimValue));
+                                    }
+                                }
                             }
                             eat(TOKEN_RBRACKET);
                         }
@@ -5791,16 +5940,30 @@ class Parser
                                 memberDimensions.push_back(0);
                                 isFlexible = true;
                             }
-                            else if (currentToken.type == TOKEN_NUMBER)
-                            {
-                                memberDimensions.push_back(std::stoul(currentToken.value));
-                                eat(TOKEN_NUMBER);
-                            }
                             else
                             {
-                                reportError(currentToken.line, currentToken.col, "Union array member size must be constant");
-                                hadError = true;
-                                memberDimensions.push_back(1);
+                                auto dimExpr = condition(nullptr);
+                                if (!dimExpr || !dimExpr->isConstant())
+                                {
+                                    reportError(currentToken.line, currentToken.col, "Union array member size must be constant");
+                                    hadError = true;
+                                    memberDimensions.push_back(1);
+                                }
+                                else
+                                {
+                                    int dimValue = dimExpr->getConstantValue();
+                                    if (dimValue <= 0)
+                                    {
+                                        reportError(currentToken.line, currentToken.col,
+                                                    "Union array member size must be positive");
+                                        hadError = true;
+                                        memberDimensions.push_back(1);
+                                    }
+                                    else
+                                    {
+                                        memberDimensions.push_back(static_cast<size_t>(dimValue));
+                                    }
+                                }
                             }
                             eat(TOKEN_RBRACKET);
                         }
@@ -5979,14 +6142,8 @@ class Parser
             integerLike = false;
             if (sawFloat)
                 baseTok = TOKEN_FLOAT;
-            else if (longCount > 0)
-            {
-                reportError(currentToken.line, currentToken.col, "long double is not supported yet");
-                hadError = true;
-                baseTok = TOKEN_DOUBLE;
-            }
             else
-                baseTok = TOKEN_DOUBLE;
+                baseTok = TOKEN_DOUBLE; // Treat long double as double for compatibility.
         }
         else if (sawVoid)
         {
@@ -6014,7 +6171,8 @@ class Parser
             baseTok = TOKEN_INT;
         }
 
-        if ((sawFloat || sawDouble || sawVoid) && (sawUnsigned || sawSigned || sawShort || longCount > 0 || sawChar || sawStruct))
+        if ((sawFloat || sawDouble || sawVoid) && (sawUnsigned || sawSigned || sawShort || sawChar || sawStruct ||
+            (sawFloat && longCount > 0) || (sawDouble && longCount > 1) || (sawVoid && longCount > 0)))
         {
             reportError(currentToken.line, currentToken.col, "Invalid type specifier combination");
             hadError = true;
@@ -6150,8 +6308,32 @@ class Parser
         auto applyPostfix = [&](std::unique_ptr<ASTNode> node, int l, int c) -> std::unique_ptr<ASTNode>
         {
             while (currentToken.type == TOKEN_LBRACKET || currentToken.type == TOKEN_DOT ||
-                   currentToken.type == TOKEN_ARROW || currentToken.type == TOKEN_LPAREN)
+                   currentToken.type == TOKEN_ARROW || currentToken.type == TOKEN_LPAREN ||
+                   currentToken.type == TOKEN_INCREMENT || currentToken.type == TOKEN_DECREMENT)
             {
+                if (currentToken.type == TOKEN_INCREMENT || currentToken.type == TOKEN_DECREMENT)
+                {
+                    Token opTok = currentToken;
+                    eat(opTok.type);
+
+                    if (auto idNode = dynamic_cast<IdentifierNode*>(node.get()))
+                    {
+                        node = std::make_unique<UnaryOpNode>(opTok.value, idNode->name, false, idNode->line, idNode->col);
+                        continue;
+                    }
+
+                    if (dynamic_cast<MemberAccessNode*>(node.get()))
+                    {
+                        node = std::make_unique<PostfixUpdateNode>(std::move(node), opTok.value, opTok.line, opTok.col);
+                        continue;
+                    }
+
+                    reportError(opTok.line, opTok.col, "Postfix ++/-- requires an assignable identifier or member expression");
+                    hadError = true;
+                    node = std::make_unique<NumberNode>(0);
+                    continue;
+                }
+
                 if (currentToken.type == TOKEN_LPAREN)
                 {
                     eat(TOKEN_LPAREN);
@@ -6490,7 +6672,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 if (currentToken.type == TOKEN_ASSIGN)
                 {
                     eat(TOKEN_ASSIGN);
-                    valueExpr = condition(currentFunction);
+                    valueExpr = conditional(currentFunction);
                 }
 
                 int enumValue = nextValue;
@@ -6844,7 +7026,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             std::vector<size_t> typedefArrayDims;
             TokenType typeTok = parseTypeSpecifiers(seenUnsigned, seenConst, seenAuto, seenRegister, seenTypedef,
                                                     &declStructName, &parsedDeclBaseType, &typedefArrayDims);
-            bool isUns = seenUnsigned;
+            // bool isUns = seenUnsigned;
             std::vector<std::unique_ptr<ASTNode>> declNodes;
 
             while (true)
@@ -7390,7 +7572,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         {
             isExternal = true;
             eat(TOKEN_EXTERN);
-            if (currentToken.type == TOKEN_IDENTIFIER)
+            if (currentToken.type == TOKEN_IDENTIFIER && lexer.peekToken().type == TOKEN_SEMICOLON)
             {
                 // Parse the function name
                 Token nameToken = currentToken;
@@ -7411,7 +7593,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         bool returnTypedef = false;
         Type resolvedReturnType{Type::INT, 0};
         std::vector<size_t> returnTypedefArrayDims;
-        TokenType returnType = parseTypeSpecifiers(returnUns, returnConst, returnAuto, returnRegister, returnTypedef,
+        parseTypeSpecifiers(returnUns, returnConst, returnAuto, returnRegister, returnTypedef,
                                &returnStructName, &resolvedReturnType, &returnTypedefArrayDims);
 
         int returnPtrLevel = 0;
@@ -7474,7 +7656,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
         // If the next token is not '(', or this is already a function-pointer
         // declarator, treat it as file-scope declaration(s).
-        if (currentToken.type != TOKEN_LPAREN || firstIsFunctionPtr)
+        if (returnTypedef || currentToken.type != TOKEN_LPAREN || firstIsFunctionPtr)
         {
             if (returnAuto || returnRegister)
             {
@@ -7512,6 +7694,23 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                             hadError = true;
                         }
                         eat(TOKEN_RBRACKET);
+                    }
+
+                    // Support function-type typedefs such as:
+                    //   typedef int handler_t(int, char*);
+                    // by consuming the parameter list in the typedef declarator.
+                    if (currentToken.type == TOKEN_LPAREN)
+                    {
+                        int depth = 0;
+                        do
+                        {
+                            if (currentToken.type == TOKEN_LPAREN)
+                                depth++;
+                            else if (currentToken.type == TOKEN_RPAREN)
+                                depth--;
+                            currentToken = lexer.nextToken();
+                        }
+                        while (currentToken.type != TOKEN_EOF && depth > 0);
                     }
 
                     if (currentToken.type == TOKEN_ASSIGN)
@@ -7711,7 +7910,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             bool paramTypedef = false;
             Type resolvedParamType{Type::INT, 0};
             std::vector<size_t> paramTypedefArrayDims;
-            TokenType paramType = parseTypeSpecifiers(paramUns, paramConst, paramAuto, paramRegister, paramTypedef,
+            parseTypeSpecifiers(paramUns, paramConst, paramAuto, paramRegister, paramTypedef,
                                                       &paramStructName, &resolvedParamType, &paramTypedefArrayDims);
             if (paramAuto)
             {
@@ -7754,9 +7953,17 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             }
             else
             {
-                // Parse the parameter name (required in this compiler's model)
-                name = currentToken.value;
-                eat(TOKEN_IDENTIFIER);
+                // Parameter names can be omitted in prototypes from system headers.
+                if (currentToken.type == TOKEN_IDENTIFIER)
+                {
+                    name = currentToken.value;
+                    eat(TOKEN_IDENTIFIER);
+                }
+                else
+                {
+                    static size_t unnamedParamCounter = 0;
+                    name = "__unnamed_param_" + std::to_string(unnamedParamCounter++);
+                }
             }
 
             // Optional array declarators in parameters (e.g. int a[][3]).
@@ -9016,17 +9223,66 @@ private:
             return;
         initialized = true;
 
-        Macro stdc;
-        stdc.replacement = {"1"};
-        macros["__STDC__"] = stdc;
+        auto addObjectMacro = [&](const std::string& name, std::vector<std::string> repl)
+        {
+            Macro m;
+            m.replacement = std::move(repl);
+            macros[name] = m;
+        };
 
-        Macro stdcver;
-        stdcver.replacement = {"201710L"};
-        macros["__STDC_VERSION__"] = stdcver;
+        auto addFunctionLikeEmpty = [&](const std::string& name)
+        {
+            Macro m;
+            m.functionLike = true;
+            m.variadic = true;
+            macros[name] = m;
+        };
 
-        Macro stdchost;
-        stdchost.replacement = {"1"};
-        macros["__STDC_HOSTED__"] = stdchost;
+        addObjectMacro("__STDC__", {"1"});
+        addObjectMacro("__STDC_VERSION__", {"201710L"});
+        addObjectMacro("__STDC_HOSTED__", {"1"});
+
+        // Basic GNU compatibility surface for common libc headers.
+        addObjectMacro("__extension__", {});
+        addObjectMacro("__restrict", {});
+        addObjectMacro("__restrict__", {});
+        addObjectMacro("__inline", {});
+        addObjectMacro("__inline__", {});
+        addObjectMacro("__volatile__", {});
+        addObjectMacro("__const", {"const"});
+        addObjectMacro("__const__", {"const"});
+        addObjectMacro("__signed__", {"signed"});
+        addObjectMacro("__THROW", {});
+        addObjectMacro("__THROWNL", {});
+        addObjectMacro("__NTH", {});
+        addObjectMacro("__NTHNL", {});
+        addObjectMacro("__wur", {});
+        addObjectMacro("__nonnull", {});
+        addObjectMacro("__returns_nonnull", {});
+        addObjectMacro("__attribute_malloc__", {});
+
+        // GCC builtin type aliases that appear in stddef/stdarg internals.
+        addObjectMacro("__builtin_va_list", {"char", "*"});
+        addObjectMacro("__SIZE_TYPE__", {"unsigned", "long"});
+        addObjectMacro("__PTRDIFF_TYPE__", {"long"});
+        addObjectMacro("__WCHAR_TYPE__", {"int"});
+        addObjectMacro("__WINT_TYPE__", {"unsigned", "int"});
+
+        // glibc math headers may expose C23 floating keywords in declarations.
+        // Map them to supported scalar types for parser compatibility.
+        addObjectMacro("_Float32", {"float"});
+        addObjectMacro("_Float32x", {"double"});
+        addObjectMacro("_Float64", {"double"});
+        addObjectMacro("_Float64x", {"double"});
+        addObjectMacro("_Float128", {"double"});
+
+        // Ignore GNU attribute/asm spellings in headers.
+        addFunctionLikeEmpty("__attribute__");
+        addFunctionLikeEmpty("__attribute");
+        addFunctionLikeEmpty("__asm__");
+        addFunctionLikeEmpty("__asm");
+        addFunctionLikeEmpty("__declspec");
+        addFunctionLikeEmpty("__builtin_offsetof");
     }
 
     bool parseDefineDirective(const std::string& rest, int lineNo, int col,
@@ -9119,16 +9375,104 @@ private:
 
     std::string resolveIncludePath(const std::string& includeName, bool angled, const std::string& currentFile)
     {
+        if (!includeName.empty() && (includeName[0] == '/' || includeName[0] == '\\'))
+        {
+            std::string absolute = normalizeSlashes(includeName);
+            if (fileExists(absolute))
+                return absolute;
+            return "";
+        }
+
         std::vector<std::string> candidates;
         std::string currentDir = dirnameOf(normalizeSlashes(currentFile));
         std::string rootDir = dirnameOf(normalizeSlashes(sourceFileName));
+        auto addCandidate = [&](const std::string& c)
+        {
+            std::string normalized = normalizeSlashes(c);
+            if (!normalized.empty())
+                candidates.push_back(normalized);
+        };
 
+        // Search local/project paths first for quote includes.
         if (!angled)
-            candidates.push_back(currentDir + "/" + includeName);
-        candidates.push_back(rootDir + "/" + includeName);
-        candidates.push_back(rootDir + "/lib/" + includeName);
-        candidates.push_back("lib/" + includeName);
-        candidates.push_back(includeName);
+        {
+            addCandidate(currentDir + "/" + includeName);
+            addCandidate(rootDir + "/" + includeName);
+            addCandidate(rootDir + "/lib/" + includeName);
+            addCandidate("lib/" + includeName);
+            addCandidate(includeName);
+        }
+
+        // System include lookup for angle includes and as fallback for quote includes.
+        // This enables headers such as <stdio.h> and nested includes like <bits/...>
+        // on common Linux installations.
+        std::vector<std::string> systemIncludeDirs = {
+            "/usr/include",
+            "/usr/local/include",
+            "/usr/include/x86_64-linux-gnu",
+            "/usr/include/aarch64-linux-gnu",
+            "/usr/include/arm-linux-gnueabihf"
+        };
+
+        auto appendCompilerIncludeDirs = [&](std::vector<std::string>& out)
+        {
+            namespace fs = std::filesystem;
+            auto addDir = [&](const fs::path& p)
+            {
+                std::string s = normalizeSlashes(p.string());
+                if (!s.empty())
+                    out.push_back(s);
+            };
+
+            auto scanGccRoot = [&](const fs::path& root)
+            {
+                std::error_code ec;
+                if (!fs::exists(root, ec) || !fs::is_directory(root, ec))
+                    return;
+
+                for (const auto& targetEntry : fs::directory_iterator(root, ec))
+                {
+                    if (ec || !targetEntry.is_directory(ec))
+                        continue;
+                    for (const auto& verEntry : fs::directory_iterator(targetEntry.path(), ec))
+                    {
+                        if (ec || !verEntry.is_directory(ec))
+                            continue;
+                        fs::path includeDir = verEntry.path() / "include";
+                        fs::path includeFixedDir = verEntry.path() / "include-fixed";
+                        if (fs::exists(includeDir, ec) && fs::is_directory(includeDir, ec))
+                            addDir(includeDir);
+                        if (fs::exists(includeFixedDir, ec) && fs::is_directory(includeFixedDir, ec))
+                            addDir(includeFixedDir);
+                    }
+                }
+            };
+
+            auto scanClangRoot = [&](const fs::path& root)
+            {
+                std::error_code ec;
+                if (!fs::exists(root, ec) || !fs::is_directory(root, ec))
+                    return;
+
+                for (const auto& verEntry : fs::directory_iterator(root, ec))
+                {
+                    if (ec || !verEntry.is_directory(ec))
+                        continue;
+                    fs::path includeDir = verEntry.path() / "include";
+                    if (fs::exists(includeDir, ec) && fs::is_directory(includeDir, ec))
+                        addDir(includeDir);
+                }
+            };
+
+            scanGccRoot("/usr/lib/gcc");
+            scanGccRoot("/usr/lib64/gcc");
+            scanClangRoot("/usr/lib/clang");
+            scanClangRoot("/usr/lib64/clang");
+        };
+
+        appendCompilerIncludeDirs(systemIncludeDirs);
+        for (const auto& dir : systemIncludeDirs)
+            addCandidate(dir + "/" + includeName);
 
         for (const auto& c : candidates)
             if (fileExists(c))
@@ -9439,9 +9783,23 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 {
     // Reset the global stack and index counter
     functionVariableIndex = 0;
+    emittedExternalFunctions.clear();
+    declaredExternalFunctions.clear();
+    referencedExternalFunctions.clear();
     while(!scopes.empty())
     {
         scopes.pop();
+    }
+
+    // Collect external declarations up front so call emission can mark usage
+    // regardless of declaration order.
+    for (const auto& node : ast)
+    {
+        if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
+        {
+            if (fn->isExternal)
+                declaredExternalFunctions.insert(fn->name);
+        }
     }
     
     // Emit data section (for global variables)
@@ -9454,6 +9812,17 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
     for (const auto& node : ast)
     {
         node->emitCode(f);
+    }
+
+    for (const auto& name : referencedExternalFunctions)
+    {
+        if (!declaredExternalFunctions.count(name))
+            continue;
+        if (emittedExternalFunctions.insert(name).second)
+        {
+            f << std::endl << "extrn '" << name << "' as _" << name << std::endl;
+            f << name << " = PLT _" << name << std::endl;
+        }
     }
 
     f << std::endl << "section '.data' writable" << std::endl;
@@ -9500,6 +9869,7 @@ static std::pair<int,int> bestEffortNodeLocation(const ASTNode* node)
     if (auto asg = dynamic_cast<const AssignmentNode*>(node)) return {asg->line, asg->col};
     if (auto iasg = dynamic_cast<const IndirectAssignmentNode*>(node)) return {iasg->line, iasg->col};
     if (auto un = dynamic_cast<const UnaryOpNode*>(node)) return {un->line, un->col};
+    if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node)) return {pu->line, pu->col};
     if (auto ln = dynamic_cast<const LogicalNotNode*>(node)) return {ln->line, ln->col};
     if (auto tn = dynamic_cast<const TernaryNode*>(node)) return {tn->line, tn->col};
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node)) return bestEffortNodeLocation(bin->left.get());
@@ -9648,6 +10018,13 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
             return {Type::INT,0};
         }
     }
+    if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node))
+    {
+        Type t = computeExprType(pu->target.get(), scopes, currentFunction);
+        if (auto mutablePu = dynamic_cast<PostfixUpdateNode*>(const_cast<ASTNode*>(node)))
+            mutablePu->valueType = t;
+        return t;
+    }
     if (auto ao = dynamic_cast<const AddressOfNode*>(node))
     {
         auto lookupResult = lookupInScopes(scopes, ao->Identifier);
@@ -9771,6 +10148,10 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     }
     if (auto cn = dynamic_cast<const CastNode*>(node))
     {
+        // Keep inner expression type metadata up to date (for example, pointer
+        // arithmetic scaling in nested BinaryOpNode) even when the cast decides
+        // the final expression type.
+        computeExprType(cn->operand.get(), scopes, currentFunction);
         return cn->targetType;
     }
     if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
@@ -10012,6 +10393,24 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
                 reportError(un->line, un->col, "Cannot modify const-qualified object '" + un->name + "'");
                 hadError = true;
             }
+        }
+        return;
+    }
+
+    if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node))
+    {
+        semanticCheckExpression(pu->target.get(), scopes, currentFunction);
+        Type t = computeExprType(pu->target.get(), scopes, currentFunction);
+        bool scalar = (t.pointerLevel > 0) || isIntegerScalarType(t) || isFloatScalarType(t);
+        if (!scalar)
+        {
+            reportError(pu->line, pu->col, "Postfix ++/-- requires a scalar operand");
+            hadError = true;
+        }
+        if (t.isConst)
+        {
+            reportError(pu->line, pu->col, "Cannot modify const-qualified expression with postfix ++/--");
+            hadError = true;
         }
         return;
     }
@@ -10993,6 +11392,57 @@ int main(int argc, char** argv)
     buff << inFile.rdbuf();
     std::string source = buff.str();
     inFile.close();
+
+    auto runSystemPreprocessor = [&](const std::string& inPath, std::string& outText) -> bool
+    {
+        std::string tmpStem = std::to_string(static_cast<long long>(std::time(nullptr))) + "_" + std::to_string(std::rand());
+        std::string ppOutPath = "/tmp/gvc_pp_" + tmpStem + ".i";
+        std::string ppErrPath = "/tmp/gvc_pp_" + tmpStem + ".err";
+
+        std::string cmd = "cc -E -P " + shellQuote(inPath) + " -o " + shellQuote(ppOutPath) + " 2> " + shellQuote(ppErrPath);
+        int rc = std::system(cmd.c_str());
+        if (rc != 0)
+        {
+            std::ifstream errIn(ppErrPath);
+            if (errIn.is_open())
+            {
+                std::stringstream errBuff;
+                errBuff << errIn.rdbuf();
+                std::string errText = errBuff.str();
+                if (!errText.empty())
+                    std::cerr << errText;
+            }
+            std::error_code ec;
+            std::filesystem::remove(ppOutPath, ec);
+            std::filesystem::remove(ppErrPath, ec);
+            return false;
+        }
+
+        std::ifstream ppIn(ppOutPath);
+        if (!ppIn.is_open())
+        {
+            std::error_code ec;
+            std::filesystem::remove(ppOutPath, ec);
+            std::filesystem::remove(ppErrPath, ec);
+            return false;
+        }
+
+        std::stringstream ppBuff;
+        ppBuff << ppIn.rdbuf();
+        outText = ppBuff.str();
+
+        std::error_code ec;
+        std::filesystem::remove(ppOutPath, ec);
+        std::filesystem::remove(ppErrPath, ec);
+        return true;
+    };
+
+    if (source.find("#include <") != std::string::npos)
+    {
+        std::string externalPreprocessed;
+        if (runSystemPreprocessor(inputPath, externalPreprocessed))
+            source = externalPreprocessed;
+    }
 
     Preprocessor preprocessor;
     std::unordered_map<std::string, std::string> defines;
