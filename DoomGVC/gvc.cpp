@@ -424,6 +424,7 @@ static std::vector<CompileError> compileErrors;
 
 enum TokenType
 {
+    TOKEN_TYPEDEF,
     TOKEN_INT,
     TOKEN_CHAR,
     TOKEN_VOID,
@@ -507,6 +508,7 @@ std::string tokenTypeToString(TokenType t)
 {
     switch (t)
     {
+        case TOKEN_TYPEDEF: return "typedef";
         case TOKEN_INT: return "int";
         case TOKEN_CHAR: return "char";
         case TOKEN_VOID: return "void";
@@ -1017,6 +1019,7 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             std::string ident;
             while (isalnum(peek()) || peek() == '_') ident += advance();
             if (ident == "if")      return Token{ TOKEN_IF    , ident, tokenLine, tokenCol };
+            if (ident == "typedef") return Token{ TOKEN_TYPEDEF, ident, tokenLine, tokenCol };
             if (ident == "int")     return Token{ TOKEN_INT   , ident, tokenLine, tokenCol };
             if (ident == "short")   return Token{ TOKEN_SHORT , ident, tokenLine, tokenCol };
             if (ident == "long")    return Token{ TOKEN_LONG  , ident, tokenLine, tokenCol };
@@ -5038,6 +5041,62 @@ class Parser
     Lexer& lexer;
     Token currentToken;
 
+    struct TypedefInfo
+    {
+        Type type;
+        std::vector<size_t> arrayDims;
+    };
+
+    std::vector<std::map<std::string, TypedefInfo>> typedefScopes;
+
+    void pushTypedefScope()
+    {
+        typedefScopes.push_back({});
+    }
+
+    void popTypedefScope()
+    {
+        if (!typedefScopes.empty())
+            typedefScopes.pop_back();
+    }
+
+    const TypedefInfo* lookupTypedef(const std::string& name) const
+    {
+        for (auto it = typedefScopes.rbegin(); it != typedefScopes.rend(); ++it)
+        {
+            auto found = it->find(name);
+            if (found != it->end())
+                return &found->second;
+        }
+        return nullptr;
+    }
+
+    bool isTypedefName(const std::string& name) const
+    {
+        return lookupTypedef(name) != nullptr;
+    }
+
+    void registerTypedef(const std::string& name, const TypedefInfo& info, int line, int col)
+    {
+        if (typedefScopes.empty())
+            pushTypedefScope();
+
+        auto& scope = typedefScopes.back();
+        if (scope.find(name) != scope.end())
+        {
+            reportError(line, col, "Redefinition of typedef '" + name + "'");
+            hadError = true;
+            return;
+        }
+        scope[name] = info;
+    }
+
+    bool startsTypeSpecifier(const Token& tok) const
+    {
+        return isTypeSpecifierToken(tok.type) ||
+               (tok.type == TOKEN_IDENTIFIER && isTypedefName(tok.value));
+    }
+
     std::unique_ptr<ASTNode> cloneExpr(const ASTNode* node, const FunctionNode* currentFunction = nullptr)
     {
         if (!node) return nullptr;
@@ -5137,19 +5196,27 @@ class Parser
 
     bool isTypeSpecifierToken(TokenType t) const
     {
-        return t == TOKEN_INT || t == TOKEN_CHAR || t == TOKEN_VOID || t == TOKEN_SHORT ||
+        return t == TOKEN_TYPEDEF || t == TOKEN_INT || t == TOKEN_CHAR || t == TOKEN_VOID || t == TOKEN_SHORT ||
                t == TOKEN_LONG || t == TOKEN_FLOAT || t == TOKEN_DOUBLE || t == TOKEN_STRUCT ||
                t == TOKEN_UNION || t == TOKEN_UNSIGNED || t == TOKEN_SIGNED || t == TOKEN_CONST ||
                t == TOKEN_AUTO || t == TOKEN_REGISTER;
     }
 
-    TokenType parseTypeSpecifiers(bool &isUnsignedOut, bool &isConstOut, bool &isAutoOut, bool &isRegisterOut, std::string* structNameOut = nullptr)
+    TokenType parseTypeSpecifiers(bool &isUnsignedOut,
+                                  bool &isConstOut,
+                                  bool &isAutoOut,
+                                  bool &isRegisterOut,
+                                  bool &isTypedefOut,
+                                  std::string* structNameOut = nullptr,
+                                  Type* resolvedTypeOut = nullptr,
+                                  std::vector<size_t>* typedefArrayDimsOut = nullptr)
     {
         bool sawUnsigned = false;
         bool sawSigned = false;
         bool sawConst = false;
         bool sawAuto = false;
         bool sawRegister = false;
+        bool sawTypedefKeyword = false;
         bool sawShort = false;
         int longCount = 0;
         bool sawInt = false;
@@ -5159,12 +5226,16 @@ class Parser
         bool sawDouble = false;
         bool sawStruct = false;
         bool sawUnion = false;
+        bool sawTypedefName = false;
         std::string structName;
-        bool isUnion = false;  // Track if the aggregate is a union vs struct
+        Type typedefBaseType{Type::INT, 0};
+        std::vector<size_t> typedefArrayDims;
 
-        while (isTypeSpecifierToken(currentToken.type))
+        while (isTypeSpecifierToken(currentToken.type) ||
+               (currentToken.type == TOKEN_IDENTIFIER && isTypedefName(currentToken.value)))
         {
-            if (currentToken.type == TOKEN_UNSIGNED) { sawUnsigned = true; eat(TOKEN_UNSIGNED); }
+            if (currentToken.type == TOKEN_TYPEDEF) { sawTypedefKeyword = true; eat(TOKEN_TYPEDEF); }
+            else if (currentToken.type == TOKEN_UNSIGNED) { sawUnsigned = true; eat(TOKEN_UNSIGNED); }
             else if (currentToken.type == TOKEN_SIGNED) { sawSigned = true; eat(TOKEN_SIGNED); }
             else if (currentToken.type == TOKEN_CONST) { sawConst = true; eat(TOKEN_CONST); }
             else if (currentToken.type == TOKEN_AUTO) { sawAuto = true; eat(TOKEN_AUTO); }
@@ -5199,13 +5270,14 @@ class Parser
                     {
                         bool mu = false, mc = false, ma = false, mr = false;
                         std::string memberStructName;
-                        if (!isTypeSpecifierToken(currentToken.type))
+                        if (!startsTypeSpecifier(currentToken))
                         {
                             reportError(currentToken.line, currentToken.col, "Expected member type in struct definition");
                             hadError = true;
                             break;
                         }
-                        TokenType mtok = parseTypeSpecifiers(mu, mc, ma, mr, &memberStructName);
+                        bool mtypedef = false;
+                        TokenType mtok = parseTypeSpecifiers(mu, mc, ma, mr, mtypedef, &memberStructName);
                         int ptrLevel = 0;
                         while (currentToken.type == TOKEN_MUL)
                         {
@@ -5405,7 +5477,6 @@ class Parser
             else if (currentToken.type == TOKEN_UNION)
             {
                 sawUnion = true;
-                isUnion = true;
                 eat(TOKEN_UNION);
 
                 std::string tag;
@@ -5427,13 +5498,14 @@ class Parser
                     {
                         bool mu = false, mc = false, ma = false, mr = false;
                         std::string memberStructName;
-                        if (!isTypeSpecifierToken(currentToken.type))
+                        if (!startsTypeSpecifier(currentToken))
                         {
                             reportError(currentToken.line, currentToken.col, "Expected member type in union definition");
                             hadError = true;
                             break;
                         }
-                        TokenType mtok = parseTypeSpecifiers(mu, mc, ma, mr, &memberStructName);
+                        bool mtypedef = false;
+                        TokenType mtok = parseTypeSpecifiers(mu, mc, ma, mr, mtypedef, &memberStructName);
                         int ptrLevel = 0;
                         while (currentToken.type == TOKEN_MUL)
                         {
@@ -5586,6 +5658,17 @@ class Parser
 
                 structName = tag;
             }
+            else if (currentToken.type == TOKEN_IDENTIFIER && isTypedefName(currentToken.value))
+            {
+                const TypedefInfo* td = lookupTypedef(currentToken.value);
+                if (td)
+                {
+                    sawTypedefName = true;
+                    typedefBaseType = td->type;
+                    typedefArrayDims = td->arrayDims;
+                }
+                eat(TOKEN_IDENTIFIER);
+            }
         }
 
         if (sawUnsigned && sawSigned)
@@ -5601,10 +5684,36 @@ class Parser
             hadError = true;
         }
 
+        if (sawTypedefName && (sawStruct || sawUnion || sawFloat || sawDouble || sawVoid || sawChar ||
+                               sawShort || longCount > 0 || sawInt || sawUnsigned || sawSigned))
+        {
+            reportError(currentToken.line, currentToken.col, "Invalid combination of typedef name with built-in type specifiers");
+            hadError = true;
+        }
+
         TokenType baseTok = TOKEN_INT;
         bool integerLike = true;
 
-        if (sawStruct)
+        if (sawTypedefName)
+        {
+            switch (typedefBaseType.base)
+            {
+                case Type::CHAR: baseTok = TOKEN_CHAR; break;
+                case Type::VOID: baseTok = TOKEN_VOID; break;
+                case Type::SHORT: baseTok = TOKEN_SHORT; break;
+                case Type::LONG: baseTok = TOKEN_LONG; break;
+                case Type::LONG_LONG: baseTok = TOKEN_LONG_LONG; break;
+                case Type::FLOAT: baseTok = TOKEN_FLOAT; break;
+                case Type::DOUBLE: baseTok = TOKEN_DOUBLE; break;
+                case Type::STRUCT: baseTok = TOKEN_STRUCT; break;
+                case Type::UNION: baseTok = TOKEN_UNION; break;
+                case Type::INT:
+                default: baseTok = TOKEN_INT; break;
+            }
+            structName = typedefBaseType.structName;
+            integerLike = isIntegerScalarType(typedefBaseType);
+        }
+        else if (sawStruct)
         {
             baseTok = TOKEN_STRUCT;
             integerLike = false;
@@ -5663,10 +5772,25 @@ class Parser
         if (structNameOut)
             *structNameOut = structName;
 
+        if (typedefArrayDimsOut)
+            *typedefArrayDimsOut = typedefArrayDims;
+
+        if (resolvedTypeOut)
+        {
+            if (sawTypedefName)
+                *resolvedTypeOut = typedefBaseType;
+            else
+                *resolvedTypeOut = makeType(baseTok, 0, integerLike && sawUnsigned, sawConst, structName);
+
+            if (resolvedTypeOut->pointerLevel > 0)
+                resolvedTypeOut->isConst = false;
+        }
+
         isUnsignedOut = integerLike && sawUnsigned;
         isConstOut = sawConst;
         isAutoOut = sawAuto;
         isRegisterOut = sawRegister;
+        isTypedefOut = sawTypedefKeyword;
         return baseTok;
     }
 
@@ -5675,8 +5799,9 @@ class Parser
         bool ignoredConst = false;
         bool ignoredAuto = false;
         bool ignoredRegister = false;
-        TokenType t = parseTypeSpecifiers(isUnsignedOut, ignoredConst, ignoredAuto, ignoredRegister, structNameOut);
-        if (ignoredAuto || ignoredRegister)
+        bool ignoredTypedef = false;
+        TokenType t = parseTypeSpecifiers(isUnsignedOut, ignoredConst, ignoredAuto, ignoredRegister, ignoredTypedef, structNameOut);
+        if (ignoredAuto || ignoredRegister || ignoredTypedef)
         {
             reportError(currentToken.line, currentToken.col, "Storage class specifier is not valid in this type-name context");
             hadError = true;
@@ -5745,7 +5870,8 @@ class Parser
         bool typeAuto = false;
         bool typeRegister = false;
         std::string structName;
-        TokenType typeTok = parseTypeSpecifiers(typeUnsigned, typeConst, typeAuto, typeRegister, &structName);
+        bool typeTypedef = false;
+        TokenType typeTok = parseTypeSpecifiers(typeUnsigned, typeConst, typeAuto, typeRegister, typeTypedef, &structName);
 
         int ptrLevel = 0;
         while (currentToken.type == TOKEN_MUL)
@@ -5838,7 +5964,7 @@ class Parser
             {
                 eat(TOKEN_LPAREN);
                 // attempt to parse a type-name sequence as for declarations
-                bool sawType = isTypeSpecifierToken(currentToken.type);
+                bool sawType = startsTypeSpecifier(currentToken);
                 TokenType tt = TOKEN_INT;
                 bool sawUnsigned = false;
                 std::string sizeofStructName;
@@ -6385,11 +6511,13 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
         if (token.type == TOKEN_LBRACE) {
             eat(TOKEN_LBRACE);
+            pushTypedefScope();
             std::vector<std::unique_ptr<ASTNode>> stmts;
             while (currentToken.type != TOKEN_RBRACE && currentToken.type != TOKEN_EOF) {
                 stmts.push_back(statement(currentFunction));
             }
             eat(TOKEN_RBRACE);
+            popTypedefScope();
             return std::make_unique<BlockNode>(std::move(stmts));
         }
 
@@ -6398,11 +6526,12 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             return parseEnumDeclarationOrVariable(currentFunction);
         }
 
-// declaration begins with a type keyword
-        if (token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID || token.type == TOKEN_STRUCT ||
+// declaration begins with a type keyword or typedef name
+        if (token.type == TOKEN_TYPEDEF || token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID || token.type == TOKEN_STRUCT ||
             token.type == TOKEN_UNION || token.type == TOKEN_SHORT || token.type == TOKEN_LONG || token.type == TOKEN_FLOAT ||
             token.type == TOKEN_DOUBLE || token.type == TOKEN_UNSIGNED || token.type == TOKEN_SIGNED ||
-            token.type == TOKEN_CONST || token.type == TOKEN_AUTO || token.type == TOKEN_REGISTER)
+            token.type == TOKEN_CONST || token.type == TOKEN_AUTO || token.type == TOKEN_REGISTER ||
+            (token.type == TOKEN_IDENTIFIER && isTypedefName(token.value)))
         {
             // consume sequence of type specifiers (signed/unsigned, short, long, etc.)
             bool seenUnsigned = false;
@@ -6410,7 +6539,11 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             bool seenAuto = false;
             bool seenRegister = false;
             std::string declStructName;
-            TokenType typeTok = parseTypeSpecifiers(seenUnsigned, seenConst, seenAuto, seenRegister, &declStructName);
+            bool seenTypedef = false;
+            Type parsedDeclBaseType{Type::INT, 0};
+            std::vector<size_t> typedefArrayDims;
+            TokenType typeTok = parseTypeSpecifiers(seenUnsigned, seenConst, seenAuto, seenRegister, seenTypedef,
+                                                    &declStructName, &parsedDeclBaseType, &typedefArrayDims);
             bool isUns = seenUnsigned;
             std::vector<std::unique_ptr<ASTNode>> declNodes;
 
@@ -6480,8 +6613,34 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     eat(TOKEN_RBRACKET);
                 }
 
-                Type baseType = makeType(typeTok, pointerLevel, isUns, seenConst, declStructName);
-                if (!dimensions.empty())
+                Type baseType = parsedDeclBaseType;
+                baseType.pointerLevel += pointerLevel;
+                if (baseType.pointerLevel > 0)
+                    baseType.isConst = false;
+
+                std::vector<size_t> effectiveDimensions = dimensions;
+                if (pointerLevel == 0 && !typedefArrayDims.empty())
+                    effectiveDimensions.insert(effectiveDimensions.end(), typedefArrayDims.begin(), typedefArrayDims.end());
+
+                if (seenTypedef)
+                {
+                    if (currentToken.type == TOKEN_ASSIGN)
+                    {
+                        reportError(currentToken.line, currentToken.col, "typedef declaration cannot have an initializer");
+                        hadError = true;
+                        eat(TOKEN_ASSIGN);
+                        auto ignored = assignmentExpression(currentFunction);
+                        (void)ignored;
+                    }
+
+                    TypedefInfo td;
+                    td.type = baseType;
+                    td.arrayDims = dimensions;
+                    if (pointerLevel == 0 && !typedefArrayDims.empty())
+                        td.arrayDims.insert(td.arrayDims.end(), typedefArrayDims.begin(), typedefArrayDims.end());
+                    registerTypedef(identifier, td, idToken.line, idToken.col);
+                }
+                else if (!effectiveDimensions.empty())
                 {
                     if (typeTok == TOKEN_CHAR && pointerLevel == 0 && currentToken.type == TOKEN_ASSIGN)
                     {
@@ -6504,7 +6663,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                                 initializer = std::make_unique<InitNode>(parseStringInitializerList());
                             else
                                 initializer = std::make_unique<InitNode>(parseInitializerList());
-                            declNodes.push_back(std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer), false, idToken.line, idToken.col));
+                            declNodes.push_back(std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(effectiveDimensions), std::move(initializer), false, idToken.line, idToken.col));
                         }
                     }
                     else
@@ -6520,7 +6679,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                             else
                                 initializer = std::make_unique<InitNode>(parseInitializerList());
                         }
-                        declNodes.push_back(std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(dimensions), std::move(initializer), false, idToken.line, idToken.col));
+                        declNodes.push_back(std::make_unique<ArrayDeclarationNode>(identifier, arrayType, std::move(effectiveDimensions), std::move(initializer), false, idToken.line, idToken.col));
                     }
                 }
                 else
@@ -6551,6 +6710,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 reportError(token.line, token.col, "Only one of 'auto' and 'register' is allowed");
                 hadError = true;
             }
+            if (seenTypedef)
+                return std::make_unique<EmptyStatementNode>();
             if (declNodes.empty())
                 return std::make_unique<NumberNode>(0);
             if (declNodes.size() == 1)
@@ -6802,7 +6963,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 if (currentToken.type == TOKEN_LPAREN)
                 {
                     Token lookahead = lexer.peekToken();
-                    if (isTypeSpecifierToken(lookahead.type))
+                    if (startsTypeSpecifier(lookahead))
                         expr = parseStructCompoundLiteral(currentFunction);
                     else
                         expr = condition(currentFunction);
@@ -6941,7 +7102,11 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         bool returnAuto = false;
         bool returnRegister = false;
         std::string returnStructName;
-        TokenType returnType = parseTypeSpecifiers(returnUns, returnConst, returnAuto, returnRegister, &returnStructName);
+        bool returnTypedef = false;
+        Type resolvedReturnType{Type::INT, 0};
+        std::vector<size_t> returnTypedefArrayDims;
+        TokenType returnType = parseTypeSpecifiers(returnUns, returnConst, returnAuto, returnRegister, returnTypedef,
+                               &returnStructName, &resolvedReturnType, &returnTypedefArrayDims);
 
         int returnPtrLevel = 0;
         while (currentToken.type == TOKEN_MUL)
@@ -6971,6 +7136,80 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 reportError(nameToken.line, nameToken.col, "Storage class 'auto' or 'register' is not valid at file scope");
                 hadError = true;
             }
+
+            if (returnTypedef)
+            {
+                auto parseTypedefDeclarator = [&](int ptrLevel, Token declaratorToken, const std::string& declaratorName)
+                {
+                    std::vector<size_t> declaratorDims;
+                    while (currentToken.type == TOKEN_LBRACKET)
+                    {
+                        eat(TOKEN_LBRACKET);
+                        if (currentToken.type == TOKEN_NUMBER)
+                        {
+                            declaratorDims.push_back(std::stoul(currentToken.value));
+                            eat(TOKEN_NUMBER);
+                        }
+                        else if (currentToken.type == TOKEN_RBRACKET)
+                        {
+                            if (!declaratorDims.empty())
+                            {
+                                reportError(currentToken.line, currentToken.col,
+                                            "Only the first array dimension may be omitted");
+                                hadError = true;
+                            }
+                            declaratorDims.push_back(0);
+                        }
+                        else
+                        {
+                            reportError(currentToken.line, currentToken.col,
+                                        "Expected constant array size or ']' after [ in typedef declaration");
+                            hadError = true;
+                        }
+                        eat(TOKEN_RBRACKET);
+                    }
+
+                    if (currentToken.type == TOKEN_ASSIGN)
+                    {
+                        reportError(currentToken.line, currentToken.col, "typedef declaration cannot have an initializer");
+                        hadError = true;
+                        eat(TOKEN_ASSIGN);
+                        auto ignored = assignmentExpression(nullptr);
+                        (void)ignored;
+                    }
+
+                    TypedefInfo td;
+                    td.type = resolvedReturnType;
+                    td.type.pointerLevel += ptrLevel;
+                    if (td.type.pointerLevel > 0)
+                        td.type.isConst = false;
+                    td.arrayDims = declaratorDims;
+                    if (ptrLevel == 0 && !returnTypedefArrayDims.empty())
+                        td.arrayDims.insert(td.arrayDims.end(), returnTypedefArrayDims.begin(), returnTypedefArrayDims.end());
+
+                    registerTypedef(declaratorName, td, declaratorToken.line, declaratorToken.col);
+                };
+
+                parseTypedefDeclarator(returnPtrLevel, nameToken, name);
+                while (currentToken.type == TOKEN_COMMA)
+                {
+                    eat(TOKEN_COMMA);
+                    int declaratorPtrLevel = 0;
+                    while (currentToken.type == TOKEN_MUL)
+                    {
+                        eat(TOKEN_MUL);
+                        declaratorPtrLevel++;
+                    }
+
+                    Token declaratorToken = currentToken;
+                    std::string declaratorName = currentToken.value;
+                    eat(TOKEN_IDENTIFIER);
+                    parseTypedefDeclarator(declaratorPtrLevel, declaratorToken, declaratorName);
+                }
+                eat(TOKEN_SEMICOLON);
+                return std::make_unique<EmptyStatementNode>();
+            }
+
             auto parseGlobalDeclarator = [&](int ptrLevel, Token declaratorToken, const std::string& declaratorName) -> std::unique_ptr<ASTNode>
             {
                 // parse dimensions (same rules as locals)
@@ -7052,14 +7291,19 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 if (dimensions.empty() || charArrayToPointer)
                 {
                     int globalPtrLevel = ptrLevel + (charArrayToPointer ? 1 : 0);
-                    auto gd = std::make_unique<GlobalDeclarationNode>(declaratorName, makeType(returnType, globalPtrLevel, returnUns, returnConst, returnStructName), std::move(init), isExternal, declaratorToken.line, declaratorToken.col);
+                    Type globalType = resolvedReturnType;
+                    globalType.pointerLevel += globalPtrLevel;
+                    if (globalType.pointerLevel > 0)
+                        globalType.isConst = false;
+                    auto gd = std::make_unique<GlobalDeclarationNode>(declaratorName, globalType, std::move(init), isExternal, declaratorToken.line, declaratorToken.col);
                     if (charArrayToPointer && gd->initializer)
                         gd->knownObjectSize = gd->initializer->getKnownObjectSize();
                     return gd;
                 }
 
                 // create a temporary ArrayDeclarationNode to hold dimension info, then wrap in GlobalDeclaration
-                auto arrType = makeType(returnType, ptrLevel + 1, returnUns, returnConst, returnStructName);
+                Type arrType = resolvedReturnType;
+                arrType.pointerLevel += ptrLevel + 1;
                 auto arrDecl = std::make_unique<ArrayDeclarationNode>(declaratorName, arrType, std::move(dimensions), std::move(arrayInit), true, declaratorToken.line, declaratorToken.col);
                 // general global handling will later pick up type and dims via semantic pass
                 return arrDecl;
@@ -7116,10 +7360,19 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             bool paramAuto = false;
             bool paramRegister = false;
             std::string paramStructName;
-            TokenType paramType = parseTypeSpecifiers(paramUns, paramConst, paramAuto, paramRegister, &paramStructName);
+            bool paramTypedef = false;
+            Type resolvedParamType{Type::INT, 0};
+            std::vector<size_t> paramTypedefArrayDims;
+            TokenType paramType = parseTypeSpecifiers(paramUns, paramConst, paramAuto, paramRegister, paramTypedef,
+                                                      &paramStructName, &resolvedParamType, &paramTypedefArrayDims);
             if (paramAuto)
             {
                 reportError(currentToken.line, currentToken.col, "'auto' is not valid for function parameters");
+                hadError = true;
+            }
+            if (paramTypedef)
+            {
+                reportError(currentToken.line, currentToken.col, "'typedef' is not valid for function parameters");
                 hadError = true;
             }
             int ptrLevel = 0;
@@ -7158,7 +7411,11 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 eat(TOKEN_RBRACKET);
             }
 
-            Type ptype = makeType(paramType, ptrLevel, paramUns, paramConst, paramStructName);
+            if (ptrLevel == 0 && !paramTypedefArrayDims.empty())
+                paramDims.insert(paramDims.end(), paramTypedefArrayDims.begin(), paramTypedefArrayDims.end());
+
+            Type ptype = resolvedParamType;
+            ptype.pointerLevel += ptrLevel;
             if (!paramDims.empty())
                 ptype.pointerLevel += 1;
 
@@ -7186,13 +7443,21 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         if (currentToken.type == TOKEN_SEMICOLON)
         {
             // create node with empty body and return
-            auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType, returnPtrLevel, returnUns, returnConst, returnStructName), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, true, nameToken.line, nameToken.col);
+            Type finalReturnType = resolvedReturnType;
+            finalReturnType.pointerLevel += returnPtrLevel;
+            if (finalReturnType.pointerLevel > 0)
+                finalReturnType.isConst = false;
+            auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, true, nameToken.line, nameToken.col);
             eat(TOKEN_SEMICOLON);
             return functionNode;
         }
 
         // Create the FunctionNode; body will be filled in below
-        auto functionNode = std::make_unique<FunctionNode>(name, makeType(returnType, returnPtrLevel, returnUns, returnConst, returnStructName), parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, false, nameToken.line, nameToken.col);
+        Type finalReturnType = resolvedReturnType;
+        finalReturnType.pointerLevel += returnPtrLevel;
+        if (finalReturnType.pointerLevel > 0)
+            finalReturnType.isConst = false;
+        auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, false, nameToken.line, nameToken.col);
 
         if (isExternal)
         {
@@ -7201,12 +7466,14 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         }
         // Parse the function body
         eat(TOKEN_LBRACE);
+        pushTypedefScope();
         std::vector<std::unique_ptr<ASTNode>> body;
         while (currentToken.type != TOKEN_RBRACE && currentToken.type != TOKEN_EOF)
         {
             body.push_back(statement(functionNode.get()));
         }
         eat(TOKEN_RBRACE);
+        popTypedefScope();
 
         // Set the body of the FuntcionNode
         functionNode->body = std::move(body);
@@ -7351,7 +7618,10 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
     }
 
 public:
-    Parser(Lexer& lexer) : lexer(lexer), currentToken(lexer.nextToken()) {}
+    Parser(Lexer& lexer) : lexer(lexer), currentToken(lexer.nextToken())
+    {
+        pushTypedefScope();
+    }
 
     std::vector<std::unique_ptr<ASTNode>> parse()
     {
@@ -7360,10 +7630,11 @@ public:
         while (currentToken.type != TOKEN_EOF)
 	    {
             // allow any of the basic type specifiers or 'extern' at file scope
-            if (currentToken.type == TOKEN_ENUM || currentToken.type == TOKEN_STRUCT || currentToken.type == TOKEN_UNION || currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
+            if (currentToken.type == TOKEN_TYPEDEF || currentToken.type == TOKEN_ENUM || currentToken.type == TOKEN_STRUCT || currentToken.type == TOKEN_UNION || currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
                 currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT || currentToken.type == TOKEN_DOUBLE ||
                 currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED ||
-                currentToken.type == TOKEN_CONST || currentToken.type == TOKEN_AUTO || currentToken.type == TOKEN_REGISTER)
+                currentToken.type == TOKEN_CONST || currentToken.type == TOKEN_AUTO || currentToken.type == TOKEN_REGISTER ||
+                (currentToken.type == TOKEN_IDENTIFIER && isTypedefName(currentToken.value)))
             {
                 auto node = function();
                 if (auto listNode = dynamic_cast<StatementListNode*>(node.get()))
