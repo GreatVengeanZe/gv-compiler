@@ -25,7 +25,7 @@
 
 // Type system used for static checking
 struct Type {
-    enum Base { INT, CHAR, VOID, SHORT, LONG, LONG_LONG, FLOAT, DOUBLE, STRUCT, UNION } base;
+    enum Base { BOOL, INT, CHAR, VOID, SHORT, LONG, LONG_LONG, FLOAT, DOUBLE, STRUCT, UNION } base;
     int pointerLevel = 0; // number of '*' qualifiers
     bool isUnsigned = false; // type qualifier
     bool isConst = false; // top-level const qualifier
@@ -49,6 +49,7 @@ struct Type {
         if (isUnsigned)
             s += "unsigned ";
         switch (base) {
+            case BOOL: s += "_Bool"; break;
             case INT:  s += "int"; break;
             case CHAR: s += "char"; break;
             case VOID: s += "void"; break;
@@ -128,6 +129,7 @@ static size_t sizeOfType(const Type &t)
         return 8;
 
     switch (t.base) {
+        case Type::BOOL:   return 1;
         case Type::CHAR:   return 1;
         case Type::SHORT:  return 2;
         case Type::INT:    return 4;
@@ -156,11 +158,98 @@ static bool isSmallStructValueType(const Type &t)
     return sz > 0 && sz <= 16;
 }
 
+static bool usesMemoryReturnType(const Type &t)
+{
+    if (t.pointerLevel != 0 || (t.base != Type::STRUCT && t.base != Type::UNION))
+        return false;
+    size_t sz = sizeOfType(t);
+    return sz > 16;
+}
+
 static size_t stackPassSize(const Type &t)
 {
     if (isSmallStructValueType(t))
         return alignUp(sizeOfType(t), 8);
     return 8;
+}
+
+struct AbiArgLocation
+{
+    bool stackPassed = false;
+    bool isFloat = false;
+    size_t stackOffset = 0;
+    size_t stackSize = 0;
+    size_t spillOffset = 0;
+    int intRegIndex = -1;
+    int floatRegIndex = -1;
+};
+
+static std::vector<AbiArgLocation> computeAbiArgLocations(const std::vector<Type>& types, bool hasHiddenSRet)
+{
+    std::vector<AbiArgLocation> locations(types.size());
+    int nextIntReg = hasHiddenSRet ? 1 : 0;
+    int nextFloatReg = 0;
+    size_t nextStackOffset = 0;
+    size_t nextSpillSlot = hasHiddenSRet ? 1 : 0;
+
+    for (size_t i = 0; i < types.size(); ++i)
+    {
+        AbiArgLocation loc;
+        loc.isFloat = (types[i].pointerLevel == 0 && (types[i].base == Type::FLOAT || types[i].base == Type::DOUBLE));
+
+        if (isSmallStructValueType(types[i]))
+        {
+            loc.stackPassed = true;
+            loc.stackSize = stackPassSize(types[i]);
+            loc.stackOffset = nextStackOffset;
+            nextStackOffset += loc.stackSize;
+        }
+        else if (loc.isFloat)
+        {
+            if (nextFloatReg < 8)
+            {
+                loc.floatRegIndex = nextFloatReg++;
+                loc.spillOffset = (++nextSpillSlot) * 8;
+            }
+            else
+            {
+                loc.stackPassed = true;
+                loc.stackSize = 8;
+                loc.stackOffset = nextStackOffset;
+                nextStackOffset += loc.stackSize;
+            }
+        }
+        else
+        {
+            if (nextIntReg < 6)
+            {
+                loc.intRegIndex = nextIntReg++;
+                loc.spillOffset = (++nextSpillSlot) * 8;
+            }
+            else
+            {
+                loc.stackPassed = true;
+                loc.stackSize = 8;
+                loc.stackOffset = nextStackOffset;
+                nextStackOffset += loc.stackSize;
+            }
+        }
+
+        locations[i] = loc;
+    }
+
+    return locations;
+}
+
+static size_t requiredAbiSpillAreaBytes(const std::vector<AbiArgLocation>& locations, bool hasHiddenSRet)
+{
+    size_t maxSlotOffset = hasHiddenSRet ? 8 : 0;
+    for (const auto& loc : locations)
+    {
+        if (!loc.stackPassed && loc.spillOffset > maxSlotOffset)
+            maxSlotOffset = loc.spillOffset;
+    }
+    return maxSlotOffset + 8;
 }
 
 static void emitLoadSmallStructFromAddress(std::ofstream& f, const Type& t, const std::string& addrReg, const std::string& comment)
@@ -179,10 +268,46 @@ static void emitStoreSmallStructToAddress(std::ofstream& f, const Type& t, const
         f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov qword [" + addrReg + " + 8], rdx") << ";; Store second struct slot for " << comment << std::endl;
 }
 
+static void emitFixedSizeObjectCopy(std::ofstream& f, const std::string& dstReg, const std::string& srcReg, size_t size, const std::string& comment)
+{
+    size_t copied = 0;
+    while (copied + 8 <= size)
+    {
+        std::string suffix = copied == 0 ? "" : (" + " + std::to_string(copied));
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov r11, [" + srcReg + suffix + "]") << ";; Copy qword chunk for " << comment << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov [" + dstReg + suffix + "], r11") << ";; Store qword chunk for " << comment << std::endl;
+        copied += 8;
+    }
+
+    size_t remaining = size - copied;
+    if (remaining >= 4)
+    {
+        std::string suffix = copied == 0 ? "" : (" + " + std::to_string(copied));
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov r11d, dword [" + srcReg + suffix + "]") << ";; Copy dword tail for " << comment << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov dword [" + dstReg + suffix + "], r11d") << ";; Store dword tail for " << comment << std::endl;
+        copied += 4;
+        remaining -= 4;
+    }
+    if (remaining >= 2)
+    {
+        std::string suffix = copied == 0 ? "" : (" + " + std::to_string(copied));
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov r11w, word [" + srcReg + suffix + "]") << ";; Copy word tail for " << comment << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov word [" + dstReg + suffix + "], r11w") << ";; Store word tail for " << comment << std::endl;
+        copied += 2;
+        remaining -= 2;
+    }
+    if (remaining == 1)
+    {
+        std::string suffix = copied == 0 ? "" : (" + " + std::to_string(copied));
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov r11b, byte [" + srcReg + suffix + "]") << ";; Copy byte tail for " << comment << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov byte [" + dstReg + suffix + "], r11b") << ";; Store byte tail for " << comment << std::endl;
+    }
+}
+
 static bool isIntegerScalarType(const Type &t)
 {
     return t.pointerLevel == 0 &&
-           (t.base == Type::CHAR || t.base == Type::SHORT || t.base == Type::INT ||
+           (t.base == Type::BOOL || t.base == Type::CHAR || t.base == Type::SHORT || t.base == Type::INT ||
             t.base == Type::LONG || t.base == Type::LONG_LONG);
 }
 
@@ -195,6 +320,7 @@ static int integerConversionRank(Type::Base b)
 {
     switch (b)
     {
+        case Type::BOOL: return 0;
         case Type::CHAR: return 1;
         case Type::SHORT: return 2;
         case Type::INT: return 3;
@@ -209,7 +335,7 @@ static Type promoteIntegerType(Type t)
     if (!isIntegerScalarType(t))
         return t;
 
-    if (t.base == Type::CHAR || t.base == Type::SHORT)
+    if (t.base == Type::BOOL || t.base == Type::CHAR || t.base == Type::SHORT)
     {
         t.base = Type::INT;
         t.isUnsigned = false;
@@ -258,6 +384,8 @@ static std::string loadScalarToRaxInstruction(const Type &t, const std::string &
 {
     if (t.pointerLevel > 0 || t.base == Type::DOUBLE || t.base == Type::LONG || t.base == Type::LONG_LONG)
         return "\tmov rax, " + addressExpr;
+    if (t.base == Type::BOOL)
+        return "\tmovzx eax, byte " + addressExpr;
     if (t.base == Type::FLOAT || (t.base == Type::INT && t.isUnsigned))
         return "\tmov eax, dword " + addressExpr;
     if (t.base == Type::INT)
@@ -287,6 +415,39 @@ static void emitScalarConversion(std::ofstream& f, const Type& dest, const Type&
     bool destIsDouble = (dest.base == Type::DOUBLE);
     bool srcIsFloat = (src.base == Type::FLOAT);
     bool srcIsDouble = (src.base == Type::DOUBLE);
+
+    if (dest.base == Type::BOOL)
+    {
+        if (srcIsFloat)
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd xmm0, eax" << ";; prepare float->_Bool" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\txorps xmm1, xmm1" << ";; 0.0f" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tucomiss xmm0, xmm1" << ";; compare float against 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetne al" << ";; true if nonzero" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetp cl" << ";; NaN is also true" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tor al, cl" << ";; merge nonzero/unordered result" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, al" << ";; normalize to 0 or 1" << std::endl;
+            return;
+        }
+        if (srcIsDouble)
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; prepare double->_Bool" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\txorpd xmm1, xmm1" << ";; 0.0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tucomisd xmm0, xmm1" << ";; compare double against 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetne al" << ";; true if nonzero" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetp cl" << ";; NaN is also true" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tor al, cl" << ";; merge nonzero/unordered result" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, al" << ";; normalize to 0 or 1" << std::endl;
+            return;
+        }
+        if (isIntegerScalarType(src))
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\ttest rax, rax" << ";; compare integer against 0" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tsetne al" << ";; true if nonzero" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, al" << ";; normalize to 0 or 1" << std::endl;
+        }
+        return;
+    }
 
     // float/double destinations
     if (destIsDouble)
@@ -376,6 +537,8 @@ struct VarInfo {
 
 static Type computeExprType(const ASTNode*, const std::stack<std::map<std::string, VarInfo>>&, const FunctionNode*);
 static void collectReferencedFunctionsStatement(const ASTNode* node, std::unordered_set<std::string>& refs);
+static bool emitAddressOfAggregateSource(std::ofstream& f, const ASTNode* expr, const std::string& outReg);
+static bool emitAggregateValueToAddress(std::ofstream& f, const ASTNode* expr, const Type& aggregateType, const std::string& destReg);
 
 // Global stack to track scopes
 static std::stack<std::map<std::string, VarInfo>> scopes;
@@ -411,9 +574,12 @@ static std::unordered_set<std::string> emittedExternalFunctions;
 static std::unordered_set<std::string> declaredExternalFunctions;
 static std::unordered_set<std::string> referencedExternalFunctions;
 static std::unordered_set<std::string> referencedRegularFunctions;
+static bool enableFunctionReachabilityFilter = true;
 
 static bool shouldEmitFunctionBody(const std::string& name)
 {
+    if (!enableFunctionReachabilityFilter)
+        return true;
     return name == "main" || referencedRegularFunctions.count(name) > 0;
 }
 
@@ -505,6 +671,7 @@ static std::vector<CompileError> compileErrors;
 enum TokenType
 {
     TOKEN_TYPEDEF,
+    TOKEN_BOOL,
     TOKEN_INT,
     TOKEN_CHAR,
     TOKEN_VOID,
@@ -558,6 +725,9 @@ enum TokenType
     TOKEN_DO,
     TOKEN_WHILE,
     TOKEN_FOR,
+    TOKEN_SWITCH,
+    TOKEN_CASE,
+    TOKEN_DEFAULT,
     TOKEN_BREAK,
     TOKEN_CONTINUE,
     TOKEN_GOTO,
@@ -592,6 +762,7 @@ std::string tokenTypeToString(TokenType t)
     switch (t)
     {
         case TOKEN_TYPEDEF: return "typedef";
+        case TOKEN_BOOL: return "_Bool";
         case TOKEN_INT: return "int";
         case TOKEN_CHAR: return "char";
         case TOKEN_VOID: return "void";
@@ -646,6 +817,9 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_DO: return "do";
         case TOKEN_WHILE: return "while";
         case TOKEN_FOR: return "for";
+        case TOKEN_SWITCH: return "switch";
+        case TOKEN_CASE: return "case";
+        case TOKEN_DEFAULT: return "default";
         case TOKEN_BREAK: return "break";
         case TOKEN_CONTINUE: return "continue";
         case TOKEN_GOTO: return "goto";
@@ -682,6 +856,7 @@ Type makeType(TokenType tok, int ptrLevel = 0, bool isUnsigned = false, bool isC
     Type t;
     switch (tok)
     {
+        case TOKEN_BOOL:  t.base = Type::BOOL; break;
         case TOKEN_CHAR:  t.base = Type::CHAR; break;
         case TOKEN_VOID:  t.base = Type::VOID; break;
         case TOKEN_SHORT: t.base = Type::SHORT; break;
@@ -1077,6 +1252,7 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             while (isalnum(peek()) || peek() == '_') ident += advance();
             if (ident == "if")      return Token{ TOKEN_IF    , ident, tokenLine, tokenCol };
             if (ident == "typedef") return Token{ TOKEN_TYPEDEF, ident, tokenLine, tokenCol };
+            if (ident == "_Bool")   return Token{ TOKEN_BOOL  , ident, tokenLine, tokenCol };
             if (ident == "int")     return Token{ TOKEN_INT   , ident, tokenLine, tokenCol };
             if (ident == "short")   return Token{ TOKEN_SHORT , ident, tokenLine, tokenCol };
             if (ident == "long")    return Token{ TOKEN_LONG  , ident, tokenLine, tokenCol };
@@ -1098,6 +1274,9 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             if (ident == "else")    return Token{ TOKEN_ELSE  , ident, tokenLine, tokenCol };
             if (ident == "do")      return Token{ TOKEN_DO    , ident, tokenLine, tokenCol };
             if (ident == "while")   return Token{ TOKEN_WHILE , ident, tokenLine, tokenCol };
+            if (ident == "switch")  return Token{ TOKEN_SWITCH, ident, tokenLine, tokenCol };
+            if (ident == "case")    return Token{ TOKEN_CASE, ident, tokenLine, tokenCol };
+            if (ident == "default") return Token{ TOKEN_DEFAULT, ident, tokenLine, tokenCol };
             if (ident == "return")  return Token{ TOKEN_RETURN, ident, tokenLine, tokenCol };
             if (ident == "break")   return Token{ TOKEN_BREAK, ident, tokenLine, tokenCol };
             if (ident == "continue")return Token{ TOKEN_CONTINUE, ident, tokenLine, tokenCol };
@@ -1479,8 +1658,6 @@ struct StatementWithDeferredOpsNode : ASTNode
         emitDeferredPostfixOps(f);
     }
 };
-
-// Represents multiple statements produced from a single parse construct
 // (e.g. comma-separated declarations) without introducing a new scope.
 struct StatementListNode : ASTNode
 {
@@ -1558,6 +1735,7 @@ struct EmptyStatementNode : ASTNode
 static size_t labelCounter = 0; // Global counter for generating unique labels
 // Stack of active loops: {continueTargetLabel, breakTargetLabel}
 static std::vector<std::pair<std::string, std::string>> loopControlStack;
+static std::vector<std::string> breakControlStack;
 
 struct LogicalOrNode : ASTNode
 {
@@ -1566,7 +1744,7 @@ struct LogicalOrNode : ASTNode
 
     LogicalOrNode(std::unique_ptr<ASTNode> l, std::unique_ptr<ASTNode> r)
         : left(std::move(l)), right(std::move(r)) {}
-    
+
     void emitData(std::ofstream& f) const override
     {
         left->emitData(f);
@@ -1577,11 +1755,11 @@ struct LogicalOrNode : ASTNode
     {
         size_t labelID = labelCounter++;
         left->emitCode(f);
-        std::string instruction = "\tjne .logical_or_true_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare left operand with 0" << std::endl;
+        std::string instruction = "\tjne .logical_or_true_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump if left operand is true" << std::endl;
         right->emitCode(f);
-        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; compare right operand with 0" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rax, 0" << ";; Compare right operand with 0" << std::endl;
         instruction = "\tjne .logical_or_true_" + std::to_string(labelID);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump if right operand is true" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; Set result to false" << std::endl;
@@ -1745,7 +1923,32 @@ struct FunctionCallNode : ASTNode
         }
     }
 
-    void emitCode(std::ofstream& f) const override
+    Type resolvedReturnType(bool& haveRetType) const
+    {
+        haveRetType = false;
+        if (isIndirect)
+        {
+            haveRetType = true;
+            return indirectReturnType;
+        }
+
+        if (functionName == "__builtin_bswap16" || functionName == "__builtin_bswap32" || functionName == "__builtin_bswap64")
+        {
+            haveRetType = true;
+            return {Type::INT, 0, true};
+        }
+
+        auto retIt = functionReturnTypes.find(functionName);
+        if (retIt != functionReturnTypes.end())
+        {
+            haveRetType = true;
+            return retIt->second;
+        }
+
+        return {Type::INT, 0};
+    }
+
+    void emitCall(std::ofstream& f, const std::string* hiddenRetDestReg = nullptr) const
     {
         if (functionName == "__builtin_bswap16" || functionName == "__builtin_bswap32" || functionName == "__builtin_bswap64") {
             if (arguments.size() != 1) {
@@ -1763,10 +1966,14 @@ struct FunctionCallNode : ASTNode
             return;
         }
 
+        bool haveRetType = false;
+        Type retType = resolvedReturnType(haveRetType);
+        bool retViaMemory = haveRetType && usesMemoryReturnType(retType);
+
         // System V AMD64 ABI calling convention
-        // First 6 arguments in: rdi, rsi, rdx, rcx, r8, r9 for integer/pointer args
-        // Floating-point args go in xmm0..xmm7. Variadic functions must know how many
-        // xmm registers are used in AL.
+        // Integer/pointer args use rdi, rsi, rdx, rcx, r8, r9.
+        // Floating-point args use xmm0..xmm7.
+        // Large struct/union returns use a hidden sret pointer in rdi.
         std::vector<std::string> argRegisters = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
         
         // Determine argument types if they were recorded during semantic checking.
@@ -1793,15 +2000,31 @@ struct FunctionCallNode : ASTNode
                 passTypes[i] = (*declaredParams)[i];
         }
 
+        std::vector<AbiArgLocation> abiLocations = computeAbiArgLocations(passTypes, retViaMemory);
+
+        size_t hiddenRetTempSize = 0;
+        if (retViaMemory && hiddenRetDestReg == nullptr)
+            hiddenRetTempSize = alignUp(sizeOfType(retType), 8);
+
         int bytesToPush = 0;
         for (size_t i = 0; i < argCount; ++i)
         {
-            bool stackPass = isSmallStructValueType(passTypes[i]) || i >= 6;
-            if (stackPass)
-                bytesToPush += static_cast<int>(stackPassSize(passTypes[i]));
+            if (abiLocations[i].stackPassed)
+                bytesToPush += static_cast<int>(abiLocations[i].stackSize);
         }
 
-        int alignmentNeeded = (16 - (bytesToPush % 16)) % 16;
+        if (hiddenRetTempSize > 0)
+        {
+            std::string instruction = "\tsub rsp, " + std::to_string(hiddenRetTempSize);
+            f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Temporary buffer for memory return" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdi, rsp" << ";; Hidden sret destination" << std::endl;
+        }
+        else if (retViaMemory && hiddenRetDestReg)
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov rdi, " + *hiddenRetDestReg) << ";; Hidden sret destination" << std::endl;
+        }
+
+        int alignmentNeeded = (16 - ((bytesToPush + static_cast<int>(hiddenRetTempSize)) % 16)) % 16;
         if (alignmentNeeded > 0)
         {
             std::string instruction = "\tsub rsp, " + std::to_string(alignmentNeeded);
@@ -1812,12 +2035,11 @@ struct FunctionCallNode : ASTNode
         for (size_t i = argCount; i > 0; --i)
         {
             size_t argIndex = i - 1;
-            bool stackPass = isSmallStructValueType(passTypes[argIndex]) || argIndex >= 6;
-            if (!stackPass)
+            if (!abiLocations[argIndex].stackPassed)
                 continue;
 
             arguments[argIndex]->emitCode(f);
-            size_t passSize = stackPassSize(passTypes[argIndex]);
+            size_t passSize = abiLocations[argIndex].stackSize;
             if (isSmallStructValueType(passTypes[argIndex]))
             {
                 f << std::left << std::setw(COMMENT_COLUMN) << ("\tsub rsp, " + std::to_string(passSize)) << ";; Reserve stack space for struct argument " << argIndex << std::endl;
@@ -1833,16 +2055,11 @@ struct FunctionCallNode : ASTNode
 
         int floatRegCount = 0;
         bool callIsVariadic = isIndirect ? indirectVariadic : functionIsVariadic[functionName];
-        // load up to first six args into appropriate registers, but make sure that
-        // evaluating each argument doesn't clobber registers already assigned for
-        // earlier arguments.  We achieve this by saving any used integer or
-        // floating-point registers before evaluating a new argument, then
-        // restoring them afterwards.
-        int intRegsUsed = 0;
+        int intRegsUsed = retViaMemory ? 1 : 0;
         int floatRegsUsed = 0;
-        for (size_t i = 0; i < argCount && i < 6; ++i)
+        for (size_t i = 0; i < argCount; ++i)
         {
-            if (isSmallStructValueType(passTypes[i]))
+            if (abiLocations[i].stackPassed)
                 continue;
 
             // save integer registers currently in use
@@ -1931,8 +2148,8 @@ struct FunctionCallNode : ASTNode
                 floatRegCount++;
                 floatRegsUsed++;
             } else {
-                std::string instruction = "\tmov " + argRegisters[i] + ", rax";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Pass argument " << i << " in " << argRegisters[i] << std::endl;
+                std::string instruction = "\tmov " + argRegisters[abiLocations[i].intRegIndex] + ", rax";
+                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Pass argument " << i << " in " << argRegisters[abiLocations[i].intRegIndex] << std::endl;
                 intRegsUsed++;
             }
         }
@@ -1989,29 +2206,13 @@ struct FunctionCallNode : ASTNode
             f << std::left << std::setw(COMMENT_COLUMN) << instrCall << ";; Call function " << functionName << std::endl;
         }
 
-        // Normalize return value into this compiler's expression convention.
-        // - float: bits in eax
-        // - double: bits in rax
-        bool haveRetType = false;
-        Type retType{Type::INT,0};
-        if (isIndirect)
-        {
-            retType = indirectReturnType;
-            haveRetType = true;
-        }
-        else
-        {
-            auto retIt = functionReturnTypes.find(functionName);
-            if (retIt != functionReturnTypes.end())
-            {
-                retType = retIt->second;
-                haveRetType = true;
-            }
-        }
-
         if (haveRetType)
         {
-            if (retType.pointerLevel == 0 && retType.base == Type::FLOAT)
+            if (retViaMemory && hiddenRetDestReg == nullptr)
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rax" << ";; Memory return temporary discarded outside address context" << std::endl;
+            }
+            else if (retType.pointerLevel == 0 && retType.base == Type::FLOAT)
             {
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << ";; move float return bits into eax" << std::endl;
             }
@@ -2022,15 +2223,24 @@ struct FunctionCallNode : ASTNode
         }
 
         // Clean up the stack (remove arguments beyond first 6 + any alignment padding)
-        int totalCleanup = bytesToPush + alignmentNeeded;
+        int totalCleanup = bytesToPush + alignmentNeeded + static_cast<int>(hiddenRetTempSize);
         if (totalCleanup > 0)
         {
             std::string instrCleanup = "\tadd rsp, " + std::to_string(totalCleanup);
             f << std::left << std::setw(COMMENT_COLUMN) << instrCleanup << ";; Clean up stack" << std::endl;
         }
     }
-};
 
+    void emitCodeToAddress(std::ofstream& f, const std::string& destReg) const
+    {
+        emitCall(f, &destReg);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        emitCall(f, nullptr);
+    }
+};
 
 struct FunctionNode : ASTNode
 {
@@ -2074,26 +2284,30 @@ struct FunctionNode : ASTNode
         f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rbp" << ";; Save base pointer" << std::endl;
         f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rbp, rsp" << ";; Set stack frame\n" << std::endl;
 
+        bool hasHiddenSRet = usesMemoryReturnType(returnType);
+        std::vector<Type> parameterTypes;
+        parameterTypes.reserve(parameters.size());
+        for (const auto& param : parameters)
+            parameterTypes.push_back(param.first);
+        std::vector<AbiArgLocation> abiLocations = computeAbiArgLocations(parameterTypes, hasHiddenSRet);
+        size_t abiSpillArea = requiredAbiSpillAreaBytes(abiLocations, hasHiddenSRet);
+
         // Calculate space needed:
-        // - parameters (up to 6 are in registers, rest on stack)
+        // - register-passed parameter spill slots (+ hidden sret pointer slot when needed)
         // - local variables
         // Stack must be 16-byte aligned BEFORE call instructions
         // After push rbp, rsp is 16-byte aligned
         // We need sub rsp amount to be a multiple of 16
-        size_t totalParams = std::min(parameters.size(), (size_t)6);
-
         // Locals are addressed as [rbp - offset].  Start below rbp and below
         // any register-parameter spill slots to avoid overlap at [rbp - 0].
-        functionVariableIndex = (totalParams + 1) * 8;
+        functionVariableIndex = abiSpillArea;
         
 
         // Compute additional space required for all local arrays in this function
         size_t totalLocalSpace = 0;
         for (const auto& stmt : body)
             totalLocalSpace += stmt->getArraySpaceNeeded();
-        // reserve space for register-parameter spill slots plus one guard slot
-        // because locals begin at offset (totalParams + 1) * 8.
-        totalLocalSpace += (totalParams + 1) * 8;
+        totalLocalSpace += abiSpillArea;
         
         // Align to multiple of 16: round up to next 16-byte boundary
         size_t alignedSpace = ((totalLocalSpace + 15) / 16) * 16;
@@ -2101,22 +2315,23 @@ struct FunctionNode : ASTNode
         std::string instruction = "\tsub rsp, " + std::to_string(alignedSpace);
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Allocate space for parameters and local variables (16-byte aligned)" << std::endl;
 
+        if (hasHiddenSRet)
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rbp - 8], rdi" << ";; Save hidden sret pointer" << std::endl;
+
         // Save parameter registers to stack AFTER allocation
-        // System V AMD64 ABI: first 6 args in rdi, rsi, rdx, rcx, r8, r9 for integer/pointer args
-        // floating-point args come in xmm0..xmm5.  We must save the appropriate
+        // System V AMD64 ABI: integer/pointer args in rdi, rsi, rdx, rcx, r8, r9
+        // floating-point args in xmm0..xmm7.
         // register depending on the declared parameter type.
         std::vector<std::string> paramRegisters = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
-        int intRegIdx = 0;
-        int floatRegIdx = 0;
-        for (size_t i = 0; i < parameters.size() && i < 6; ++i)
+        for (size_t i = 0; i < parameters.size(); ++i)
         {
             Type pt = parameters[i].first;
-            if (isSmallStructValueType(pt))
+            const AbiArgLocation& loc = abiLocations[i];
+            if (loc.stackPassed)
                 continue;
-            bool isFloatParam = (pt.pointerLevel == 0 && (pt.base == Type::FLOAT || pt.base == Type::DOUBLE));
-            size_t offset = (i + 1) * 8;
-            if (isFloatParam) {
-                std::string reg = "xmm" + std::to_string(floatRegIdx);
+            size_t offset = loc.spillOffset;
+            if (loc.isFloat) {
+                std::string reg = "xmm" + std::to_string(loc.floatRegIndex);
                 if (pt.base == Type::FLOAT) {
                     // store 32‑bit float, zero‑extend upper bits
                     std::string instruction = "\tmovd [rbp - " + std::to_string(offset) + "], " + reg;
@@ -2128,42 +2343,26 @@ struct FunctionNode : ASTNode
                     f << std::left << std::setw(COMMENT_COLUMN)
                       <<  instruction << ";; Save double parameter " << i << " from " << reg << std::endl;
                 }
-                floatRegIdx++;
             } else {
-                std::string instr = "\tmov [rbp - " + std::to_string(offset) + "], " + paramRegisters[intRegIdx];
+                std::string instr = "\tmov [rbp - " + std::to_string(offset) + "], " + paramRegisters[loc.intRegIndex];
                 f << std::left << std::setw(COMMENT_COLUMN) << instr
-                  << ";; Save parameter " << i << " from " << paramRegisters[intRegIdx] << std::endl;
-                intRegIdx++;
+                  << ";; Save parameter " << i << " from " << paramRegisters[loc.intRegIndex] << std::endl;
             }
         }
 
         // Store function parameters in the current scope.  We compute their
-        // byte offsets manually rather than using `functionVariableIndex`, since
-        // the latter is meant for locals and was previously producing tiny values
-        // (1,2,3) which led to incorrect loads at offsets -1,-2 etc.
-        size_t stackParamOffset = 0;
+        // ABI locations explicitly so register and stack-passed parameters stay aligned.
         for (size_t i = 0; i < parameters.size(); i++)
         {
             std::string paramName = parameters[i].second;
             std::string uniqueName = generateUniqueName(paramName);
 
-            size_t index;
-            bool stackPassed = isSmallStructValueType(parameters[i].first) || i >= 6;
-            if (!stackPassed)
-            {
-                // register parameters saved at (i+1)*8 bytes below rbp
-                index = (i + 1) * 8;
-            }
-            else
-            {
-                // stack parameters: positive offset from rbp, cumulative by pass size
-                index = stackParamOffset;
-                stackParamOffset += stackPassSize(parameters[i].first);
-            }
+            const AbiArgLocation& loc = abiLocations[i];
+            size_t index = loc.stackPassed ? loc.stackOffset : loc.spillOffset;
 
             // Add the parameter to the current scope (record its type as well)
             scopes.top()[paramName] = {uniqueName, index, parameters[i].first};
-            if (stackPassed)
+            if (loc.stackPassed)
                 scopes.top()[paramName].isStackParameter = true;
             if (i < parameterDimensions.size())
                 scopes.top()[paramName].dimensions = parameterDimensions[i];
@@ -2289,11 +2488,18 @@ struct ReturnNode : ASTNode
             if (currentFunction && currentFunction->returnType.pointerLevel == 0 &&
                 (currentFunction->returnType.base == Type::STRUCT || currentFunction->returnType.base == Type::UNION))
             {
-                if (auto sl = dynamic_cast<const StructLiteralNode*>(expression.get()))
+                if (usesMemoryReturnType(currentFunction->returnType))
                 {
-                    size_t structSize = sizeOfType(currentFunction->returnType);
-                    if (structSize > 0 && structSize <= 16)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, [rbp - 8]" << ";; Load hidden sret destination" << std::endl;
+                    emitAggregateValueToAddress(f, expression.get(), currentFunction->returnType, "rcx");
+                    emitDeferredPostfixOps(f);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rbp - 8]" << ";; Return hidden sret pointer" << std::endl;
+                }
+                else
+                {
+                    if (auto sl = dynamic_cast<const StructLiteralNode*>(expression.get()))
                     {
+                        size_t structSize = sizeOfType(currentFunction->returnType);
                         size_t tempSize = alignUp(structSize, 8);
                         f << std::left << std::setw(COMMENT_COLUMN) << ("\tsub rsp, " + std::to_string(tempSize)) << ";; Temporary storage for struct return" << std::endl;
                         f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rsp" << ";; Struct return temp base" << std::endl;
@@ -2305,19 +2511,19 @@ struct ReturnNode : ASTNode
                     }
                     else
                     {
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rax" << ";; Unsupported large struct return" << std::endl;
-                        f << std::left << std::setw(COMMENT_COLUMN) << "\txor rdx, rdx" << ";; Unsupported large struct return" << std::endl;
+                        expression->emitCode(f);
                     }
-                }
-                else
-                {
-                    expression->emitCode(f);
                     emitDeferredPostfixOps(f);
                 }
             }
             else
             {
                 expression->emitCode(f);
+                if (currentFunction)
+                {
+                    Type exprType = computeExprType(expression.get(), scopes, currentFunction);
+                    emitScalarConversion(f, currentFunction->returnType, exprType);
+                }
                 emitDeferredPostfixOps(f);
             }
         }
@@ -2451,17 +2657,8 @@ struct DeclarationNode : ASTNode
         {
             if (varType.pointerLevel == 0 && (varType.base == Type::STRUCT || varType.base == Type::UNION))
             {
-                if (auto sl = dynamic_cast<const StructLiteralNode*>(initializer.get()))
-                {
-                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(offset) + "]") << ";; Address of local struct initializer" << std::endl;
-                    sl->emitIntoAddress(f, "rcx");
-                }
-                else
-                {
-                    initializer->emitCode(f);
-                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(offset) + "]") << ";; Address of local struct " << uniqueName << std::endl;
-                    emitStoreSmallStructToAddress(f, varType, "rcx", uniqueName);
-                }
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(offset) + "]") << ";; Address of local aggregate initializer" << std::endl;
+                emitAggregateValueToAddress(f, initializer.get(), varType, "rcx");
             }
             else
             {
@@ -2580,7 +2777,12 @@ struct ArrayDeclarationNode : ASTNode
             {
                 if (i) f << ", ";
                 if (flat[i]->isConstant())
-                    f << flat[i]->getConstantValue();
+                {
+                    long value = flat[i]->getConstantValue();
+                    if (elemType.pointerLevel == 0 && elemType.base == Type::BOOL)
+                        value = (value != 0) ? 1 : 0;
+                    f << value;
+                }
                 else
                     f << "0"; // fallback
             }
@@ -2747,18 +2949,27 @@ struct GlobalDeclarationNode : ASTNode
                 else
                 {
                     value = initializer->getConstantValue();
+                    if (varType.pointerLevel == 0 && varType.base == Type::BOOL)
+                        value = (value != 0) ? 1 : 0;
                     valueExpr = std::to_string(value);
                 }
             }
             else
             {
                 value = initializer->getConstantValue();
+                if (varType.pointerLevel == 0 && varType.base == Type::BOOL)
+                    value = (value != 0) ? 1 : 0;
                 valueExpr = std::to_string(value);
             }
         }
 
         std::string globalSym = globalAsmSymbol(identifier);
-        std::string string = "\t" + globalSym + ": dq " + valueExpr;
+        size_t varSize = sizeOfType(varType);
+        std::string directive = "dq";
+        if (varSize == 1) directive = "db";
+        else if (varSize == 2) directive = "dw";
+        else if (varSize == 4) directive = "dd";
+        std::string string = "\t" + globalSym + ": " + directive + " " + valueExpr;
         f << std::left << std::setw(COMMENT_COLUMN) << string << ";; Declaring global variable" << std::endl;
     }
 
@@ -2781,7 +2992,11 @@ struct DereferenceNode : ASTNode
     void emitCode(std::ofstream& f) const override
     {
         operand->emitCode(f); // Get the pointer value into rax
-        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [rax]" << ";; Dereference pointer" << std::endl;
+        Type pt = computeExprType(operand.get(), scopes, currentFuction);
+        if (pt.pointerLevel > 0)
+            pt.pointerLevel--;
+        std::string instruction = loadScalarToRaxInstruction(pt, "[rax]");
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Dereference pointer" << std::endl;
     }
 };
 
@@ -3331,6 +3546,91 @@ struct MemberAddressNode : ASTNode
     }
 };
 
+static bool emitAddressOfAggregateSource(std::ofstream& f, const ASTNode* expr, const std::string& outReg)
+{
+    if (!expr)
+        return false;
+
+    if (const std::string* name = expr->getIdentifierName())
+    {
+        auto lookupResult = lookupVariable(*name);
+        if (lookupResult.first)
+        {
+            const VarInfo& info = lookupResult.second;
+            if (info.isStaticStorage)
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea " + outReg + ", [" + info.uniqueName + "]") << ";; Aggregate source address" << std::endl;
+            else if (info.isStackParameter)
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea " + outReg + ", [rbp + " + std::to_string(info.index + 16) + "]") << ";; Aggregate source parameter address" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea " + outReg + ", [rbp - " + std::to_string(info.index) + "]") << ";; Aggregate source local address" << std::endl;
+            return true;
+        }
+        if (globalVariables.count(*name))
+        {
+            std::string globalSym = globalAsmSymbol(*name);
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea " + outReg + ", [" + globalSym + "]") << ";; Aggregate source global address" << std::endl;
+            return true;
+        }
+        return false;
+    }
+
+    if (auto ma = dynamic_cast<const MemberAccessNode*>(expr))
+    {
+        ma->emitAddress(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov " + outReg + ", rcx") << ";; Aggregate member source address" << std::endl;
+        return true;
+    }
+
+    if (auto dn = dynamic_cast<const DereferenceNode*>(expr))
+    {
+        dn->operand->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov " + outReg + ", rax") << ";; Aggregate dereference source address" << std::endl;
+        return true;
+    }
+
+    return false;
+}
+
+static bool emitAggregateValueToAddress(std::ofstream& f, const ASTNode* expr, const Type& aggregateType, const std::string& destReg)
+{
+    if (!expr)
+        return false;
+
+    if (auto sl = dynamic_cast<const StructLiteralNode*>(expr))
+    {
+        sl->emitIntoAddress(f, destReg);
+        return true;
+    }
+
+    if (auto fc = dynamic_cast<const FunctionCallNode*>(expr))
+    {
+        if (usesMemoryReturnType(aggregateType))
+        {
+            fc->emitCodeToAddress(f, destReg);
+            return true;
+        }
+
+        fc->emitCode(f);
+        emitStoreSmallStructToAddress(f, aggregateType, destReg, "aggregate call result");
+        return true;
+    }
+
+    if (isSmallStructValueType(aggregateType))
+    {
+        expr->emitCode(f);
+        emitStoreSmallStructToAddress(f, aggregateType, destReg, "aggregate expression");
+        return true;
+    }
+
+    if (emitAddressOfAggregateSource(f, expr, "r10"))
+    {
+        emitFixedSizeObjectCopy(f, destReg, "r10", sizeOfType(aggregateType), "aggregate value");
+        return true;
+    }
+
+    return false;
+}
+
 struct PostfixUpdateNode : ASTNode
 {
     std::unique_ptr<ASTNode> target;
@@ -3738,13 +4038,15 @@ struct AssignmentNode : ASTNode
                 std::string uniqueName = infoC.uniqueName;
                 size_t offset = infoC.index;
                 size_t varSize = sizeOfType(infoC.type);
-                if (isSmallStructValueType(infoC.type))
+                if (infoC.type.pointerLevel == 0 && (infoC.type.base == Type::STRUCT || infoC.type.base == Type::UNION))
                 {
                     if (infoC.isStaticStorage)
                         f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [" + uniqueName + "]") << ";; Address of static local struct " << uniqueName << std::endl;
+                    else if (infoC.isStackParameter)
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp + " + std::to_string(offset + 16) + "]") << ";; Address of stack aggregate parameter " << uniqueName << std::endl;
                     else
                         f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(offset) + "]") << ";; Address of local struct " << uniqueName << std::endl;
-                    emitStoreSmallStructToAddress(f, infoC.type, "rcx", uniqueName);
+                    emitAggregateValueToAddress(f, expression.get(), infoC.type, "rcx");
                 }
                 else
                 {
@@ -3768,9 +4070,10 @@ struct AssignmentNode : ASTNode
             {
                 std::string globalSym = globalAsmSymbol(identifier);
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global target address" << std::endl;
-                if (globalVariables.count(identifier) && isSmallStructValueType(globalVariables[identifier]))
+                if (globalVariables.count(identifier) && globalVariables[identifier].pointerLevel == 0 &&
+                    (globalVariables[identifier].base == Type::STRUCT || globalVariables[identifier].base == Type::UNION))
                 {
-                    emitStoreSmallStructToAddress(f, globalVariables[identifier], "rcx", identifier);
+                    emitAggregateValueToAddress(f, expression.get(), globalVariables[identifier], "rcx");
                 }
                 else
                 {
@@ -3853,6 +4156,16 @@ struct IndirectAssignmentNode : ASTNode
                     return;
                 }
             }
+        }
+
+        if (valueType.pointerLevel == 0 && (valueType.base == Type::STRUCT || valueType.base == Type::UNION))
+        {
+            pointerExpr->emitCode(f);
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; Aggregate indirect assignment destination" << std::endl;
+            emitAggregateValueToAddress(f, expression.get(), valueType, "rcx");
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Assignment expression result address" << std::endl;
+            emitDeferredPostfixOps(f);
+            return;
         }
 
         expression->emitCode(f);
@@ -4054,6 +4367,7 @@ struct WhileLoopNode : ASTNode
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump to end if condition is false" << std::endl;
 
         loopControlStack.push_back({fullStartLabel, fullEndLabel});
+        breakControlStack.push_back(fullEndLabel);
 
         // Emit the loop body (with its own scope)
         scopes.push({});
@@ -4063,6 +4377,7 @@ struct WhileLoopNode : ASTNode
         }
         scopes.pop();
         loopControlStack.pop_back();
+        breakControlStack.pop_back();
         
         instruction = "\tjmp " + fullStartLabel;
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Jump back to start of loop" << std::endl;
@@ -4104,12 +4419,14 @@ struct DoWhileLoopNode : ASTNode
         f << std::endl << fullStartLabel << ":" << std::endl;
 
         loopControlStack.push_back({fullCondLabel, fullEndLabel});
+        breakControlStack.push_back(fullEndLabel);
 
         scopes.push({});
         for (const auto& stmt : body)
             stmt->emitCode(f);
         scopes.pop();
         loopControlStack.pop_back();
+        breakControlStack.pop_back();
 
         f << std::endl << fullCondLabel << ":" << std::endl;
 
@@ -4191,6 +4508,7 @@ struct ForLoopNode : ASTNode
         }
 
         loopControlStack.push_back({fullContinueLabel, fullEndLabel});
+        breakControlStack.push_back(fullEndLabel);
 
         for (const auto& stmt : body)
         {
@@ -4198,6 +4516,7 @@ struct ForLoopNode : ASTNode
         }
 
         loopControlStack.pop_back();
+        breakControlStack.pop_back();
 
         f << std::endl << fullContinueLabel << ":" << std::endl;
 
@@ -4229,6 +4548,119 @@ struct ForLoopNode : ASTNode
     }
 };
 
+struct SwitchClause
+{
+    bool hasLabel = false;
+    bool isDefault = false;
+    std::unique_ptr<ASTNode> caseExpr;
+    int caseValue = 0;
+    int line = 0;
+    int col = 0;
+    std::vector<std::unique_ptr<ASTNode>> statements;
+};
+
+struct SwitchStatementNode : ASTNode
+{
+    std::unique_ptr<ASTNode> condition;
+    std::vector<SwitchClause> clauses;
+    std::string functionName;
+    int line = 0;
+    int col = 0;
+
+    SwitchStatementNode(std::unique_ptr<ASTNode> cond,
+                        std::vector<SwitchClause> cls,
+                        std::string funcName,
+                        int l = 0,
+                        int c = 0)
+        : condition(std::move(cond)), clauses(std::move(cls)), functionName(std::move(funcName)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        if (condition)
+            condition->emitData(f);
+        for (const auto& clause : clauses)
+        {
+            if (clause.caseExpr)
+                clause.caseExpr->emitData(f);
+            for (const auto& stmt : clause.statements)
+                stmt->emitData(f);
+        }
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        size_t switchId = labelCounter++;
+        std::string endLabel = functionName + ".switch_end_" + std::to_string(switchId);
+
+        std::vector<std::string> clauseLabels(clauses.size());
+        std::string defaultLabel;
+        for (size_t i = 0; i < clauses.size(); ++i)
+        {
+            if (!clauses[i].hasLabel)
+                continue;
+            clauseLabels[i] = functionName + ".switch_case_" + std::to_string(switchId) + "_" + std::to_string(i);
+            if (clauses[i].isDefault && defaultLabel.empty())
+                defaultLabel = clauseLabels[i];
+        }
+
+        condition->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save switch condition value" << std::endl;
+        emitDeferredPostfixOps(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Restore switch condition value" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rbx, rax" << ";; Keep switch condition in rbx" << std::endl;
+
+        for (size_t i = 0; i < clauses.size(); ++i)
+        {
+            if (!clauses[i].hasLabel || clauses[i].isDefault)
+                continue;
+            f << std::left << std::setw(COMMENT_COLUMN)
+              << ("\tcmp rbx, " + std::to_string(clauses[i].caseValue))
+              << ";; Compare switch value with case" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN)
+              << ("\tje " + clauseLabels[i])
+              << ";; Jump to matching case" << std::endl;
+        }
+
+        if (!defaultLabel.empty())
+        {
+            f << std::left << std::setw(COMMENT_COLUMN)
+              << ("\tjmp " + defaultLabel)
+              << ";; No case matched, jump to default" << std::endl;
+        }
+        else
+        {
+            f << std::left << std::setw(COMMENT_COLUMN)
+              << ("\tjmp " + endLabel)
+              << ";; No case matched, leave switch" << std::endl;
+        }
+
+        breakControlStack.push_back(endLabel);
+        scopes.push({});
+
+        for (size_t i = 0; i < clauses.size(); ++i)
+        {
+            if (clauses[i].hasLabel)
+                f << std::endl << clauseLabels[i] << ":" << std::endl;
+
+            for (const auto& stmt : clauses[i].statements)
+                stmt->emitCode(f);
+        }
+
+        scopes.pop();
+        breakControlStack.pop_back();
+        f << std::endl << endLabel << ":" << std::endl;
+    }
+
+    size_t getArraySpaceNeeded() const override
+    {
+        size_t total = condition ? condition->getArraySpaceNeeded() : 0;
+        for (const auto& clause : clauses)
+            for (const auto& stmt : clause.statements)
+                total += stmt->getArraySpaceNeeded();
+        return total;
+    }
+};
+
 struct BreakNode : ASTNode
 {
     int line = 0;
@@ -4240,13 +4672,13 @@ struct BreakNode : ASTNode
 
     void emitCode(std::ofstream& f) const override
     {
-        if (loopControlStack.empty())
+        if (breakControlStack.empty())
         {
-            reportError(line, col, "'break' used outside of loop");
+            reportError(line, col, "'break' used outside of loop or switch");
             hadError = true;
             return;
         }
-        const std::string& breakLabel = loopControlStack.back().second;
+        const std::string& breakLabel = breakControlStack.back();
         f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + breakLabel) << ";; break" << std::endl;
     }
 };
@@ -5271,23 +5703,7 @@ struct IdentifierNode : ASTNode
                 }
                 else
                 {
-                    std::string instruction;
-                    if (infoResult.type.pointerLevel > 0 || infoResult.type.base == Type::DOUBLE)
-                        instruction = "\tmov rax, [rbp + " + std::to_string(offset + 16) + "]";
-                    else if (infoResult.type.base == Type::FLOAT || (infoResult.type.base == Type::INT && infoResult.type.isUnsigned))
-                        instruction = "\tmov eax, dword [rbp + " + std::to_string(offset + 16) + "]";
-                    else if (infoResult.type.base == Type::INT)
-                        instruction = "\tmovsxd rax, dword [rbp + " + std::to_string(offset + 16) + "]";
-                    else if (infoResult.type.base == Type::SHORT && infoResult.type.isUnsigned)
-                        instruction = "\tmovzx eax, word [rbp + " + std::to_string(offset + 16) + "]";
-                    else if (infoResult.type.base == Type::SHORT)
-                        instruction = "\tmovsx rax, word [rbp + " + std::to_string(offset + 16) + "]";
-                    else if (infoResult.type.base == Type::CHAR && infoResult.type.isUnsigned)
-                        instruction = "\tmovzx eax, byte [rbp + " + std::to_string(offset + 16) + "]";
-                    else if (infoResult.type.base == Type::CHAR)
-                        instruction = "\tmovsx rax, byte [rbp + " + std::to_string(offset + 16) + "]";
-                    else
-                        instruction = "\tmov rax, [rbp + " + std::to_string(offset + 16) + "]";
+                    std::string instruction = loadScalarToRaxInstruction(infoResult.type, "[rbp + " + std::to_string(offset + 16) + "]");
                     f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load stack parameter " << uniqueName << std::endl;
                 }
             }
@@ -5327,23 +5743,7 @@ struct IdentifierNode : ASTNode
                 else
                 {
                     // Regular local variables and register parameters: accessed with negative offset from rbp
-                    std::string instruction;
-                    if (infoResult.type.pointerLevel > 0 || infoResult.type.base == Type::DOUBLE)
-                        instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
-                    else if (infoResult.type.base == Type::FLOAT || (infoResult.type.base == Type::INT && infoResult.type.isUnsigned))
-                        instruction = "\tmov eax, dword [rbp - " + std::to_string(index) + "]";
-                    else if (infoResult.type.base == Type::INT)
-                        instruction = "\tmovsxd rax, dword [rbp - " + std::to_string(index) + "]";
-                    else if (infoResult.type.base == Type::SHORT && infoResult.type.isUnsigned)
-                        instruction = "\tmovzx eax, word [rbp - " + std::to_string(index) + "]";
-                    else if (infoResult.type.base == Type::SHORT)
-                        instruction = "\tmovsx rax, word [rbp - " + std::to_string(index) + "]";
-                    else if (infoResult.type.base == Type::CHAR && infoResult.type.isUnsigned)
-                        instruction = "\tmovzx eax, byte [rbp - " + std::to_string(index) + "]";
-                    else if (infoResult.type.base == Type::CHAR)
-                        instruction = "\tmovsx rax, byte [rbp - " + std::to_string(index) + "]";
-                    else
-                        instruction = "\tmov rax, [rbp - " + std::to_string(index) + "]";
+                    std::string instruction = loadScalarToRaxInstruction(infoResult.type, "[rbp - " + std::to_string(index) + "]");
                     f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load variable " << uniqueName << std::endl;
                 }
             }
@@ -5758,7 +6158,7 @@ class Parser
 
     bool isTypeSpecifierToken(TokenType t) const
     {
-        return t == TOKEN_TYPEDEF || t == TOKEN_INT || t == TOKEN_CHAR || t == TOKEN_VOID || t == TOKEN_SHORT ||
+        return t == TOKEN_TYPEDEF || t == TOKEN_BOOL || t == TOKEN_INT || t == TOKEN_CHAR || t == TOKEN_VOID || t == TOKEN_SHORT ||
                t == TOKEN_LONG || t == TOKEN_FLOAT || t == TOKEN_DOUBLE || t == TOKEN_STRUCT ||
                t == TOKEN_UNION || t == TOKEN_UNSIGNED || t == TOKEN_SIGNED || t == TOKEN_CONST ||
                t == TOKEN_VOLATILE || t == TOKEN_AUTO || t == TOKEN_REGISTER || t == TOKEN_STATIC;
@@ -5796,6 +6196,7 @@ class Parser
         bool sawTypedefKeyword = false;
         bool sawShort = false;
         int longCount = 0;
+        bool sawBool = false;
         bool sawInt = false;
         bool sawChar = false;
         bool sawVoid = false;
@@ -5821,6 +6222,7 @@ class Parser
             else if (currentToken.type == TOKEN_STATIC) { sawStatic = true; eat(TOKEN_STATIC); }
             else if (currentToken.type == TOKEN_SHORT) { sawShort = true; eat(TOKEN_SHORT); }
             else if (currentToken.type == TOKEN_LONG) { longCount++; eat(TOKEN_LONG); }
+            else if (currentToken.type == TOKEN_BOOL) { sawBool = true; eat(TOKEN_BOOL); }
             else if (currentToken.type == TOKEN_INT) { sawInt = true; eat(TOKEN_INT); }
             else if (currentToken.type == TOKEN_CHAR) { sawChar = true; eat(TOKEN_CHAR); }
             else if (currentToken.type == TOKEN_VOID) { sawVoid = true; eat(TOKEN_VOID); }
@@ -6283,7 +6685,7 @@ class Parser
             hadError = true;
         }
 
-        if (sawTypedefName && (sawStruct || sawUnion || sawFloat || sawDouble || sawVoid || sawChar ||
+        if (sawTypedefName && (sawStruct || sawUnion || sawFloat || sawDouble || sawVoid || sawBool || sawChar ||
                                sawShort || longCount > 0 || sawInt || sawUnsigned || sawSigned))
         {
             reportError(currentToken.line, currentToken.col, "Invalid combination of typedef name with built-in type specifiers");
@@ -6297,6 +6699,7 @@ class Parser
         {
             switch (typedefBaseType.base)
             {
+                case Type::BOOL: baseTok = TOKEN_BOOL; break;
                 case Type::CHAR: baseTok = TOKEN_CHAR; break;
                 case Type::VOID: baseTok = TOKEN_VOID; break;
                 case Type::SHORT: baseTok = TOKEN_SHORT; break;
@@ -6335,6 +6738,10 @@ class Parser
             integerLike = false;
             baseTok = TOKEN_VOID;
         }
+        else if (sawBool)
+        {
+            baseTok = TOKEN_BOOL;
+        }
         else if (sawChar)
         {
             baseTok = TOKEN_CHAR;
@@ -6356,8 +6763,8 @@ class Parser
             baseTok = TOKEN_INT;
         }
 
-        if ((sawFloat || sawDouble || sawVoid) && (sawUnsigned || sawSigned || sawShort || sawChar || sawStruct ||
-            (sawFloat && longCount > 0) || (sawDouble && longCount > 1) || (sawVoid && longCount > 0)))
+        if ((sawFloat || sawDouble || sawVoid || sawBool) && (sawUnsigned || sawSigned || sawShort || sawChar || sawStruct || sawUnion ||
+            (sawFloat && longCount > 0) || (sawDouble && longCount > 1) || (sawVoid && longCount > 0) || (sawBool && (longCount > 0 || sawInt))))
         {
             reportError(currentToken.line, currentToken.col, "Invalid type specifier combination");
             hadError = true;
@@ -7205,7 +7612,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         }
 
 // declaration begins with a type keyword or typedef name
-        if (token.type == TOKEN_TYPEDEF || token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID || token.type == TOKEN_STRUCT ||
+        if (token.type == TOKEN_TYPEDEF || token.type == TOKEN_BOOL || token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID || token.type == TOKEN_STRUCT ||
             token.type == TOKEN_UNION || token.type == TOKEN_SHORT || token.type == TOKEN_LONG || token.type == TOKEN_FLOAT ||
             token.type == TOKEN_DOUBLE || token.type == TOKEN_UNSIGNED || token.type == TOKEN_SIGNED ||
             token.type == TOKEN_CONST || token.type == TOKEN_VOLATILE || token.type == TOKEN_AUTO || token.type == TOKEN_REGISTER || token.type == TOKEN_STATIC ||
@@ -7653,6 +8060,104 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             return std::make_unique<ForLoopNode>(std::move(initialization), std::move(cond), std::move(iteration), std::move(body), currentFunction->name);
         }
 
+        else if (token.type == TOKEN_SWITCH)
+        {
+            if (!currentFunction)
+            {
+                reportError(token.line, token.col, "'switch' is only valid inside a function");
+                hadError = true;
+                currentToken = lexer.nextToken();
+                return nullptr;
+            }
+
+            eat(TOKEN_SWITCH);
+            eat(TOKEN_LPAREN);
+            auto condExpr = condition(currentFunction);
+            eat(TOKEN_RPAREN);
+
+            if (currentToken.type != TOKEN_LBRACE)
+            {
+                reportError(currentToken.line, currentToken.col, "Expected '{' after switch condition");
+                hadError = true;
+                auto singleStmt = statement(currentFunction);
+                SwitchClause fallbackClause;
+                fallbackClause.hasLabel = false;
+                if (singleStmt)
+                    fallbackClause.statements.push_back(std::move(singleStmt));
+                std::vector<SwitchClause> fallbackClauses;
+                fallbackClauses.push_back(std::move(fallbackClause));
+                return std::make_unique<SwitchStatementNode>(std::move(condExpr), std::move(fallbackClauses), currentFunction->name, token.line, token.col);
+            }
+
+            eat(TOKEN_LBRACE);
+            std::vector<SwitchClause> clauses;
+            bool seenDefault = false;
+
+            while (currentToken.type != TOKEN_RBRACE && currentToken.type != TOKEN_EOF)
+            {
+                if (currentToken.type == TOKEN_CASE)
+                {
+                    Token caseTok = currentToken;
+                    eat(TOKEN_CASE);
+                    auto caseExpr = assignmentExpression(currentFunction);
+                    int caseValue = 0;
+                    if (caseExpr && caseExpr->isConstant())
+                    {
+                        caseValue = caseExpr->getConstantValue();
+                    }
+                    eat(TOKEN_COLON);
+
+                    SwitchClause clause;
+                    clause.hasLabel = true;
+                    clause.isDefault = false;
+                    clause.caseExpr = std::move(caseExpr);
+                    clause.caseValue = caseValue;
+                    clause.line = caseTok.line;
+                    clause.col = caseTok.col;
+                    clauses.push_back(std::move(clause));
+                    continue;
+                }
+
+                if (currentToken.type == TOKEN_DEFAULT)
+                {
+                    Token defaultTok = currentToken;
+                    eat(TOKEN_DEFAULT);
+                    eat(TOKEN_COLON);
+
+                    if (seenDefault)
+                    {
+                        reportError(defaultTok.line, defaultTok.col, "Multiple default labels in switch statement");
+                        hadError = true;
+                    }
+                    seenDefault = true;
+
+                    SwitchClause clause;
+                    clause.hasLabel = true;
+                    clause.isDefault = true;
+                    clause.line = defaultTok.line;
+                    clause.col = defaultTok.col;
+                    clauses.push_back(std::move(clause));
+                    continue;
+                }
+
+                auto stmt = statement(currentFunction);
+                if (!stmt)
+                    continue;
+
+                if (clauses.empty())
+                {
+                    SwitchClause clause;
+                    clause.hasLabel = false;
+                    clauses.push_back(std::move(clause));
+                }
+
+                clauses.back().statements.push_back(std::move(stmt));
+            }
+
+            eat(TOKEN_RBRACE);
+            return std::make_unique<SwitchStatementNode>(std::move(condExpr), std::move(clauses), currentFunction->name, token.line, token.col);
+        }
+
         else if (token.type == TOKEN_RETURN)
 	    {
             Token returnToken = token;
@@ -7703,6 +8208,28 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             eat(TOKEN_IDENTIFIER);
             eat(TOKEN_SEMICOLON);
             return std::make_unique<GotoNode>(targetLabel, currentFunction ? currentFunction->name : "", gotoToken.line, gotoToken.col);
+        }
+
+        else if (token.type == TOKEN_CASE)
+        {
+            reportError(token.line, token.col, "'case' label not within a switch statement");
+            hadError = true;
+            eat(TOKEN_CASE);
+            while (currentToken.type != TOKEN_COLON && currentToken.type != TOKEN_EOF)
+                currentToken = lexer.nextToken();
+            if (currentToken.type == TOKEN_COLON)
+                eat(TOKEN_COLON);
+            return std::make_unique<EmptyStatementNode>();
+        }
+
+        else if (token.type == TOKEN_DEFAULT)
+        {
+            reportError(token.line, token.col, "'default' label not within a switch statement");
+            hadError = true;
+            eat(TOKEN_DEFAULT);
+            if (currentToken.type == TOKEN_COLON)
+                eat(TOKEN_COLON);
+            return std::make_unique<EmptyStatementNode>();
         }
 
         // Generic expression statement (e.g. (a>b)?foo():bar(); )
@@ -8401,7 +8928,7 @@ public:
         while (currentToken.type != TOKEN_EOF)
 	    {
             // allow any of the basic type specifiers or 'extern' at file scope
-            if (currentToken.type == TOKEN_TYPEDEF || currentToken.type == TOKEN_ENUM || currentToken.type == TOKEN_STRUCT || currentToken.type == TOKEN_UNION || currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
+            if (currentToken.type == TOKEN_TYPEDEF || currentToken.type == TOKEN_ENUM || currentToken.type == TOKEN_STRUCT || currentToken.type == TOKEN_UNION || currentToken.type == TOKEN_EXTERN || currentToken.type == TOKEN_BOOL || currentToken.type == TOKEN_INT || currentToken.type == TOKEN_CHAR || currentToken.type == TOKEN_VOID ||
                 currentToken.type == TOKEN_SHORT || currentToken.type == TOKEN_LONG || currentToken.type == TOKEN_FLOAT || currentToken.type == TOKEN_DOUBLE ||
                 currentToken.type == TOKEN_UNSIGNED || currentToken.type == TOKEN_SIGNED ||
                 currentToken.type == TOKEN_CONST || currentToken.type == TOKEN_VOLATILE || currentToken.type == TOKEN_AUTO || currentToken.type == TOKEN_REGISTER || currentToken.type == TOKEN_STATIC ||
@@ -8724,6 +9251,17 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
         collectReferencedFunctionsStatement(forn->iteration.get(), refs);
         for (const auto& stmt : forn->body)
             collectReferencedFunctionsStatement(stmt.get(), refs);
+        return;
+    }
+    if (auto sw = dynamic_cast<const SwitchStatementNode*>(node))
+    {
+        collectReferencedFunctionsExpr(sw->condition.get(), refs);
+        for (const auto& clause : sw->clauses)
+        {
+            collectReferencedFunctionsExpr(clause.caseExpr.get(), refs);
+            for (const auto& stmt : clause.statements)
+                collectReferencedFunctionsStatement(stmt.get(), refs);
+        }
         return;
     }
     if (auto rn = dynamic_cast<const ReturnNode*>(node))
@@ -10412,6 +10950,17 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
             collectReferencedFunctionsStatement(stmt.get(), refs);
         return;
     }
+    if (auto sw = dynamic_cast<const SwitchStatementNode*>(node))
+    {
+        collectReferencedFunctionsExpr(sw->condition.get(), refs);
+        for (const auto& clause : sw->clauses)
+        {
+            collectReferencedFunctionsExpr(clause.caseExpr.get(), refs);
+            for (const auto& stmt : clause.statements)
+                collectReferencedFunctionsStatement(stmt.get(), refs);
+        }
+        return;
+    }
     if (auto rn = dynamic_cast<const ReturnNode*>(node))
     {
         collectReferencedFunctionsExpr(rn->expression.get(), refs);
@@ -10433,14 +10982,17 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
 }
 
 
-void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstream& f)
+void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstream& f, bool useReachabilityFilter = true)
 {
     // Reset the global stack and index counter
     functionVariableIndex = 0;
+    enableFunctionReachabilityFilter = useReachabilityFilter;
     emittedExternalFunctions.clear();
     declaredExternalFunctions.clear();
     referencedExternalFunctions.clear();
     referencedRegularFunctions.clear();
+    loopControlStack.clear();
+    breakControlStack.clear();
     while(!scopes.empty())
     {
         scopes.pop();
@@ -10457,48 +11009,51 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
         }
     }
 
-    if (functionReturnTypes.count("main") > 0 && declaredExternalFunctions.count("main") == 0)
-        referencedRegularFunctions.insert("main");
-
-    // Seed references from non-function top-level nodes (for example, function
-    // addresses used in global initializers) and then walk function bodies only
-    // for functions that are themselves reachable.
-    std::unordered_map<std::string, const FunctionNode*> functionDefs;
-    for (const auto& node : ast)
+    if (enableFunctionReachabilityFilter)
     {
-        if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
-            functionDefs[fn->name] = fn;
-        else
-            collectReferencedFunctionsStatement(node.get(), referencedRegularFunctions);
-    }
+        if (functionReturnTypes.count("main") > 0 && declaredExternalFunctions.count("main") == 0)
+            referencedRegularFunctions.insert("main");
 
-    std::vector<std::string> worklist;
-    worklist.reserve(referencedRegularFunctions.size());
-    for (const auto& name : referencedRegularFunctions)
-        worklist.push_back(name);
-
-    for (size_t i = 0; i < worklist.size(); ++i)
-    {
-        const std::string& fnName = worklist[i];
-        auto it = functionDefs.find(fnName);
-        if (it == functionDefs.end())
-            continue;
-
-        const FunctionNode* fn = it->second;
-        if (!fn || fn->isExternal || fn->isPrototype)
-            continue;
-
-        size_t before = referencedRegularFunctions.size();
-        for (const auto& stmt : fn->body)
-            collectReferencedFunctionsStatement(stmt.get(), referencedRegularFunctions);
-
-        if (referencedRegularFunctions.size() != before)
+        // Seed references from non-function top-level nodes (for example, function
+        // addresses used in global initializers) and then walk function bodies only
+        // for functions that are themselves reachable.
+        std::unordered_map<std::string, const FunctionNode*> functionDefs;
+        for (const auto& node : ast)
         {
-            // Append newly discovered functions for transitive closure.
-            for (const auto& discovered : referencedRegularFunctions)
+            if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
+                functionDefs[fn->name] = fn;
+            else
+                collectReferencedFunctionsStatement(node.get(), referencedRegularFunctions);
+        }
+
+        std::vector<std::string> worklist;
+        worklist.reserve(referencedRegularFunctions.size());
+        for (const auto& name : referencedRegularFunctions)
+            worklist.push_back(name);
+
+        for (size_t i = 0; i < worklist.size(); ++i)
+        {
+            const std::string& fnName = worklist[i];
+            auto it = functionDefs.find(fnName);
+            if (it == functionDefs.end())
+                continue;
+
+            const FunctionNode* fn = it->second;
+            if (!fn || fn->isExternal || fn->isPrototype)
+                continue;
+
+            size_t before = referencedRegularFunctions.size();
+            for (const auto& stmt : fn->body)
+                collectReferencedFunctionsStatement(stmt.get(), referencedRegularFunctions);
+
+            if (referencedRegularFunctions.size() != before)
             {
-                if (std::find(worklist.begin(), worklist.end(), discovered) == worklist.end())
-                    worklist.push_back(discovered);
+                // Append newly discovered functions for transitive closure.
+                for (const auto& discovered : referencedRegularFunctions)
+                {
+                    if (std::find(worklist.begin(), worklist.end(), discovered) == worklist.end())
+                        worklist.push_back(discovered);
+                }
             }
         }
     }
@@ -10582,9 +11137,9 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 
     if (hasText)
     {
-        f << "section '.text' executable" << std::endl << std::endl;
+        f << "section '.text' executable" << std::endl;
         if (shouldExportMain)
-            f << "public main" << std::endl;
+            f  << std::endl << "public main" << std::endl;
         f << textPayload;
     }
 
@@ -11601,6 +12156,14 @@ static void collectLabelsAndGotosInStatement(
         return;
     }
 
+    if (auto sw = dynamic_cast<const SwitchStatementNode*>(node))
+    {
+        for (const auto& clause : sw->clauses)
+            for (const auto& stmt : clause.statements)
+                collectLabelsAndGotosInStatement(stmt.get(), labels, gotos);
+        return;
+    }
+
     if (auto bn = dynamic_cast<const BlockNode*>(node))
     {
         for (const auto& stmt : bn->statements)
@@ -11628,12 +12191,13 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
     }
 
     static int semanticLoopDepth = 0;
+    static int semanticSwitchDepth = 0;
 
     if (auto br = dynamic_cast<const BreakNode*>(node))
     {
-        if (semanticLoopDepth == 0)
+        if (semanticLoopDepth == 0 && semanticSwitchDepth == 0)
         {
-            reportError(br->line, br->col, "'break' statement not within a loop");
+            reportError(br->line, br->col, "'break' statement not within a loop or switch");
             hadError = true;
         }
         return;
@@ -11768,6 +12332,80 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
         semanticLoopDepth++;
         for (const auto& stmt : forn->body) semanticCheckStatement(stmt.get(), scopes, currentFunction);
         semanticLoopDepth--;
+        scopes.pop();
+        return;
+    }
+
+    if (auto sw = dynamic_cast<const SwitchStatementNode*>(node))
+    {
+        semanticCheckExpression(sw->condition.get(), scopes, currentFunction);
+        Type condType = computeExprType(sw->condition.get(), scopes, currentFunction);
+        bool integralLike = (condType.pointerLevel == 0) && isIntegerScalarType(condType);
+        if (!integralLike)
+        {
+            reportError(sw->line, sw->col, "Switch condition must have an integer type");
+            hadError = true;
+        }
+
+        std::unordered_set<int> seenCaseValues;
+        bool seenDefault = false;
+        SwitchStatementNode* mutSwitch = const_cast<SwitchStatementNode*>(sw);
+        for (size_t ci = 0; ci < sw->clauses.size(); ++ci)
+        {
+            const auto& clause = sw->clauses[ci];
+            if (!clause.hasLabel)
+                continue;
+            if (clause.isDefault)
+            {
+                if (seenDefault)
+                {
+                    reportError(clause.line, clause.col, "Multiple default labels in switch statement");
+                    hadError = true;
+                }
+                seenDefault = true;
+            }
+            else
+            {
+                if (!clause.caseExpr)
+                {
+                    reportError(clause.line, clause.col, "Case label does not reduce to an integer constant");
+                    hadError = true;
+                    continue;
+                }
+                semanticCheckExpression(clause.caseExpr.get(), scopes, currentFunction);
+                if (!clause.caseExpr->isConstant())
+                {
+                    reportError(clause.line, clause.col, "Case label does not reduce to an integer constant");
+                    hadError = true;
+                    continue;
+                }
+
+                Type caseType = computeExprType(clause.caseExpr.get(), scopes, currentFunction);
+                bool caseIntegralLike = (caseType.pointerLevel == 0) && isIntegerScalarType(caseType);
+                if (!caseIntegralLike)
+                {
+                    reportError(clause.line, clause.col, "Case label must have an integer constant expression");
+                    hadError = true;
+                    continue;
+                }
+
+                int caseValue = clause.caseExpr->getConstantValue();
+                mutSwitch->clauses[ci].caseValue = caseValue;
+                if (seenCaseValues.count(caseValue) > 0)
+                {
+                    reportError(clause.line, clause.col, "Duplicate case label value " + std::to_string(caseValue));
+                    hadError = true;
+                }
+                seenCaseValues.insert(caseValue);
+            }
+        }
+
+        scopes.push({});
+        semanticSwitchDepth++;
+        for (const auto& clause : sw->clauses)
+            for (const auto& stmt : clause.statements)
+                semanticCheckStatement(stmt.get(), scopes, currentFunction);
+        semanticSwitchDepth--;
         scopes.pop();
         return;
     }
@@ -12164,7 +12802,7 @@ int main(int argc, char** argv)
             std::cerr << "Error creating output assembly file!" << std::endl;
             return -1;
         }
-        generateCode(ast, file);
+        generateCode(ast, file, false);
         file.close();
         return 0;
     }
@@ -12522,7 +13160,8 @@ int main(int argc, char** argv)
             std::cerr << "Error creating output assembly file: " << asmFile << std::endl;
             return -1;
         }
-        generateCode(ast, file);
+        bool useReachabilityFilter = !flagS && !flagC;
+        generateCode(ast, file, useReachabilityFilter);
     }
 
     if (flagS)
