@@ -14,7 +14,6 @@ This project is focused on being hackable and educational: one large source file
 
 - [gvc.cpp](gvc.cpp): compiler implementation (lexer + parser + AST + semantic pass + codegen + CLI)
 - [examples](examples): demo programs and regression-style samples
-- [test.c](test.c): active playground test
 - [Makefile](Makefile): optional convenience build flow
 
 ## Requirements

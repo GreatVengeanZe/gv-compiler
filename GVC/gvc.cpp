@@ -1,6 +1,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
+#include <filesystem>
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
@@ -18,7 +19,6 @@
 #include <ctime>
 #include <set>
 #include <map>
-#include <filesystem>
 
 // Define fixed column position for comments
 #define COMMENT_COLUMN 32
@@ -560,6 +560,7 @@ enum TokenType
     TOKEN_FOR,
     TOKEN_BREAK,
     TOKEN_CONTINUE,
+    TOKEN_GOTO,
     TOKEN_EQ,
     TOKEN_NE,
     TOKEN_LT,
@@ -647,6 +648,7 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_FOR: return "for";
         case TOKEN_BREAK: return "break";
         case TOKEN_CONTINUE: return "continue";
+        case TOKEN_GOTO: return "goto";
         case TOKEN_EQ: return "==";
         case TOKEN_NE: return "!=";
         case TOKEN_LT: return "<";
@@ -1099,6 +1101,7 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             if (ident == "return")  return Token{ TOKEN_RETURN, ident, tokenLine, tokenCol };
             if (ident == "break")   return Token{ TOKEN_BREAK, ident, tokenLine, tokenCol };
             if (ident == "continue")return Token{ TOKEN_CONTINUE, ident, tokenLine, tokenCol };
+            if (ident == "goto")    return Token{ TOKEN_GOTO, ident, tokenLine, tokenCol };
             if (ident == "extern")  return Token{ TOKEN_EXTERN, ident, tokenLine, tokenCol };
             if (ident == "sizeof")  return Token{ TOKEN_SIZEOF, ident, tokenLine, tokenCol };
             return Token{ TOKEN_IDENTIFIER, ident, tokenLine, tokenCol };
@@ -4270,6 +4273,56 @@ struct ContinueNode : ASTNode
     }
 };
 
+struct LabelNode : ASTNode
+{
+    std::string labelName;
+    std::string functionName;
+    std::unique_ptr<ASTNode> statement;
+    int line = 0;
+    int col = 0;
+
+    LabelNode(std::string label, std::string func, std::unique_ptr<ASTNode> stmt, int l = 0, int c = 0)
+        : labelName(std::move(label)), functionName(std::move(func)), statement(std::move(stmt)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        if (statement)
+            statement->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        f << std::endl << functionName << ".label_" << labelName << ":" << std::endl;
+        if (statement)
+            statement->emitCode(f);
+    }
+
+    size_t getArraySpaceNeeded() const override
+    {
+        if (statement)
+            return statement->getArraySpaceNeeded();
+        return 0;
+    }
+};
+
+struct GotoNode : ASTNode
+{
+    std::string targetLabel;
+    std::string functionName;
+    int line = 0;
+    int col = 0;
+
+    GotoNode(std::string label, std::string func, int l = 0, int c = 0)
+        : targetLabel(std::move(label)), functionName(std::move(func)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override {}
+
+    void emitCode(std::ofstream& f) const override
+    {
+        f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + functionName + ".label_" + targetLabel) << ";; goto" << std::endl;
+    }
+};
+
 
 // floating-point literal (parsed as double)
 struct FloatLiteralNode : ASTNode
@@ -7133,6 +7186,24 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             return parseEnumDeclarationOrVariable(currentFunction);
         }
 
+        if (token.type == TOKEN_IDENTIFIER && lexer.peekToken().type == TOKEN_COLON)
+        {
+            if (!currentFunction)
+            {
+                reportError(token.line, token.col, "Label declaration outside of function");
+                hadError = true;
+            }
+
+            std::string labelName = token.value;
+            Token labelToken = token;
+            eat(TOKEN_IDENTIFIER);
+            eat(TOKEN_COLON);
+            auto labeledStmt = statement(currentFunction);
+            if (!labeledStmt)
+                labeledStmt = std::make_unique<EmptyStatementNode>();
+            return std::make_unique<LabelNode>(labelName, currentFunction ? currentFunction->name : "", std::move(labeledStmt), labelToken.line, labelToken.col);
+        }
+
 // declaration begins with a type keyword or typedef name
         if (token.type == TOKEN_TYPEDEF || token.type == TOKEN_INT || token.type == TOKEN_CHAR || token.type == TOKEN_VOID || token.type == TOKEN_STRUCT ||
             token.type == TOKEN_UNION || token.type == TOKEN_SHORT || token.type == TOKEN_LONG || token.type == TOKEN_FLOAT ||
@@ -7611,6 +7682,27 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             eat(TOKEN_CONTINUE);
             eat(TOKEN_SEMICOLON);
             return std::make_unique<ContinueNode>(continueToken.line, continueToken.col);
+        }
+
+        else if (token.type == TOKEN_GOTO)
+        {
+            Token gotoToken = token;
+            eat(TOKEN_GOTO);
+            if (currentToken.type != TOKEN_IDENTIFIER)
+            {
+                reportError(currentToken.line, currentToken.col, "Expected label name after 'goto'");
+                hadError = true;
+                while (currentToken.type != TOKEN_SEMICOLON && currentToken.type != TOKEN_EOF)
+                    currentToken = lexer.nextToken();
+                if (currentToken.type == TOKEN_SEMICOLON)
+                    eat(TOKEN_SEMICOLON);
+                return std::make_unique<EmptyStatementNode>();
+            }
+
+            std::string targetLabel = currentToken.value;
+            eat(TOKEN_IDENTIFIER);
+            eat(TOKEN_SEMICOLON);
+            return std::make_unique<GotoNode>(targetLabel, currentFunction ? currentFunction->name : "", gotoToken.line, gotoToken.col);
         }
 
         // Generic expression statement (e.g. (a>b)?foo():bar(); )
@@ -8555,6 +8647,11 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
     if (auto wrapped = dynamic_cast<const StatementWithDeferredOpsNode*>(node))
     {
         collectReferencedFunctionsStatement(wrapped->statement.get(), refs);
+        return;
+    }
+    if (auto label = dynamic_cast<const LabelNode*>(node))
+    {
+        collectReferencedFunctionsStatement(label->statement.get(), refs);
         return;
     }
     if (auto decl = dynamic_cast<const DeclarationNode*>(node))
@@ -10238,6 +10335,11 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
         collectReferencedFunctionsStatement(wrapped->statement.get(), refs);
         return;
     }
+    if (auto label = dynamic_cast<const LabelNode*>(node))
+    {
+        collectReferencedFunctionsStatement(label->statement.get(), refs);
+        return;
+    }
     if (auto decl = dynamic_cast<const DeclarationNode*>(node))
     {
         collectReferencedFunctionsExpr(decl->initializer.get(), refs);
@@ -11429,6 +11531,91 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
     }
 }
 
+static void collectLabelsAndGotosInStatement(
+    const ASTNode* node,
+    std::unordered_map<std::string, std::pair<int, int>>& labels,
+    std::vector<std::tuple<std::string, int, int>>& gotos)
+{
+    if (!node)
+        return;
+
+    if (auto wrapped = dynamic_cast<const StatementWithDeferredOpsNode*>(node))
+    {
+        collectLabelsAndGotosInStatement(wrapped->statement.get(), labels, gotos);
+        return;
+    }
+
+    if (auto label = dynamic_cast<const LabelNode*>(node))
+    {
+        if (labels.count(label->labelName) > 0)
+        {
+            reportError(label->line, label->col, "Duplicate label '" + label->labelName + "'");
+            hadError = true;
+        }
+        else
+        {
+            labels[label->labelName] = {label->line, label->col};
+        }
+        collectLabelsAndGotosInStatement(label->statement.get(), labels, gotos);
+        return;
+    }
+
+    if (auto go = dynamic_cast<const GotoNode*>(node))
+    {
+        gotos.push_back({go->targetLabel, go->line, go->col});
+        return;
+    }
+
+    if (auto ifn = dynamic_cast<const IfStatementNode*>(node))
+    {
+        for (const auto& stmt : ifn->body)
+            collectLabelsAndGotosInStatement(stmt.get(), labels, gotos);
+        for (const auto& branch : ifn->elseIfBlocks)
+            for (const auto& stmt : branch.second)
+                collectLabelsAndGotosInStatement(stmt.get(), labels, gotos);
+        for (const auto& stmt : ifn->elseBody)
+            collectLabelsAndGotosInStatement(stmt.get(), labels, gotos);
+        return;
+    }
+
+    if (auto whilen = dynamic_cast<const WhileLoopNode*>(node))
+    {
+        for (const auto& stmt : whilen->body)
+            collectLabelsAndGotosInStatement(stmt.get(), labels, gotos);
+        return;
+    }
+
+    if (auto dwn = dynamic_cast<const DoWhileLoopNode*>(node))
+    {
+        for (const auto& stmt : dwn->body)
+            collectLabelsAndGotosInStatement(stmt.get(), labels, gotos);
+        return;
+    }
+
+    if (auto forn = dynamic_cast<const ForLoopNode*>(node))
+    {
+        collectLabelsAndGotosInStatement(forn->initialization.get(), labels, gotos);
+        collectLabelsAndGotosInStatement(forn->iteration.get(), labels, gotos);
+        for (const auto& stmt : forn->body)
+            collectLabelsAndGotosInStatement(stmt.get(), labels, gotos);
+        return;
+    }
+
+    if (auto bn = dynamic_cast<const BlockNode*>(node))
+    {
+        for (const auto& stmt : bn->statements)
+            collectLabelsAndGotosInStatement(stmt.get(), labels, gotos);
+        return;
+    }
+
+    if (auto sn = dynamic_cast<const StatementListNode*>(node))
+    {
+        for (const auto& stmt : sn->statements)
+            collectLabelsAndGotosInStatement(stmt.get(), labels, gotos);
+        return;
+    }
+}
+
 static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std::string, VarInfo>> &scopes, const FunctionNode* currentFunction)
 {
     if (!node) return;
@@ -11459,6 +11646,19 @@ static void semanticCheckStatement(const ASTNode* node, std::stack<std::map<std:
             reportError(cont->line, cont->col, "'continue' statement not within a loop");
             hadError = true;
         }
+        return;
+    }
+
+    if (auto label = dynamic_cast<const LabelNode*>(node))
+    {
+        if (label->statement)
+            semanticCheckStatement(label->statement.get(), scopes, currentFunction);
+        return;
+    }
+
+    if (auto go = dynamic_cast<const GotoNode*>(node))
+    {
+        (void)go;
         return;
     }
 
@@ -11819,6 +12019,22 @@ static void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast)
             // Check body immediately (order-sensitive visibility)
             if (!fn->isPrototype)
             {
+            std::unordered_map<std::string, std::pair<int, int>> functionLabels;
+            std::vector<std::tuple<std::string, int, int>> functionGotos;
+            for (const auto& stmt : fn->body)
+                collectLabelsAndGotosInStatement(stmt.get(), functionLabels, functionGotos);
+            for (const auto& go : functionGotos)
+            {
+                const std::string& labelName = std::get<0>(go);
+                int line = std::get<1>(go);
+                int col = std::get<2>(go);
+                if (functionLabels.count(labelName) == 0)
+                {
+                    reportError(line, col, "Undefined label '" + labelName + "' in function '" + fn->name + "'");
+                    hadError = true;
+                }
+            }
+
             std::stack<std::map<std::string, VarInfo>> localScopes;
             localScopes.push({});
             for (size_t i = 0; i < fn->parameters.size(); ++i)
