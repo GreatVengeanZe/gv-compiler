@@ -1,0 +1,32 @@
+#include "compiler.h"
+#include "lexer.h"
+
+std::unordered_map<std::string, StructTypeInfo> structTypes;
+int anonymousStructCounter = 0;
+std::stack<std::map<std::string, VarInfo>> scopes;
+std::unordered_map<std::string, Type> globalVariables;
+std::unordered_map<std::string, std::vector<size_t>> globalArrayDimensions;
+std::unordered_map<std::string, size_t> globalKnownObjectSizes;
+std::unordered_map<std::string, int> globalEnumConstants;
+std::set<std::string> externGlobals;
+std::set<std::string> staticStorageGlobals;
+std::unordered_map<std::string, Type> functionReturnTypes;
+std::unordered_map<std::string, std::vector<Type>> functionParamTypes;
+std::unordered_map<std::string, bool> functionIsVariadic;
+std::unordered_set<std::string> emittedExternalFunctions;
+std::unordered_set<std::string> declaredExternalFunctions;
+std::unordered_set<std::string> referencedExternalFunctions;
+std::unordered_set<std::string> referencedRegularFunctions;
+bool enableFunctionReachabilityFilter = true;
+std::unordered_map<std::string, Type> fnPtrReturnTypes;
+std::unordered_map<std::string, std::vector<Type>> fnPtrParamTypes;
+std::unordered_map<std::string, bool> fnPtrVariadic;
+std::unordered_map<std::string, bool> fnPtrHasPrototype;
+size_t functionVariableIndex = 0;
+std::vector<DeferredPostfixOp> deferredPostfixOps;
+std::string sourceFileName = "";
+bool hadError = false;
+std::vector<CompileError> compileErrors;
+size_t labelCounter = 0;
+std::vector<std::pair<std::string, std::string>> loopControlStack;
+std::vector<std::string> breakControlStack;
