@@ -329,6 +329,8 @@ struct FunctionCallNode : ASTNode
     std::vector<std::unique_ptr<ASTNode>> arguments;
     // filled during semantic analysis
     std::vector<Type> argTypes;
+    bool hasBuiltinVaArgType = false;
+    Type builtinVaArgType{Type::INT,0};
     bool isIndirect = false;
     Type indirectReturnType{Type::INT,0};
     std::vector<Type> indirectParamTypes;
@@ -357,6 +359,18 @@ struct FunctionCallNode : ASTNode
             return indirectReturnType;
         }
 
+        if (functionName == "__builtin_va_start" || functionName == "__builtin_va_end")
+        {
+            haveRetType = true;
+            return {Type::VOID, 0};
+        }
+
+        if (functionName == "__builtin_va_arg")
+        {
+            haveRetType = true;
+            return hasBuiltinVaArgType ? builtinVaArgType : Type{Type::INT, 0};
+        }
+
         if (functionName == "__builtin_bswap16" || functionName == "__builtin_bswap32" || functionName == "__builtin_bswap64")
         {
             haveRetType = true;
@@ -375,6 +389,182 @@ struct FunctionCallNode : ASTNode
 
     void emitCall(std::ofstream& f, const std::string* hiddenRetDestReg = nullptr) const
     {
+        if (functionName == "__builtin_va_start" || functionName == "__builtin_va_end")
+        {
+            auto tryEmitVaListPointerStore = [&](const std::string& srcReg) -> bool
+            {
+                if (arguments.empty())
+                    return false;
+
+                if (const std::string* idName = arguments[0]->getIdentifierName())
+                {
+                    auto lookupResult = lookupVariable(*idName);
+                    if (lookupResult.first)
+                    {
+                        const VarInfo& vi = lookupResult.second;
+                        std::string dst;
+                        if (vi.isStaticStorage)
+                            dst = "[" + vi.uniqueName + "]";
+                        else if (vi.isStackParameter)
+                            dst = "[rbp + " + std::to_string(vi.index) + "]";
+                        else
+                            dst = "[rbp - " + std::to_string(vi.index) + "]";
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov qword " + dst + ", " + srcReg) << ";; va_list cursor init" << std::endl;
+                        return true;
+                    }
+
+                    auto git = globalVariables.find(*idName);
+                    if (git != globalVariables.end())
+                    {
+                        std::string globalSym = globalAsmSymbol(*idName);
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov qword [" + globalSym + "], " + srcReg) << ";; va_list cursor init (global)" << std::endl;
+                        return true;
+                    }
+                }
+
+                return false;
+            };
+
+            if (functionName == "__builtin_va_start")
+            {
+                if (!currentVariadicFunctionActive)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; va_start outside variadic function" << std::endl;
+                    return;
+                }
+
+                // va_list points to an internal state object:
+                // [0]=gp_index [8]=fp_index [16]=gp_base [24]=fp_base [32]=stack_ptr
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rax, [rbp - " + std::to_string(currentVariadicVaStateOffset) + "]") << ";; va_list state address" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov qword [rax + 0], " + std::to_string(std::min<size_t>(currentVariadicFixedGpCount, 6))) << ";; initial gp cursor" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov qword [rax + 8], " + std::to_string(std::min<size_t>(currentVariadicFixedFpCount, 8))) << ";; initial fp cursor" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rdx, [rbp - " + std::to_string(currentVariadicGpAreaOffset) + "]") << ";; gp save area base" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rax + 16], rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rdx, [rbp - " + std::to_string(currentVariadicFpAreaOffset) + "]") << ";; fp save area base" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rax + 24], rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rdx, [rbp + " + std::to_string(currentVariadicStackStartOffset) + "]") << ";; overflow arg area" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rax + 32], rdx" << std::endl;
+
+                if (!tryEmitVaListPointerStore("rax"))
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\t; unsupported va_list destination" << std::endl;
+            }
+
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; va builtin returns void" << std::endl;
+            return;
+        }
+
+        if (functionName == "__builtin_va_arg")
+        {
+            auto tryEmitVaListPointerLoad = [&](const std::string& dstReg) -> bool
+            {
+                if (arguments.empty())
+                    return false;
+
+                if (const std::string* idName = arguments[0]->getIdentifierName())
+                {
+                    auto lookupResult = lookupVariable(*idName);
+                    if (lookupResult.first)
+                    {
+                        const VarInfo& vi = lookupResult.second;
+                        std::string src;
+                        if (vi.isStaticStorage)
+                            src = "[" + vi.uniqueName + "]";
+                        else if (vi.isStackParameter)
+                            src = "[rbp + " + std::to_string(vi.index) + "]";
+                        else
+                            src = "[rbp - " + std::to_string(vi.index) + "]";
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov " + dstReg + ", qword " + src) << ";; load va_list cursor" << std::endl;
+                        return true;
+                    }
+
+                    auto git = globalVariables.find(*idName);
+                    if (git != globalVariables.end())
+                    {
+                        std::string globalSym = globalAsmSymbol(*idName);
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov " + dstReg + ", qword [" + globalSym + "]") << ";; load va_list cursor (global)" << std::endl;
+                        return true;
+                    }
+                }
+
+                return false;
+            };
+
+            if (!tryEmitVaListPointerLoad("rcx"))
+            {
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; unsupported va_list source" << std::endl;
+                return;
+            }
+
+            bool wantFloat = hasBuiltinVaArgType && builtinVaArgType.pointerLevel == 0 &&
+                             (builtinVaArgType.base == Type::FLOAT || builtinVaArgType.base == Type::DOUBLE);
+
+            std::string doneLabel = ".vaarg_done_" + std::to_string(labelCounter++);
+            std::string fpLabel = ".vaarg_fp_" + std::to_string(labelCounter++);
+            std::string stackLabel = ".vaarg_stack_" + std::to_string(labelCounter++);
+
+            if (wantFloat)
+            {
+                // fp_index in [rcx+8], fp_base in [rcx+24], stack_ptr in [rcx+32]
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, [rcx + 8]" << ";; fp cursor" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rdx, 8" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tjl " + fpLabel) << std::endl;
+
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + stackLabel) << std::endl;
+
+                f << fpLabel << ":" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r8, [rcx + 24]" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r9, rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\timul r9, 8" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r10, r8" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsub r10, r9" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [r10]" << ";; load FP variadic arg" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rcx + 8], rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + doneLabel) << std::endl;
+
+                f << stackLabel << ":" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r8, [rcx + 32]" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [r8]" << ";; load FP variadic arg from stack" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd r8, 8" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rcx + 32], r8" << std::endl;
+                if (builtinVaArgType.base == Type::FLOAT)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovq xmm0, rax" << ";; double->float for va_arg(float)" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tcvtsd2ss xmm0, xmm0" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovd eax, xmm0" << std::endl;
+                }
+            }
+            else
+            {
+                // gp_index in [rcx+0], gp_base in [rcx+16], stack_ptr in [rcx+32]
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, [rcx + 0]" << ";; gp cursor" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tcmp rdx, 6" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tjl " + fpLabel) << std::endl;
+
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + stackLabel) << std::endl;
+
+                f << fpLabel << ":" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r8, [rcx + 16]" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r9, rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\timul r9, 8" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r10, r8" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tsub r10, r9" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [r10]" << ";; load GP variadic arg" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rcx + 0], rdx" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tjmp " + doneLabel) << std::endl;
+
+                f << stackLabel << ":" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov r8, [rcx + 32]" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, [r8]" << ";; load GP variadic arg from stack" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tadd r8, 8" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rcx + 32], r8" << std::endl;
+            }
+
+            f << doneLabel << ":" << std::endl;
+            return;
+        }
+
         if (functionName == "__builtin_bswap16" || functionName == "__builtin_bswap32" || functionName == "__builtin_bswap64") {
             if (arguments.size() != 1) {
                 f << "\tmov rax, 0 ;; error: bswap builtin requires exactly 1 argument" << std::endl;
@@ -716,6 +906,26 @@ struct FunctionNode : ASTNode
             parameterTypes.push_back(param.first);
         std::vector<AbiArgLocation> abiLocations = computeAbiArgLocations(parameterTypes, hasHiddenSRet);
         size_t abiSpillArea = requiredAbiSpillAreaBytes(abiLocations, hasHiddenSRet);
+        size_t variadicGpSaveArea = isVariadic ? 48 : 0; // rdi..r9 saved as qwords
+        size_t variadicFpSaveArea = isVariadic ? 64 : 0; // xmm0..xmm7 saved as qwords
+        size_t variadicVaStateArea = isVariadic ? 40 : 0; // gp/fp cursors + base pointers + stack pointer
+        size_t variadicGpAreaOffset = abiSpillArea;
+        size_t variadicFpAreaOffset = variadicGpAreaOffset + variadicGpSaveArea;
+        size_t variadicVaStateOffset = variadicFpAreaOffset + variadicFpSaveArea;
+
+        size_t fixedGpUsed = hasHiddenSRet ? 1 : 0;
+        size_t fixedFpUsed = 0;
+        size_t fixedStackBytes = 0;
+        for (size_t i = 0; i < parameters.size(); ++i)
+        {
+            const AbiArgLocation& loc = abiLocations[i];
+            if (!loc.stackPassed && !loc.isFloat)
+                fixedGpUsed++;
+            if (!loc.stackPassed && loc.isFloat)
+                fixedFpUsed++;
+            if (loc.stackPassed)
+                fixedStackBytes += loc.stackSize;
+        }
 
         // Calculate space needed:
         // - register-passed parameter spill slots (+ hidden sret pointer slot when needed)
@@ -725,14 +935,14 @@ struct FunctionNode : ASTNode
         // We need sub rsp amount to be a multiple of 16
         // Locals are addressed as [rbp - offset].  Start below rbp and below
         // any register-parameter spill slots to avoid overlap at [rbp - 0].
-        functionVariableIndex = abiSpillArea;
+        functionVariableIndex = abiSpillArea + variadicGpSaveArea + variadicFpSaveArea + variadicVaStateArea;
         
 
         // Compute additional space required for all local arrays in this function
         size_t totalLocalSpace = 0;
         for (const auto& stmt : body)
             totalLocalSpace += stmt->getArraySpaceNeeded();
-        totalLocalSpace += abiSpillArea;
+        totalLocalSpace += abiSpillArea + variadicGpSaveArea + variadicFpSaveArea + variadicVaStateArea;
         
         // Align to multiple of 16: round up to next 16-byte boundary
         size_t alignedSpace = ((totalLocalSpace + 15) / 16) * 16;
@@ -742,6 +952,35 @@ struct FunctionNode : ASTNode
 
         if (hasHiddenSRet)
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rbp - 8], rdi" << ";; Save hidden sret pointer" << std::endl;
+
+        currentVariadicFunctionActive = isVariadic;
+        currentVariadicHasHiddenSRet = hasHiddenSRet;
+        currentVariadicFixedGpCount = fixedGpUsed;
+        currentVariadicGpAreaOffset = variadicGpAreaOffset;
+        currentVariadicFixedFpCount = fixedFpUsed;
+        currentVariadicFpAreaOffset = variadicFpAreaOffset;
+        currentVariadicStackStartOffset = 16 + fixedStackBytes;
+        currentVariadicVaStateOffset = variadicVaStateOffset;
+
+        if (isVariadic)
+        {
+            std::vector<std::string> gpRegs = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+            for (size_t i = 0; i < gpRegs.size(); ++i)
+            {
+                size_t off = variadicGpAreaOffset + i * 8;
+                f << std::left << std::setw(COMMENT_COLUMN)
+                  << ("\tmov [rbp - " + std::to_string(off) + "], " + gpRegs[i])
+                  << ";; Save GP arg register for va_list" << std::endl;
+            }
+
+            for (size_t i = 0; i < 8; ++i)
+            {
+                size_t off = variadicFpAreaOffset + i * 8;
+                f << std::left << std::setw(COMMENT_COLUMN)
+                << ("\tmovq [rbp - " + std::to_string(off) + "], xmm" + std::to_string(i))
+                << ";; Save FP arg register for va_list" << std::endl;
+            }
+        }
 
         // Save parameter registers to stack AFTER allocation
         // System V AMD64 ABI: integer/pointer args in rdi, rsi, rdx, rcx, r8, r9
@@ -811,6 +1050,15 @@ struct FunctionNode : ASTNode
 
         // Pop the scope from the stack
         scopes.pop();
+
+        currentVariadicFunctionActive = false;
+        currentVariadicHasHiddenSRet = false;
+        currentVariadicFixedGpCount = 0;
+        currentVariadicGpAreaOffset = 0;
+        currentVariadicFixedFpCount = 0;
+        currentVariadicFpAreaOffset = 0;
+        currentVariadicStackStartOffset = 0;
+        currentVariadicVaStateOffset = 0;
     }
 };
 
@@ -1011,8 +1259,11 @@ struct DeclarationNode : ASTNode
         if (align == 0) align = 1;
         if (align > 8) align = 8;
         // Conservative per-declaration estimate for frame pre-allocation.
-        // This absorbs alignment padding introduced during emitCode().
-        return alignUp(varSize, align);
+        // Adding (align - 1) accounts for the worst-case alignment padding that
+        // may be needed before this variable due to the preceding variable's size.
+        // e.g. after an int (4 bytes), a double (8-byte aligned) needs up to 4 bytes
+        // of padding, which is bounded by (align - 1) = 7.
+        return alignUp(varSize, align) + (align - 1);
     }
 
     void emitData(std::ofstream& f) const override

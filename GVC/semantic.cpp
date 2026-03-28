@@ -325,6 +325,10 @@ Type computeExprType(const ASTNode* node, const std::stack<std::map<std::string,
     {
         if (fc->isIndirect)
             return fc->indirectReturnType;
+        if (fc->functionName == "__builtin_va_start" || fc->functionName == "__builtin_va_end")
+            return {Type::VOID, 0};
+        if (fc->functionName == "__builtin_va_arg")
+            return fc->hasBuiltinVaArgType ? fc->builtinVaArgType : Type{Type::INT, 0};
         if (fc->functionName == "__builtin_bswap16" ||
             fc->functionName == "__builtin_bswap32" ||
             fc->functionName == "__builtin_bswap64")
@@ -774,6 +778,16 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         {
             const auto& params = it->second;
             bool variadic = functionIsVariadic[fc->functionName];
+            auto skipSetjmpArgCheck = [&](size_t argIndex) -> bool
+            {
+                if (argIndex != 0)
+                    return false;
+                return fc->functionName == "setjmp" ||
+                       fc->functionName == "_setjmp" ||
+                       fc->functionName == "longjmp" ||
+                       fc->functionName == "sigsetjmp" ||
+                       fc->functionName == "siglongjmp";
+            };
             if (!variadic) {
                 if (params.size() != fc->arguments.size())
                 {
@@ -792,6 +806,8 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             size_t checkCount = std::min(params.size(), fc->arguments.size());
             for (size_t i = 0; i < checkCount; ++i)
             {
+                if (skipSetjmpArgCheck(i))
+                    continue;
                 Type argType = computeExprType(fc->arguments[i].get(), scopes, currentFunction);
                 if (!typesCompatible(params[i], argType))
                 {
@@ -804,7 +820,10 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         {
             if (fc->functionName != "__builtin_bswap16" &&
                 fc->functionName != "__builtin_bswap32" &&
-                fc->functionName != "__builtin_bswap64")
+                fc->functionName != "__builtin_bswap64" &&
+                fc->functionName != "__builtin_va_start" &&
+                fc->functionName != "__builtin_va_end" &&
+                fc->functionName != "__builtin_va_arg")
             {
                 reportError(fc->line, fc->col, "Call to undeclared function '" + fc->functionName + "'");
                 hadError = true;

@@ -644,6 +644,16 @@ inline Type makeFunctionPointerType(const Type& returnType,
 // Global index counter for function local variables (incremented per declaration)
 extern size_t functionVariableIndex;
 
+// Active variadic function context for lowering __builtin_va_* builtins.
+extern bool currentVariadicFunctionActive;
+extern bool currentVariadicHasHiddenSRet;
+extern size_t currentVariadicFixedGpCount;
+extern size_t currentVariadicGpAreaOffset;
+extern size_t currentVariadicFixedFpCount;
+extern size_t currentVariadicFpAreaOffset;
+extern size_t currentVariadicStackStartOffset;
+extern size_t currentVariadicVaStateOffset;
+
 // Structure to hold deferred postfix operations
 struct DeferredPostfixOp {
     std::string op;        // "++" or "--"

@@ -182,6 +182,13 @@ public:
             return Token{ TOKEN_STRING_LITERAL, str, tokenLine, tokenCol };
         }
 
+        if ((ch == 'L' || ch == 'u' || ch == 'U') && pos + 1 < source.size() && source[pos + 1] == '\'')
+        {
+            // Wide/UTF char literals like L'a', u'a', U'a'.
+            advance(); // consume prefix
+            ch = peek();
+        }
+
         if (ch == '\'')                 // Handle char literals
         {
             advance();                  // Consume the opening quote
@@ -205,6 +212,19 @@ public:
         {
             std::string num;
             bool isFloat = false;
+
+            // Hex integer literal: 0x... / 0X...
+            if (ch == '0' && pos + 1 < source.size() && (source[pos + 1] == 'x' || source[pos + 1] == 'X'))
+            {
+                num += advance(); // 0
+                num += advance(); // x/X
+                while (std::isxdigit(static_cast<unsigned char>(peek())))
+                    num += advance();
+                while (peek() == 'u' || peek() == 'U' || peek() == 'l' || peek() == 'L')
+                    advance();
+                return Token{ TOKEN_NUMBER, num, tokenLine, tokenCol };
+            }
+
             // integer part
             if (isdigit(ch)) {
                 while (isdigit(peek())) num += advance();
@@ -269,6 +289,8 @@ public:
             if (ident == "goto")     return Token{ TOKEN_GOTO, ident, tokenLine, tokenCol };
             if (ident == "extern")   return Token{ TOKEN_EXTERN, ident, tokenLine, tokenCol };
             if (ident == "sizeof")   return Token{ TOKEN_SIZEOF, ident, tokenLine, tokenCol };
+            if (ident == "__PRETTY_FUNCTION__" || ident == "__FUNCTION__" || ident == "__func__")
+                return Token{ TOKEN_STRING_LITERAL, "gvc", tokenLine, tokenCol };
             return Token{ TOKEN_IDENTIFIER, ident, tokenLine, tokenCol };
         }
 

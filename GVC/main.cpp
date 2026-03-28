@@ -128,13 +128,26 @@ int main(int argc, char** argv)
     std::string asmOutPath;
     std::string objOutPath;
     std::string exeOutPath;
-    std::string cppCmd = "cc";
+    std::string cppCmd = "cc -std=c11";
     bool useSystemPreprocessor = true;
     std::string fasmCmd = "fasm";
     std::string ccCmd = "gcc";
     std::vector<std::string> preprocDefines;
     std::vector<std::string> preprocIncludes;
     std::vector<std::string> linkArgs;
+    std::string compatIncludeDir;
+
+    try
+    {
+        std::filesystem::path exePath = std::filesystem::absolute(argv[0]);
+        std::filesystem::path candidate = exePath.parent_path() / "gvc_compat";
+        if (std::filesystem::exists(candidate) && std::filesystem::is_directory(candidate))
+            compatIncludeDir = candidate.string();
+    }
+    catch (...)
+    {
+        // Optional compatibility include directory; ignore discovery failures.
+    }
 
     for (int i = 1; i < argc; ++i)
     {
@@ -358,6 +371,8 @@ int main(int argc, char** argv)
         std::string ppErrPath = "/tmp/gvc_pp_" + tmpStem + ".err";
 
         std::string cmd = cppCmd + " -E -P";
+        if (!compatIncludeDir.empty())
+            cmd += " -I" + shellQuote(compatIncludeDir);
         for (const auto& d : preprocDefines)
             cmd += " -D" + shellQuote(d);
         for (const auto& inc : preprocIncludes)

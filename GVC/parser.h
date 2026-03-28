@@ -309,6 +309,8 @@ class Parser
                 args.push_back(cloneExpr(a.get(), currentFunction));
             auto cloned = std::make_unique<FunctionCallNode>(fc->functionName, std::move(args), fc->line, fc->col);
             cloned->argTypes = fc->argTypes;
+            cloned->hasBuiltinVaArgType = fc->hasBuiltinVaArgType;
+            cloned->builtinVaArgType = fc->builtinVaArgType;
             cloned->isIndirect = fc->isIndirect;
             cloned->indirectReturnType = fc->indirectReturnType;
             cloned->indirectParamTypes = fc->indirectParamTypes;
@@ -374,7 +376,8 @@ class Parser
                                   std::string* structNameOut = nullptr,
                                   Type* resolvedTypeOut = nullptr,
                                   std::vector<size_t>* typedefArrayDimsOut = nullptr,
-                                  bool* isStaticOut = nullptr)
+                                  bool* isStaticOut = nullptr,
+                                  bool* usedTypedefNameOut = nullptr)
     {
         bool sawUnsigned = false;
         bool sawSigned = false;
@@ -965,6 +968,9 @@ class Parser
         if (typedefArrayDimsOut)
             *typedefArrayDimsOut = typedefArrayDims;
 
+        if (usedTypedefNameOut)
+            *usedTypedefNameOut = sawTypedefName;
+
         if (resolvedTypeOut)
         {
             if (sawTypedefName)
@@ -1353,19 +1359,19 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             if (startsTypeSpecifier(currentToken))
             {
                 bool castUnsigned = false, castConst = false, castAuto = false;
-                bool castRegister = false, castIsTypedef = false;
+                bool castRegister = false, castSawTypedefKeyword = false, castUsedTypedefName = false;
                 Type castResolvedType;
                 std::vector<size_t> castTypedefDims;
                 std::string castStructName;
 
                 TokenType castBaseTok = parseTypeSpecifiers(
-                    castUnsigned, castConst, castAuto, castRegister, castIsTypedef,
-                    &castStructName, &castResolvedType, &castTypedefDims);
+                    castUnsigned, castConst, castAuto, castRegister, castSawTypedefKeyword,
+                    &castStructName, &castResolvedType, &castTypedefDims, nullptr, &castUsedTypedefName);
 
                 Type castTargetType;
                 bool castWasFunctionPointer = false;
 
-                Type castBaseType = castIsTypedef
+                Type castBaseType = castUsedTypedefName
                     ? castResolvedType
                     : makeType(castBaseTok, 0, castUnsigned, castConst, castStructName);
 
@@ -2807,6 +2813,41 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         std::vector<std::pair<Type, std::string>> parameters; // Store (type, name) pairs
         std::vector<std::vector<size_t>> parameterDimensions; // array dimensions per parameter
         bool isVariadic = false;
+
+        // Special case: (void) means exactly zero parameters.
+        if (currentToken.type == TOKEN_VOID)
+        {
+            Token look = lexer.peekToken();
+            if (look.type == TOKEN_RPAREN)
+            {
+                bool tmpU = false, tmpC = false, tmpA = false, tmpR = false, tmpT = false;
+                Type tmpResolved{Type::INT, 0};
+                std::vector<size_t> tmpDims;
+                parseTypeSpecifiers(tmpU, tmpC, tmpA, tmpR, tmpT,
+                                    nullptr, &tmpResolved, &tmpDims, nullptr);
+                eat(TOKEN_RPAREN);
+
+                if (currentToken.type == TOKEN_SEMICOLON)
+                {
+                    Type finalReturnType = resolvedReturnType;
+                    finalReturnType.pointerLevel += returnPtrLevel;
+                    if (finalReturnType.pointerLevel > 0)
+                        finalReturnType.isConst = false;
+
+                    functionReturnTypes[name] = finalReturnType;
+                    functionParamTypes[name] = {};
+                    functionIsVariadic[name] = false;
+
+                    auto fn = std::make_unique<FunctionNode>(
+                        name, finalReturnType, std::vector<std::pair<Type, std::string>>{},
+                        std::vector<std::vector<size_t>>{}, std::vector<std::unique_ptr<ASTNode>>{},
+                        isExternal, false, false, nameToken.line, nameToken.col);
+                    eat(TOKEN_SEMICOLON);
+                    return fn;
+                }
+            }
+        }
+
         while (currentToken.type != TOKEN_RPAREN)
         {
             if (currentToken.type == TOKEN_ELLIPSIS)
@@ -2983,6 +3024,58 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
     {
         eat(TOKEN_LPAREN);
         std::vector<std::unique_ptr<ASTNode>> arguments;
+
+        // GCC stdarg macro expansion uses __builtin_va_arg(ap, type), where
+        // the second argument is a type-name, not an expression.
+        if (functionName == "__builtin_va_arg")
+        {
+            Type vaArgRequestedType{Type::INT, 0};
+            bool haveRequestedType = false;
+            if (currentToken.type != TOKEN_RPAREN)
+            {
+                arguments.push_back(assignmentExpression(currentFunction));
+                if (currentToken.type == TOKEN_COMMA)
+                {
+                    eat(TOKEN_COMMA);
+
+                    bool tUns = false, tConst = false, tAuto = false, tRegister = false, tTypedef = false, tUsedTypedefName = false;
+                    bool tStatic = false;
+                    std::string tStructName;
+                    Type tResolved{Type::INT, 0};
+                    std::vector<size_t> tDims;
+                    TokenType tTok = parseTypeSpecifiers(tUns, tConst, tAuto, tRegister, tTypedef,
+                                                         &tStructName, &tResolved, &tDims, &tStatic, &tUsedTypedefName);
+                    int tPtr = parsePointerDeclaratorLevel();
+
+                    if (tUsedTypedefName)
+                        vaArgRequestedType = tResolved;
+                    else
+                        vaArgRequestedType = makeType(tTok, 0, tUns, tConst, tStructName);
+                    vaArgRequestedType.pointerLevel += tPtr;
+                    if (vaArgRequestedType.pointerLevel > 0)
+                        vaArgRequestedType.isConst = false;
+                    haveRequestedType = true;
+
+                    // Consume optional array declarator suffixes in type-name.
+                    while (currentToken.type == TOKEN_LBRACKET)
+                    {
+                        eat(TOKEN_LBRACKET);
+                        if (currentToken.type != TOKEN_RBRACKET)
+                            assignmentExpression(currentFunction);
+                        eat(TOKEN_RBRACKET);
+                    }
+                }
+            }
+            eat(TOKEN_RPAREN);
+            auto call = std::make_unique<FunctionCallNode>(functionName, std::move(arguments), callLine, callCol);
+            if (haveRequestedType)
+            {
+                call->hasBuiltinVaArgType = true;
+                call->builtinVaArgType = vaArgRequestedType;
+            }
+            return call;
+        }
+
         while (currentToken.type != TOKEN_RPAREN)
         {
             arguments.push_back(assignmentExpression(currentFunction));
