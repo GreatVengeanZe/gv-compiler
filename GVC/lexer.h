@@ -37,6 +37,18 @@ public:
     char parseEscapeSequence(int errLine, int errCol)
     {
         char c = advance();
+        if (c >= '0' && c <= '7')
+        {
+            unsigned int value = static_cast<unsigned int>(c - '0');
+            int digits = 1;
+            while (digits < 3 && peek() >= '0' && peek() <= '7')
+            {
+                value = (value << 3) | static_cast<unsigned int>(advance() - '0');
+                ++digits;
+            }
+            return static_cast<char>(value & 0xFFu);
+        }
+
         switch (c)
         {
             case 'a': return '\a'; // Bell (0x07)
@@ -46,7 +58,6 @@ public:
             case 'r': return '\r'; // Carriage return (0x0D)
             case 't': return '\t'; // Horizontal tab (0x09)
             case 'v': return '\v'; // Vertical tab (0x0B)
-            case '0': return '\0'; // NULL char
             case '\\': return '\\';
             case '\'': return '\'';
             case '"': return '"';

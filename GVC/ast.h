@@ -19,6 +19,9 @@ struct ASTNode
     // IdentifierNode, or nullptr otherwise.  Avoids RTTI requirements.
     virtual const std::string* getIdentifierName() const { return nullptr; }
 
+    // helper used by small call optimizations on direct string-literal arguments.
+    virtual const std::string* getStringLiteralValue() const { return nullptr; }
+
     // optional compile-time size for object represented by this expression
     // (used for string-literal-backed pointers in sizeof handling)
     virtual size_t getKnownObjectSize() const { return 0; }
@@ -336,6 +339,8 @@ struct FunctionCallNode : ASTNode
     std::vector<Type> indirectParamTypes;
     bool indirectVariadic = false;
     bool indirectHasPrototype = false;
+    mutable std::string optimizedLiteralLabel;
+    mutable std::string optimizedLiteralValue;
     int line = 0;
     int col = 0;
 
@@ -344,6 +349,56 @@ struct FunctionCallNode : ASTNode
 
     void emitData(std::ofstream& f) const override
     {
+        if (!isIndirect && functionName == "printf" && arguments.size() == 1)
+        {
+            if (const std::string* stringValue = arguments[0]->getStringLiteralValue())
+            {
+                if (stringValue->size() == 1)
+                    return;
+
+                if (!stringValue->empty() && stringValue->back() == '\n')
+                {
+                    if (optimizedLiteralLabel.empty())
+                    {
+                        optimizedLiteralLabel = "str_" + std::to_string(labelCounter++);
+                        optimizedLiteralValue = stringValue->substr(0, stringValue->size() - 1);
+                    }
+
+                    std::string updatedValue;
+                    for (char c : optimizedLiteralValue)
+                    {
+                        switch (c)
+                        {
+                            case '\n': updatedValue += "\\n"; break;
+                            case '\t': updatedValue += "\\t"; break;
+                            case '\r': updatedValue += "\\r"; break;
+                            case '\v': updatedValue += "\\v"; break;
+                            case '\0': updatedValue += "\\0"; break;
+                            default:   updatedValue += c;
+                        }
+                    }
+
+                    f << "\t; \"" << updatedValue << "\"" << std::endl;
+                    f << "\t" << optimizedLiteralLabel << " db ";
+                    for (char c : optimizedLiteralValue)
+                    {
+                        switch (c)
+                        {
+                            case '\n':  f << std::to_string(10); break;
+                            case '\t':  f << std::to_string(9);  break;
+                            case '\r':  f << std::to_string(13); break;
+                            case '\v':  f << std::to_string(11); break;
+                            case '\0':  f << std::to_string(0);  break;
+                            default:    f << std::to_string(static_cast<int>(c));
+                        }
+                        f << ", ";
+                    }
+                    f << "0" << std::endl;
+                    return;
+                }
+            }
+        }
+
         for (const auto& arg : arguments)
         {
             arg->emitData(f); // Emit data for string literal
@@ -389,6 +444,31 @@ struct FunctionCallNode : ASTNode
 
     void emitCall(std::ofstream& f, const std::string* hiddenRetDestReg = nullptr) const
     {
+        std::string callFunctionName = functionName;
+        bool optimizedPrintfToPutchar = false;
+        bool optimizedPrintfToPuts = false;
+        unsigned int putcharValue = 0;
+        std::string putsValue;
+
+        if (!isIndirect && functionName == "printf" && arguments.size() == 1)
+        {
+            if (const std::string* stringValue = arguments[0]->getStringLiteralValue())
+            {
+                if (stringValue->size() == 1)
+                {
+                    callFunctionName = "putchar";
+                    optimizedPrintfToPutchar = true;
+                    putcharValue = static_cast<unsigned char>((*stringValue)[0]);
+                }
+                else if (!stringValue->empty() && stringValue->back() == '\n')
+                {
+                    callFunctionName = "puts";
+                    optimizedPrintfToPuts = true;
+                    putsValue = stringValue->substr(0, stringValue->size() - 1);
+                }
+            }
+        }
+
         if (functionName == "__builtin_va_start" || functionName == "__builtin_va_end")
         {
             auto tryEmitVaListPointerStore = [&](const std::string& srcReg) -> bool
@@ -585,6 +665,31 @@ struct FunctionCallNode : ASTNode
         Type retType = resolvedReturnType(haveRetType);
         bool retViaMemory = haveRetType && usesMemoryReturnType(retType);
 
+        if (optimizedPrintfToPutchar)
+        {
+            declaredExternalFunctions.insert(callFunctionName);
+            referencedExternalFunctions.insert(callFunctionName);
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov rdi, " + std::to_string(putcharValue)) << ";; printf(\"c\") -> putchar" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; float register count" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tcall " + functionAsmSymbol(callFunctionName)) << ";; Optimized call from printf" << std::endl;
+            return;
+        }
+
+        if (optimizedPrintfToPuts)
+        {
+            if (optimizedLiteralLabel.empty())
+            {
+                optimizedLiteralLabel = "str_" + std::to_string(labelCounter++);
+                optimizedLiteralValue = putsValue;
+            }
+            declaredExternalFunctions.insert(callFunctionName);
+            referencedExternalFunctions.insert(callFunctionName);
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rdi, [" + optimizedLiteralLabel + "]") << ";; printf(\"...\\n\") -> puts" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; float register count" << std::endl;
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tcall " + functionAsmSymbol(callFunctionName)) << ";; Optimized call from printf" << std::endl;
+            return;
+        }
+
         // System V AMD64 ABI calling convention
         // Integer/pointer args use rdi, rsi, rdx, rcx, r8, r9.
         // Floating-point args use xmm0..xmm7.
@@ -602,7 +707,7 @@ struct FunctionCallNode : ASTNode
         }
         else
         {
-            auto sigItAll = functionParamTypes.find(functionName);
+            auto sigItAll = functionParamTypes.find(callFunctionName);
             if (sigItAll != functionParamTypes.end())
                 declaredParams = &sigItAll->second;
         }
@@ -669,7 +774,7 @@ struct FunctionCallNode : ASTNode
         }
 
         int floatRegCount = 0;
-        bool callIsVariadic = isIndirect ? indirectVariadic : functionIsVariadic[functionName];
+        bool callIsVariadic = isIndirect ? indirectVariadic : functionIsVariadic[callFunctionName];
         int intRegsUsed = retViaMemory ? 1 : 0;
         int floatRegsUsed = 0;
         for (size_t i = 0; i < argCount; ++i)
@@ -813,12 +918,17 @@ struct FunctionCallNode : ASTNode
         }
         else
         {
-            if (declaredExternalFunctions.count(functionName))
-                referencedExternalFunctions.insert(functionName);
+            if (callFunctionName != functionName)
+            {
+                declaredExternalFunctions.insert(callFunctionName);
+                referencedExternalFunctions.insert(callFunctionName);
+            }
+            else if (declaredExternalFunctions.count(callFunctionName))
+                referencedExternalFunctions.insert(callFunctionName);
             else
-                referencedRegularFunctions.insert(functionName);
-            std::string instrCall = "\tcall " + functionAsmSymbol(functionName);
-            f << std::left << std::setw(COMMENT_COLUMN) << instrCall << ";; Call function " << functionName << std::endl;
+                referencedRegularFunctions.insert(callFunctionName);
+            std::string instrCall = "\tcall " + functionAsmSymbol(callFunctionName);
+            f << std::left << std::setw(COMMENT_COLUMN) << instrCall << ";; Call function " << callFunctionName << std::endl;
         }
 
         if (haveRetType)
@@ -1434,10 +1544,9 @@ struct ArrayDeclarationNode : ASTNode
         if (elemType.pointerLevel > 0) elemType.pointerLevel--;
         size_t elemSize = sizeOfType(elemType);
         std::string dataDirective = "dq";
-        std::string reserveDirective = "rq";
-        if (elemSize == 1) { dataDirective = "db"; reserveDirective = "rb"; }
-        else if (elemSize == 2) { dataDirective = "dw"; reserveDirective = "rw"; }
-        else if (elemSize == 4) { dataDirective = "dd"; reserveDirective = "rd"; }
+        if (elemSize == 1) dataDirective = "db";
+        else if (elemSize == 2) dataDirective = "dw";
+        else if (elemSize == 4) dataDirective = "dd";
         // Prepare flat list of initializer values
         std::vector<ASTNode*> flat;
         if (initializer)
@@ -1470,8 +1579,8 @@ struct ArrayDeclarationNode : ASTNode
         }
         else
         {
-            // no initializer: reserve space (indent to avoid being treated as instruction)
-            f << "\t" << reserveDirective << " " << totalElements;
+            // C requires zero-initialization for objects with static storage duration.
+            f << "\ttimes " << totalElements << " " << dataDirective << " 0";
         }
         f << "\n";
     }
@@ -2752,7 +2861,17 @@ struct AssignmentNode : ASTNode
                 }
                 else
                 {
-                    std::string instruction = "\tmov [rcx], rax";
+                    Type globalType = globalVariables.count(identifier) ? globalVariables[identifier] : Type{Type::INT, 0};
+                    size_t varSize = sizeOfType(globalType);
+                    std::string instruction;
+                    if (varSize == 1)
+                        instruction = "\tmov byte [rcx], al";
+                    else if (varSize == 2)
+                        instruction = "\tmov word [rcx], ax";
+                    else if (varSize == 4)
+                        instruction = "\tmov dword [rcx], eax";
+                    else
+                        instruction = "\tmov qword [rcx], rax";
                     f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store result in global variable " << identifier << std::endl;
                 }
             }
@@ -4317,6 +4436,7 @@ struct StringLiteralNode : ASTNode
     }
 
     size_t getKnownObjectSize() const override { return value.size() + 1; }
+    const std::string* getStringLiteralValue() const override { return &value; }
 };
 
 
