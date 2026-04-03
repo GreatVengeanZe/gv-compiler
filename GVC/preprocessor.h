@@ -147,6 +147,11 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
         collectReferencedFunctionsExpr(ln->operand.get(), refs);
         return;
     }
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+    {
+        collectReferencedFunctionsExpr(bn->operand.get(), refs);
+        return;
+    }
     if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node))
     {
         collectReferencedFunctionsExpr(pu->target.get(), refs);

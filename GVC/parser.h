@@ -179,7 +179,8 @@ class Parser
                                         std::string* nameOut,
                                         Type& outType,
                                         int* nameLineOut = nullptr,
-                                        int* nameColOut = nullptr)
+                                        int* nameColOut = nullptr,
+                                        std::vector<size_t>* dimsOut = nullptr)
     {
         if (currentToken.type != TOKEN_LPAREN)
             return false;
@@ -215,6 +216,25 @@ class Parser
                 eat(TOKEN_IDENTIFIER);
         }
 
+        while (currentToken.type == TOKEN_LBRACKET)
+        {
+            eat(TOKEN_LBRACKET);
+            size_t dim = 0;
+            if (currentToken.type == TOKEN_NUMBER)
+            {
+                dim = std::stoul(currentToken.value);
+                eat(TOKEN_NUMBER);
+            }
+            else if (currentToken.type != TOKEN_RBRACKET)
+            {
+                reportError(currentToken.line, currentToken.col,
+                            "Expected constant array size in function pointer array declarator");
+                hadError = true;
+            }
+            eat(TOKEN_RBRACKET);
+            if (dimsOut)
+                dimsOut->push_back(dim);
+        }
         eat(TOKEN_RPAREN);
 
         std::vector<Type> paramTypes;
@@ -253,10 +273,13 @@ class Parser
         {
             auto cloned = std::make_unique<PostfixUpdateNode>(cloneExpr(pu->target.get(), currentFunction), pu->op, pu->line, pu->col);
             cloned->valueType = pu->valueType;
+            cloned->returnOldResult = pu->returnOldResult;
             return cloned;
         }
         if (auto ln = dynamic_cast<const LogicalNotNode*>(node))
             return std::make_unique<LogicalNotNode>(cloneExpr(ln->operand.get(), currentFunction), ln->line, ln->col);
+        if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+            return std::make_unique<BitwiseNotNode>(cloneExpr(bn->operand.get(), currentFunction), bn->line, bn->col);
         if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
             return std::make_unique<BinaryOpNode>(bin->op, cloneExpr(bin->left.get(), currentFunction), cloneExpr(bin->right.get(), currentFunction));
         if (auto lor = dynamic_cast<const LogicalOrNode*>(node))
@@ -300,7 +323,7 @@ class Parser
             std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> inits;
             for (const auto& init : sl->initializers)
                 inits.push_back({init.first, cloneExpr(init.second.get(), currentFunction)});
-            return std::make_unique<StructLiteralNode>(sl->structName, std::move(inits), sl->line, sl->col);
+            return std::make_unique<StructLiteralNode>(sl->structName, sl->isUnionLiteral, std::move(inits), sl->line, sl->col);
         }
         if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
         {
@@ -321,12 +344,31 @@ class Parser
         if (auto dn = dynamic_cast<const DereferenceNode*>(node))
             return std::make_unique<DereferenceNode>(cloneExpr(dn->operand.get(), currentFunction), currentFunction);
         if (auto ao = dynamic_cast<const AddressOfNode*>(node))
+        {
+            if (ao->operand)
+                return std::make_unique<AddressOfNode>(cloneExpr(ao->operand.get(), currentFunction), currentFunction, ao->line, ao->col);
             return std::make_unique<AddressOfNode>(ao->Identifier, currentFunction, ao->line, ao->col);
+        }
         if (auto so = dynamic_cast<const SizeofNode*>(node))
         {
             if (so->isType)
                 return std::make_unique<SizeofNode>(so->typeOperand, currentFunction);
             return std::make_unique<SizeofNode>(cloneExpr(so->expr.get(), currentFunction), currentFunction);
+        }
+        if (auto cast = dynamic_cast<const CastNode*>(node))
+            return std::make_unique<CastNode>(cast->targetType, cloneExpr(cast->operand.get(), currentFunction), cast->line, cast->col, currentFunction);
+        if (auto asg = dynamic_cast<const AssignmentNode*>(node))
+        {
+            std::vector<std::unique_ptr<ASTNode>> idx;
+            for (const auto& i : asg->indices)
+                idx.push_back(cloneExpr(i.get(), currentFunction));
+            return std::make_unique<AssignmentNode>(asg->identifier, cloneExpr(asg->expression.get(), currentFunction), asg->dereferenceLevel, std::move(idx), asg->line, asg->col);
+        }
+        if (auto iasg = dynamic_cast<const IndirectAssignmentNode*>(node))
+        {
+            auto cloned = std::make_unique<IndirectAssignmentNode>(cloneExpr(iasg->pointerExpr.get(), currentFunction), cloneExpr(iasg->expression.get(), currentFunction), iasg->line, iasg->col);
+            cloned->valueType = iasg->valueType;
+            return cloned;
         }
         return std::make_unique<NumberNode>(0);
     }
@@ -1009,6 +1051,7 @@ class Parser
     }
 
     std::unique_ptr<ASTNode> parseStructInitializerBody(const std::string& structName,
+                                                        bool isUnionLiteral,
                                                         int startLine,
                                                         int startCol,
                                                         const FunctionNode* currentFunction = nullptr)
@@ -1020,7 +1063,7 @@ class Parser
         auto sit = structTypes.find(structName);
         if (sit == structTypes.end())
         {
-            reportError(startLine, startCol, "Unknown struct type '" + structName + "'");
+            reportError(startLine, startCol, std::string("Unknown ") + (isUnionLiteral ? "union" : "struct") + " type '" + structName + "'");
             hadError = true;
         }
 
@@ -1032,7 +1075,7 @@ class Parser
                 eat(TOKEN_DOT);
                 if (currentToken.type != TOKEN_IDENTIFIER)
                 {
-                    reportError(currentToken.line, currentToken.col, "Expected member name after '.' in struct initializer");
+                    reportError(currentToken.line, currentToken.col, std::string("Expected member name after '.' in ") + (isUnionLiteral ? "union" : "struct") + " initializer");
                     hadError = true;
                     break;
                 }
@@ -1042,9 +1085,15 @@ class Parser
             }
             else
             {
-                if (sit != structTypes.end() && positionalIndex < sit->second.members.size())
-                    memberName = sit->second.members[positionalIndex].name;
-                ++positionalIndex;
+                if (sit != structTypes.end() && !sit->second.members.empty())
+                {
+                    if (isUnionLiteral)
+                        memberName = sit->second.members[0].name;
+                    else if (positionalIndex < sit->second.members.size())
+                        memberName = sit->second.members[positionalIndex].name;
+                }
+                if (!isUnionLiteral)
+                    ++positionalIndex;
             }
 
             auto expr = assignmentExpression(currentFunction);
@@ -1056,7 +1105,7 @@ class Parser
         }
 
         eat(TOKEN_RBRACE);
-        return std::make_unique<StructLiteralNode>(structName, std::move(initializers), startLine, startCol);
+        return std::make_unique<StructLiteralNode>(structName, isUnionLiteral, std::move(initializers), startLine, startCol);
     }
 
     std::unique_ptr<ASTNode> parseStructCompoundLiteral(const FunctionNode* currentFunction = nullptr)
@@ -1077,14 +1126,15 @@ class Parser
 
         eat(TOKEN_RPAREN);
 
-        if (typeTok != TOKEN_STRUCT || ptrLevel != 0 || currentToken.type != TOKEN_LBRACE)
+        bool isAggregateType = (typeTok == TOKEN_STRUCT || typeTok == TOKEN_UNION);
+        if (!isAggregateType || ptrLevel != 0 || currentToken.type != TOKEN_LBRACE)
         {
-            reportError(openParen.line, openParen.col, "Only struct compound literals are supported in this context");
+            reportError(openParen.line, openParen.col, "Only struct/union compound literals are supported in this context");
             hadError = true;
             return std::make_unique<NumberNode>(0);
         }
 
-        return parseStructInitializerBody(structName, openParen.line, openParen.col, currentFunction);
+        return parseStructInitializerBody(structName, typeTok == TOKEN_UNION, openParen.line, openParen.col, currentFunction);
     }
 
 
@@ -1147,9 +1197,11 @@ class Parser
 
                     if (calleeName.empty())
                     {
-                        reportError(l, c, "Unsupported call target expression");
-                        hadError = true;
-                        node = std::make_unique<NumberNode>(0);
+                        // Expression-based callee (e.g. fns[i](...)) — build call node
+                        // with calleeExpr so the semantic pass can resolve the type.
+                        auto callNode = std::make_unique<FunctionCallNode>("", std::move(arguments), l, c);
+                        callNode->calleeExpr = std::move(node);
+                        node = std::move(callNode);
                     }
                     else
                     {
@@ -1199,10 +1251,21 @@ class Parser
         if (token.type == TOKEN_INCREMENT || token.type == TOKEN_DECREMENT)
         {
             eat(token.type); // Consume the operator
-            Token idToken = currentToken;
-            std::string identifier = idToken.value;
-            eat(TOKEN_IDENTIFIER); // Consume the identifier
-            return std::make_unique<UnaryOpNode>(token.value, identifier, true, idToken.line, idToken.col); // true for prefix
+            auto target = factor(currentFunction);
+
+            if (auto id = dynamic_cast<IdentifierNode*>(target.get()))
+                return std::make_unique<UnaryOpNode>(token.value, id->name, true, id->line, id->col);
+
+            bool lvalueLike = dynamic_cast<MemberAccessNode*>(target.get()) ||
+                             dynamic_cast<DereferenceNode*>(target.get());
+            if (!lvalueLike)
+            {
+                reportError(token.line, token.col, "Prefix ++/-- requires an assignable identifier, member, or dereference expression");
+                hadError = true;
+                return std::make_unique<NumberNode>(0);
+            }
+
+            return std::make_unique<PostfixUpdateNode>(std::move(target), token.value, token.line, token.col, false);
         }
 
         // sizeof operator
@@ -1211,27 +1274,25 @@ class Parser
             eat(TOKEN_SIZEOF);
             if (currentToken.type == TOKEN_LPAREN)
             {
+                // sizeof can take either a parenthesized type-name or any unary
+                // expression. Detect type-name using one-token lookahead after '('.
+                Token afterLParen = lexer.peekToken();
+                bool sawType = startsTypeSpecifier(afterLParen);
+                if (!sawType)
+                {
+                    auto exprNode = factor(currentFunction);
+                    return std::make_unique<SizeofNode>(std::move(exprNode), currentFunction);
+                }
+
                 eat(TOKEN_LPAREN);
-                // attempt to parse a type-name sequence as for declarations
-                bool sawType = startsTypeSpecifier(currentToken);
                 TokenType tt = TOKEN_INT;
                 bool sawUnsigned = false;
                 std::string sizeofStructName;
-                if (sawType)
-                    tt = parseTypeSpecifiers(sawUnsigned, &sizeofStructName);
-                if (sawType)
-                {
-                    int ptrLevel = parsePointerDeclaratorLevel();
-                    Type t = makeType(tt, ptrLevel, sawUnsigned, false, sizeofStructName);
-                    eat(TOKEN_RPAREN);
-                    return std::make_unique<SizeofNode>(t, currentFunction);
-                }
-                else
-                {
-                    auto exprNode = condition(currentFunction);
-                    eat(TOKEN_RPAREN);
-                    return std::make_unique<SizeofNode>(std::move(exprNode), currentFunction);
-                }
+                tt = parseTypeSpecifiers(sawUnsigned, &sizeofStructName);
+                int ptrLevel = parsePointerDeclaratorLevel();
+                Type t = makeType(tt, ptrLevel, sawUnsigned, false, sizeofStructName);
+                eat(TOKEN_RPAREN);
+                return std::make_unique<SizeofNode>(t, currentFunction);
             }
             else
             {
@@ -1246,6 +1307,13 @@ class Parser
             eat(TOKEN_NOT);
             auto operand = factor(currentFunction);
             return std::make_unique<LogicalNotNode>(std::move(operand), token.line, token.col);
+        }
+
+        else if (token.type == TOKEN_BITWISE_NOT)
+        {
+            eat(TOKEN_BITWISE_NOT);
+            auto operand = factor(currentFunction);
+            return std::make_unique<BitwiseNotNode>(std::move(operand), token.line, token.col);
         }
 
 else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
@@ -1270,14 +1338,19 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         {
             Token andToken = token;
             eat(TOKEN_AND);
-            if (currentToken.type != TOKEN_IDENTIFIER)
+            auto operand = factor(currentFunction);
+            bool lvalueLike = dynamic_cast<IdentifierNode*>(operand.get()) ||
+                             dynamic_cast<ArrayAccessNode*>(operand.get()) ||
+                             dynamic_cast<PostfixIndexNode*>(operand.get()) ||
+                             dynamic_cast<MemberAccessNode*>(operand.get()) ||
+                             dynamic_cast<DereferenceNode*>(operand.get());
+            if (!lvalueLike)
             {
-                reportError(currentToken.line, currentToken.col, "Expected Identifier after &");
-                std::exit(1);
+                reportError(andToken.line, andToken.col, "Address-of requires an lvalue expression");
+                hadError = true;
+                return std::make_unique<NumberNode>(0);
             }
-            std::string Identifier = currentToken.value;
-            eat(TOKEN_IDENTIFIER);
-            return std::make_unique<AddressOfNode>(Identifier, currentFunction, andToken.line, andToken.col);
+            return std::make_unique<AddressOfNode>(std::move(operand), currentFunction, andToken.line, andToken.col);
         }
 
         else if (token.type == TOKEN_CHAR_LITERAL)
@@ -1303,7 +1376,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
         else if (token.type == TOKEN_IDENTIFIER)
 	    {
-            // Handle variables or function calls
+            // Handle variable/function designator and parse all postfix forms
+            // through applyPostfix() so indexing is represented consistently.
             std::string identifier = token.value;
             eat(TOKEN_IDENTIFIER);
 
@@ -1312,37 +1386,6 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             {
                 return std::make_unique<NumberNode>(enumIt->second);
             }
-
-            // Handle array indexing
-            std::vector<std::unique_ptr<ASTNode>> indices;
-            while(currentToken.type == TOKEN_LBRACKET)
-            {
-                eat(TOKEN_LBRACKET);
-                indices.push_back(condition(currentFunction));
-                eat(TOKEN_RBRACKET);
-            }
-
-            if (!indices.empty())
-            {
-                auto node = std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction, token.line, token.col);
-                return applyPostfix(std::move(node), token.line, token.col);
-            }
-
-            if (currentToken.type == TOKEN_INCREMENT || currentToken.type == TOKEN_DECREMENT)
-            {
-                Token opToken = currentToken;
-                eat(opToken.type); // Consume the operator
-                return std::make_unique<UnaryOpNode>(opToken.value, identifier, false, token.line, token.col); // false for postfix
-            }
-
-            // Check if this is a function call
-            if (currentToken.type == TOKEN_LPAREN)
-            {
-                auto node = functionCall(identifier, token.line, token.col, currentFunction);
-                return applyPostfix(std::move(node), token.line, token.col);
-            }
-
-            // Otherwise it's a variable or parameter
             auto node = std::make_unique<IdentifierNode>(identifier, token.line, token.col, currentFunction);
             return applyPostfix(std::move(node), token.line, token.col);
         }
@@ -1391,12 +1434,12 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
                 // Compound literal: (struct T) { ... }
                 if (currentToken.type == TOKEN_LBRACE
-                    && castTargetType.base == Type::STRUCT
+                    && (castTargetType.base == Type::STRUCT || castTargetType.base == Type::UNION)
                     && !castWasFunctionPointer
                     && castTargetType.pointerLevel == 0)
                 {
                     return parseStructInitializerBody(
-                        castTargetType.structName, token.line, token.col, currentFunction);
+                        castTargetType.structName, castTargetType.base == Type::UNION, token.line, token.col, currentFunction);
                 }
 
                 // Otherwise it is a cast expression.
@@ -1841,11 +1884,12 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
                 bool isFunctionPtrDeclarator = false;
                 Type functionPtrType;
+                std::vector<size_t> dimensions;
                 if (currentToken.type == TOKEN_LPAREN && lexer.peekToken().type == TOKEN_MUL)
                 {
                     int declLine = token.line;
                     int declCol = token.col;
-                    if (!parseFunctionPointerDeclarator(baseType, &identifier, functionPtrType, &declLine, &declCol))
+                    if (!parseFunctionPointerDeclarator(baseType, &identifier, functionPtrType, &declLine, &declCol, &dimensions))
                         break;
                     isFunctionPtrDeclarator = true;
                     idToken = Token{TOKEN_IDENTIFIER, identifier, declLine, declCol};
@@ -1864,7 +1908,6 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     eat(TOKEN_IDENTIFIER);
                 }
 
-                std::vector<size_t> dimensions;
                 while (currentToken.type == TOKEN_LBRACKET)
                 {
                     eat(TOKEN_LBRACKET);
@@ -1912,9 +1955,9 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
                 if (isFunctionPtrDeclarator && !dimensions.empty())
                 {
-                    reportError(idToken.line, idToken.col,
-                                "Arrays of function pointers are not supported yet");
-                    hadError = true;
+                    // Arrays of function pointers are supported: just continue with declaration.
+                    // The element type is functionPtrType and varType will be set to functionPtrType
+                    // with an extra pointer level below (same as any array declaration).
                 }
 
                 if (isFunctionPtrDeclarator)
@@ -1991,7 +2034,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     {
                         eat(TOKEN_ASSIGN);
                         if (baseType.pointerLevel == 0 && (baseType.base == Type::STRUCT || baseType.base == Type::UNION) && currentToken.type == TOKEN_LBRACE)
-                            initializer = parseStructInitializerBody(baseType.structName, idToken.line, idToken.col, currentFunction);
+                            initializer = parseStructInitializerBody(baseType.structName, baseType.base == Type::UNION, idToken.line, idToken.col, currentFunction);
                         else
                             initializer = assignmentExpression(currentFunction);
                     }
@@ -2429,7 +2472,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
         // Generic expression statement (e.g. (a>b)?foo():bar(); )
         else if (token.type == TOKEN_LPAREN || token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL ||
-             token.type == TOKEN_CHAR_LITERAL || token.type == TOKEN_STRING_LITERAL || token.type == TOKEN_NOT ||
+               token.type == TOKEN_CHAR_LITERAL || token.type == TOKEN_STRING_LITERAL || token.type == TOKEN_NOT || token.type == TOKEN_BITWISE_NOT ||
              token.type == TOKEN_SIZEOF || token.type == TOKEN_ADD || token.type == TOKEN_SUB || token.type == TOKEN_AND ||
              token.type == TOKEN_INCREMENT || token.type == TOKEN_DECREMENT)
         {
@@ -2514,7 +2557,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 std::string name = currentToken.value;
                 eat(TOKEN_IDENTIFIER);
                 eat(TOKEN_SEMICOLON);
-                auto functionNode = std::make_unique<FunctionNode>(name, makeType(TOKEN_VOID), std::vector<std::pair<Type, std::string>>(), std::vector<std::vector<size_t>>(), std::vector<std::unique_ptr<ASTNode>>(), isExternal, false, false, nameToken.line, nameToken.col);
+                auto functionNode = std::make_unique<FunctionNode>(name, makeType(TOKEN_VOID), std::vector<std::pair<Type, std::string>>(), std::vector<std::vector<size_t>>(), std::vector<std::unique_ptr<ASTNode>>(), isExternal, false, false, false, nameToken.line, nameToken.col);
                 return functionNode;
             }
         }
@@ -2807,6 +2850,11 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             reportError(nameToken.line, nameToken.col, "Storage class specifier is not valid for function return type");
             hadError = true;
         }
+        if (isExternal && returnStatic)
+        {
+            reportError(nameToken.line, nameToken.col, "Function cannot be both extern and static");
+            hadError = true;
+        }
 
         // Parse the parameters list for a function
         eat(TOKEN_LPAREN);
@@ -2841,7 +2889,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     auto fn = std::make_unique<FunctionNode>(
                         name, finalReturnType, std::vector<std::pair<Type, std::string>>{},
                         std::vector<std::vector<size_t>>{}, std::vector<std::unique_ptr<ASTNode>>{},
-                        isExternal, false, false, nameToken.line, nameToken.col);
+                        isExternal, returnStatic, false, false, nameToken.line, nameToken.col);
                     eat(TOKEN_SEMICOLON);
                     return fn;
                 }
@@ -2986,7 +3034,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             finalReturnType.pointerLevel += returnPtrLevel;
             if (finalReturnType.pointerLevel > 0)
                 finalReturnType.isConst = false;
-            auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, true, nameToken.line, nameToken.col);
+            auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, returnStatic, isVariadic, true, nameToken.line, nameToken.col);
             eat(TOKEN_SEMICOLON);
             return functionNode;
         }
@@ -2996,7 +3044,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         finalReturnType.pointerLevel += returnPtrLevel;
         if (finalReturnType.pointerLevel > 0)
             finalReturnType.isConst = false;
-        auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, false, nameToken.line, nameToken.col);
+        auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, returnStatic, isVariadic, false, nameToken.line, nameToken.col);
 
         if (isExternal)
         {

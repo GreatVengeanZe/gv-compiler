@@ -183,6 +183,7 @@ struct AbiArgLocation
     size_t stackSize = 0;
     size_t spillOffset = 0;
     int intRegIndex = -1;
+    int secondIntRegIndex = -1; // For small structs needing two integer registers
     int floatRegIndex = -1;
 };
 
@@ -201,10 +202,26 @@ inline std::vector<AbiArgLocation> computeAbiArgLocations(const std::vector<Type
 
         if (isSmallStructValueType(types[i]))
         {
-            loc.stackPassed = true;
-            loc.stackSize = stackPassSize(types[i]);
-            loc.stackOffset = nextStackOffset;
-            nextStackOffset += loc.stackSize;
+            size_t sz = sizeOfType(types[i]);
+            int regsNeeded = (sz <= 8) ? 1 : 2;
+            if (nextIntReg + regsNeeded <= 6)
+            {
+                // Pass in integer registers per SysV AMD64 ABI
+                loc.intRegIndex = nextIntReg;
+                if (regsNeeded == 2)
+                    loc.secondIntRegIndex = nextIntReg + 1;
+                nextIntReg += regsNeeded;
+                nextSpillSlot += regsNeeded;
+                loc.spillOffset = nextSpillSlot * 8;
+            }
+            else
+            {
+                // Not enough registers; fall back to stack
+                loc.stackPassed = true;
+                loc.stackSize = stackPassSize(types[i]);
+                loc.stackOffset = nextStackOffset;
+                nextStackOffset += loc.stackSize;
+            }
         }
         else if (loc.isFloat)
         {
@@ -700,6 +717,7 @@ enum TokenType
     TOKEN_SEMICOLON,
     TOKEN_SIZEOF,
     TOKEN_NOT,
+    TOKEN_BITWISE_NOT,
     TOKEN_ASSIGN,
     TOKEN_SHORT,
     TOKEN_LONG,
@@ -791,6 +809,7 @@ inline std::string tokenTypeToString(TokenType t)
         case TOKEN_SEMICOLON: return ";";
         case TOKEN_ASSIGN: return "=";
         case TOKEN_NOT: return "!";
+        case TOKEN_BITWISE_NOT: return "~";
         case TOKEN_ADD: return "+";
         case TOKEN_ADD_ASSIGN: return "+=";
         case TOKEN_INCREMENT: return "++";

@@ -38,10 +38,36 @@ static std::pair<int,int> bestEffortNodeLocation(const ASTNode* node)
     if (auto un = dynamic_cast<const UnaryOpNode*>(node)) return {un->line, un->col};
     if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node)) return {pu->line, pu->col};
     if (auto ln = dynamic_cast<const LogicalNotNode*>(node)) return {ln->line, ln->col};
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node)) return {bn->line, bn->col};
     if (auto tn = dynamic_cast<const TernaryNode*>(node)) return {tn->line, tn->col};
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node)) return bestEffortNodeLocation(bin->left.get());
     if (auto ret = dynamic_cast<const ReturnNode*>(node)) return bestEffortNodeLocation(ret->expression.get());
     return {0,0};
+}
+
+static bool inferAggregateTypeFromMemberName(const std::string& memberName, Type& outType)
+{
+    std::string foundName;
+    int matches = 0;
+    for (const auto& it : structTypes)
+    {
+        for (const auto& m : it.second.members)
+        {
+            if (m.name == memberName)
+            {
+                foundName = it.first;
+                ++matches;
+                break;
+            }
+        }
+    }
+
+    if (matches == 1)
+    {
+        outType = makeType(TOKEN_STRUCT, 0, false, false, foundName);
+        return true;
+    }
+    return false;
 }
 
 // simple compatibility predicate.  We accept the following cases:
@@ -194,10 +220,17 @@ Type computeExprType(const ASTNode* node, const std::stack<std::map<std::string,
     }
     if (auto ao = dynamic_cast<const AddressOfNode*>(node))
     {
-        auto lookupResult = lookupInScopes(scopes, ao->Identifier);
         Type bt = {Type::INT,0};
-        if (lookupResult.first) bt = lookupResult.second.type;
-        else if (globalVariables.count(ao->Identifier)) bt = globalVariables[ao->Identifier];
+        if (ao->operand)
+        {
+            bt = computeExprType(ao->operand.get(), scopes, currentFunction);
+        }
+        else
+        {
+            auto lookupResult = lookupInScopes(scopes, ao->Identifier);
+            if (lookupResult.first) bt = lookupResult.second.type;
+            else if (globalVariables.count(ao->Identifier)) bt = globalVariables[ao->Identifier];
+        }
         bt.pointerLevel++;
         return bt;
     }
@@ -214,6 +247,13 @@ Type computeExprType(const ASTNode* node, const std::stack<std::map<std::string,
     }
     if (dynamic_cast<const LogicalNotNode*>(node))
     {
+        return {Type::INT,0};
+    }
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+    {
+        Type t = computeExprType(bn->operand.get(), scopes, currentFunction);
+        if (t.pointerLevel == 0 && isIntegerScalarType(t))
+            return t;
         return {Type::INT,0};
     }
     if (auto lor = dynamic_cast<const LogicalOrNode*>(node))
@@ -389,14 +429,69 @@ Type computeExprType(const ASTNode* node, const std::stack<std::map<std::string,
     }
     if (auto ma = dynamic_cast<const MemberAccessNode*>(node))
     {
+        auto recoverPointerLikeType = [&](const ASTNode* expr) -> Type
+        {
+            if (!expr) return {Type::INT,0};
+            if (auto castBase = dynamic_cast<const CastNode*>(expr))
+            {
+                if (castBase->targetType.pointerLevel > 0)
+                    return castBase->targetType;
+                if (castBase->targetType.base == Type::STRUCT || castBase->targetType.base == Type::UNION)
+                {
+                    Type promoted = castBase->targetType;
+                    promoted.pointerLevel = 1;
+                    return promoted;
+                }
+            }
+            if (auto binBase = dynamic_cast<const BinaryOpNode*>(expr))
+            {
+                if (binBase->op == "+" || binBase->op == "-")
+                {
+                    if (auto leftCast = dynamic_cast<const CastNode*>(binBase->left.get()))
+                    {
+                        Type rt = computeExprType(binBase->right.get(), scopes, currentFunction);
+                        Type lc = leftCast->targetType;
+                        if ((lc.base == Type::STRUCT || lc.base == Type::UNION) && lc.pointerLevel == 0)
+                            lc.pointerLevel = 1;
+                        if (lc.pointerLevel > 0 && rt.pointerLevel == 0 && isIntegerScalarType(rt))
+                            return lc;
+                    }
+                }
+            }
+            return {Type::INT,0};
+        };
+
         Type bt = computeExprType(ma->baseExpr.get(), scopes, currentFunction);
+        if (ma->throughPointer && bt.pointerLevel == 0)
+        {
+            Type recovered = recoverPointerLikeType(ma->baseExpr.get());
+            if (recovered.pointerLevel > 0)
+                bt = recovered;
+        }
+        if (!ma->throughPointer && (bt.pointerLevel != 0 || (bt.base != Type::STRUCT && bt.base != Type::UNION)))
+        {
+            if (auto dn = dynamic_cast<const DereferenceNode*>(ma->baseExpr.get()))
+            {
+                Type recovered = recoverPointerLikeType(dn->operand.get());
+                if (recovered.pointerLevel > 0)
+                {
+                    recovered.pointerLevel--;
+                    bt = recovered;
+                }
+            }
+        }
         Type st = bt;
         if (ma->throughPointer)
         {
             if (st.pointerLevel > 0)
                 st.pointerLevel--;
-            else
-                st = {Type::INT, 0};
+        }
+
+        if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
+        {
+            Type inferred{Type::INT,0};
+            if (inferAggregateTypeFromMemberName(ma->memberName, inferred))
+                st = inferred;
         }
 
         if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
@@ -439,7 +534,7 @@ Type computeExprType(const ASTNode* node, const std::stack<std::map<std::string,
     }
     if (auto sl = dynamic_cast<const StructLiteralNode*>(node))
     {
-        return makeType(TOKEN_STRUCT, 0, false, false, sl->structName);
+        return makeType(sl->isUnionLiteral ? TOKEN_UNION : TOKEN_STRUCT, 0, false, false, sl->structName);
     }
     return {Type::INT,0};
 }
@@ -593,6 +688,21 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
 
     if (auto ao = dynamic_cast<const AddressOfNode*>(node))
     {
+        if (ao->operand)
+        {
+            semanticCheckExpression(ao->operand.get(), scopes, currentFunction);
+            if (auto id = dynamic_cast<const IdentifierNode*>(ao->operand.get()))
+            {
+                auto local = lookupInScopes(scopes, id->name);
+                if (local.first && local.second.isRegisterStorage)
+                {
+                    reportError(ao->line, ao->col, "Cannot take address of register-qualified variable '" + id->name + "'");
+                    hadError = true;
+                }
+            }
+            return;
+        }
+
         auto local = lookupInScopes(scopes, ao->Identifier);
         if (local.first && local.second.isRegisterStorage)
         {
@@ -611,6 +721,19 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         if (!scalar)
         {
             reportError(ln->line, ln->col, "Operator '!' requires a scalar operand");
+            hadError = true;
+        }
+        return;
+    }
+
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+    {
+        semanticCheckExpression(bn->operand.get(), scopes, currentFunction);
+        Type t = computeExprType(bn->operand.get(), scopes, currentFunction);
+        bool integerLike = (t.pointerLevel == 0) && isIntegerScalarType(t);
+        if (!integerLike)
+        {
+            reportError(bn->line, bn->col, "Operator '~' requires an integer operand");
             hadError = true;
         }
         return;
@@ -669,6 +792,30 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         Type pt = computeExprType(iasg->pointerExpr.get(), scopes, currentFunction);
         if (pt.pointerLevel == 0)
         {
+            if (auto castPtr = dynamic_cast<const CastNode*>(iasg->pointerExpr.get()))
+            {
+                Type recovered = castPtr->targetType;
+                if ((recovered.base == Type::STRUCT || recovered.base == Type::UNION) && recovered.pointerLevel == 0)
+                    recovered.pointerLevel = 1;
+                if (recovered.pointerLevel > 0)
+                    pt = recovered;
+            }
+            else if (auto binPtr = dynamic_cast<const BinaryOpNode*>(iasg->pointerExpr.get()))
+            {
+                if ((binPtr->op == "+" || binPtr->op == "-") &&
+                    dynamic_cast<const CastNode*>(binPtr->left.get()))
+                {
+                    auto leftCast = dynamic_cast<const CastNode*>(binPtr->left.get());
+                    Type recovered = leftCast->targetType;
+                    if ((recovered.base == Type::STRUCT || recovered.base == Type::UNION) && recovered.pointerLevel == 0)
+                        recovered.pointerLevel = 1;
+                    if (recovered.pointerLevel > 0)
+                        pt = recovered;
+                }
+            }
+        }
+        if (pt.pointerLevel == 0)
+        {
             reportError(iasg->line, iasg->col, "Left side of indirect assignment must be a pointer");
             hadError = true;
             return;
@@ -710,6 +857,46 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             semanticCheckExpression(arg.get(), scopes, currentFunction);
             Type t = computeExprType(arg.get(), scopes, currentFunction);
             mut->argTypes.push_back(t);
+        }
+
+        // Expression-based call target (e.g. fns[i](...)).
+        if (fc->calleeExpr)
+        {
+            semanticCheckExpression(fc->calleeExpr.get(), scopes, currentFunction);
+            Type calleeT = computeExprType(fc->calleeExpr.get(), scopes, currentFunction);
+            if (!calleeT.isFunctionPointer)
+            {
+                reportError(fc->line, fc->col, "Called expression is not a function or function pointer");
+                hadError = true;
+                return;
+            }
+            mut->isIndirect = true;
+            std::string sigKey = calleeT.functionSignatureKey;
+            if (fnPtrReturnTypes.count(sigKey))
+                mut->indirectReturnType = fnPtrReturnTypes[sigKey];
+            if (fnPtrParamTypes.count(sigKey))
+                mut->indirectParamTypes = fnPtrParamTypes[sigKey];
+            if (fnPtrVariadic.count(sigKey))
+                mut->indirectVariadic = fnPtrVariadic[sigKey];
+            if (fnPtrHasPrototype.count(sigKey))
+                mut->indirectHasPrototype = fnPtrHasPrototype[sigKey];
+
+            if (mut->indirectHasPrototype)
+            {
+                const auto& params = mut->indirectParamTypes;
+                bool variadic = mut->indirectVariadic;
+                if (!variadic && params.size() != fc->arguments.size())
+                {
+                    reportError(fc->line, fc->col, "Function call has wrong number of arguments");
+                    hadError = true;
+                }
+                else if (variadic && fc->arguments.size() < params.size())
+                {
+                    reportError(fc->line, fc->col, "Function call has too few arguments");
+                    hadError = true;
+                }
+            }
+            return;
         }
 
         bool handledByFunctionPointer = false;
@@ -869,18 +1056,70 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
 
     if (auto ma = dynamic_cast<const MemberAccessNode*>(node))
     {
+        auto recoverPointerLikeType = [&](const ASTNode* expr) -> Type
+        {
+            if (!expr) return {Type::INT,0};
+            if (auto castBase = dynamic_cast<const CastNode*>(expr))
+            {
+                if (castBase->targetType.pointerLevel > 0)
+                    return castBase->targetType;
+                if (castBase->targetType.base == Type::STRUCT || castBase->targetType.base == Type::UNION)
+                {
+                    Type promoted = castBase->targetType;
+                    promoted.pointerLevel = 1;
+                    return promoted;
+                }
+            }
+            if (auto binBase = dynamic_cast<const BinaryOpNode*>(expr))
+            {
+                if (binBase->op == "+" || binBase->op == "-")
+                {
+                    if (auto leftCast = dynamic_cast<const CastNode*>(binBase->left.get()))
+                    {
+                        Type rt = computeExprType(binBase->right.get(), scopes, currentFunction);
+                        Type lc = leftCast->targetType;
+                        if ((lc.base == Type::STRUCT || lc.base == Type::UNION) && lc.pointerLevel == 0)
+                            lc.pointerLevel = 1;
+                        if (lc.pointerLevel > 0 && rt.pointerLevel == 0 && isIntegerScalarType(rt))
+                            return lc;
+                    }
+                }
+            }
+            return {Type::INT,0};
+        };
+
         semanticCheckExpression(ma->baseExpr.get(), scopes, currentFunction);
         Type bt = computeExprType(ma->baseExpr.get(), scopes, currentFunction);
+        if (ma->throughPointer && bt.pointerLevel == 0)
+        {
+            Type recovered = recoverPointerLikeType(ma->baseExpr.get());
+            if (recovered.pointerLevel > 0)
+                bt = recovered;
+        }
+        if (!ma->throughPointer && (bt.pointerLevel != 0 || (bt.base != Type::STRUCT && bt.base != Type::UNION)))
+        {
+            if (auto dn = dynamic_cast<const DereferenceNode*>(ma->baseExpr.get()))
+            {
+                Type recovered = recoverPointerLikeType(dn->operand.get());
+                if (recovered.pointerLevel > 0)
+                {
+                    recovered.pointerLevel--;
+                    bt = recovered;
+                }
+            }
+        }
         Type st = bt;
         if (ma->throughPointer)
         {
-            if (st.pointerLevel == 0)
-            {
-                reportError(ma->line, ma->col, "Operator '->' requires a pointer operand");
-                hadError = true;
-                return;
-            }
-            st.pointerLevel--;
+            if (st.pointerLevel > 0)
+                st.pointerLevel--;
+        }
+
+        if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
+        {
+            Type inferred{Type::INT,0};
+            if (inferAggregateTypeFromMemberName(ma->memberName, inferred))
+                st = inferred;
         }
 
         if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
@@ -923,9 +1162,16 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         auto sit = structTypes.find(sl->structName);
         if (sit == structTypes.end())
         {
-            reportError(sl->line, sl->col, "Unknown struct type '" + sl->structName + "'");
+            reportError(sl->line, sl->col,
+                        std::string("Unknown ") + (sl->isUnionLiteral ? "union" : "struct") + " type '" + sl->structName + "'");
             hadError = true;
             return;
+        }
+
+        if (sl->isUnionLiteral && sl->initializers.size() > 1)
+        {
+            reportError(sl->line, sl->col, "Union initializer must contain at most one member initializer");
+            hadError = true;
         }
 
         for (const auto& init : sl->initializers)
@@ -933,7 +1179,8 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             auto member = findStructMember(sl->structName, init.first);
             if (!member)
             {
-                reportError(sl->line, sl->col, "Struct '" + sl->structName + "' has no member named '" + init.first + "'");
+                reportError(sl->line, sl->col,
+                            std::string(sl->isUnionLiteral ? "Union" : "Struct") + " '" + sl->structName + "' has no member named '" + init.first + "'");
                 hadError = true;
                 continue;
             }
@@ -943,7 +1190,7 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             if (!typesCompatible(member->type, rhs))
             {
                 reportError(sl->line, sl->col,
-                            "Type mismatch in struct initializer: cannot assign '" + rhs.toString() +
+                            "Type mismatch in " + std::string(sl->isUnionLiteral ? "union" : "struct") + " initializer: cannot assign '" + rhs.toString() +
                             "' to member '" + init.first + "' of type '" + member->type.toString() + "'");
                 hadError = true;
             }

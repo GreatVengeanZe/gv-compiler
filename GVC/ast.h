@@ -22,6 +22,10 @@ struct ASTNode
     // helper used by small call optimizations on direct string-literal arguments.
     virtual const std::string* getStringLiteralValue() const { return nullptr; }
 
+    // Emit lvalue address into rcx when the expression is addressable.
+    // Returns true on success.
+    virtual bool emitAddress(std::ofstream& f) const { (void)f; return false; }
+
     // optional compile-time size for object represented by this expression
     // (used for string-literal-backed pointers in sizeof handling)
     virtual size_t getKnownObjectSize() const { return 0; }
@@ -268,6 +272,37 @@ struct LogicalNotNode : ASTNode
     }
 };
 
+struct BitwiseNotNode : ASTNode
+{
+    std::unique_ptr<ASTNode> operand;
+    int line = 0;
+    int col = 0;
+
+    BitwiseNotNode(std::unique_ptr<ASTNode> expr, int l = 0, int c = 0)
+        : operand(std::move(expr)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        operand->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        operand->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tnot rax" << ";; Bitwise not" << std::endl;
+    }
+
+    bool isConstant() const override
+    {
+        return operand && operand->isConstant();
+    }
+
+    int getConstantValue() const override
+    {
+        return ~operand->getConstantValue();
+    }
+};
+
 struct TernaryNode : ASTNode
 {
     std::unique_ptr<ASTNode> conditionExpr;
@@ -343,6 +378,7 @@ struct FunctionCallNode : ASTNode
     mutable std::string optimizedLiteralValue;
     int line = 0;
     int col = 0;
+    std::unique_ptr<ASTNode> calleeExpr; // non-null for expression-based call targets (e.g. fns[i](...))
 
     FunctionCallNode(const std::string& name, std::vector<std::unique_ptr<ASTNode>> args, int l = 0, int c = 0)
         : functionName(name), arguments(std::move(args)), line(l), col(c) {}
@@ -403,6 +439,8 @@ struct FunctionCallNode : ASTNode
         {
             arg->emitData(f); // Emit data for string literal
         }
+        if (calleeExpr)
+            calleeExpr->emitData(f);
     }
 
     Type resolvedReturnType(bool& haveRetType) const
@@ -502,6 +540,24 @@ struct FunctionCallNode : ASTNode
                     }
                 }
 
+                // Fallback: any addressable lvalue expression (e.g. *p, obj.m, arr[i]).
+                if (srcReg != "rax")
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tpush " + srcReg) << ";; Preserve va_list source register" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Preserve va_list source" << std::endl;
+
+                if (arguments[0]->emitAddress(f))
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop r11" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rcx], r11" << ";; va_list cursor init via lvalue address" << std::endl;
+                    return true;
+                }
+
+                if (srcReg != "rax")
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tpop " + srcReg) << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << std::endl;
+
                 return false;
             };
 
@@ -564,6 +620,13 @@ struct FunctionCallNode : ASTNode
                         f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov " + dstReg + ", qword [" + globalSym + "]") << ";; load va_list cursor (global)" << std::endl;
                         return true;
                     }
+                }
+
+                // Fallback: any addressable lvalue expression that stores a va_list pointer.
+                if (arguments[0]->emitAddress(f))
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov " + dstReg + ", qword [rcx]") << ";; load va_list cursor via lvalue address" << std::endl;
+                    return true;
                 }
 
                 return false;
@@ -758,10 +821,14 @@ struct FunctionCallNode : ASTNode
             if (!abiLocations[argIndex].stackPassed)
                 continue;
 
-            arguments[argIndex]->emitCode(f);
             size_t passSize = abiLocations[argIndex].stackSize;
             if (isSmallStructValueType(passTypes[argIndex]))
             {
+                // Load struct value into rax/rdx using address if available, otherwise direct emit
+                if (arguments[argIndex]->emitAddress(f))
+                    emitLoadSmallStructFromAddress(f, passTypes[argIndex], "rcx", "stack struct arg");
+                else
+                    arguments[argIndex]->emitCode(f);
                 f << std::left << std::setw(COMMENT_COLUMN) << ("\tsub rsp, " + std::to_string(passSize)) << ";; Reserve stack space for struct argument " << argIndex << std::endl;
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rsp], rax" << ";; Store first struct arg slot" << std::endl;
                 if (passSize > 8)
@@ -769,6 +836,7 @@ struct FunctionCallNode : ASTNode
             }
             else
             {
+                arguments[argIndex]->emitCode(f);
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push argument " << argIndex << " onto stack" << std::endl;
             }
         }
@@ -797,8 +865,18 @@ struct FunctionCallNode : ASTNode
                 }
             }
 
-            // evaluate the argument expression (result in rax)
-            arguments[i]->emitCode(f);
+            // evaluate the argument expression (result in rax/rdx for structs, rax for scalars)
+            if (isSmallStructValueType(passTypes[i]))
+            {
+                if (arguments[i]->emitAddress(f))
+                    emitLoadSmallStructFromAddress(f, passTypes[i], "rcx", "struct arg");
+                else
+                    arguments[i]->emitCode(f);
+            }
+            else
+            {
+                arguments[i]->emitCode(f);
+            }
 
             // Determine argument type to pass and convert value accordingly.
             Type actual = {Type::INT,0};
@@ -868,9 +946,23 @@ struct FunctionCallNode : ASTNode
                 floatRegCount++;
                 floatRegsUsed++;
             } else {
-                std::string instruction = "\tmov " + argRegisters[abiLocations[i].intRegIndex] + ", rax";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Pass argument " << i << " in " << argRegisters[abiLocations[i].intRegIndex] << std::endl;
-                intRegsUsed++;
+                if (abiLocations[i].secondIntRegIndex != -1)
+                {
+                    // 2-register small struct: assign second reg first to avoid clobbering rdx
+                    f << std::left << std::setw(COMMENT_COLUMN)
+                      << ("\tmov " + argRegisters[abiLocations[i].secondIntRegIndex] + ", rdx")
+                      << ";; Pass struct arg " << i << " slot 1 in " << argRegisters[abiLocations[i].secondIntRegIndex] << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN)
+                      << ("\tmov " + argRegisters[abiLocations[i].intRegIndex] + ", rax")
+                      << ";; Pass struct arg " << i << " slot 0 in " << argRegisters[abiLocations[i].intRegIndex] << std::endl;
+                    intRegsUsed += 2;
+                }
+                else
+                {
+                    std::string instruction = "\tmov " + argRegisters[abiLocations[i].intRegIndex] + ", rax";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Pass argument " << i << " in " << argRegisters[abiLocations[i].intRegIndex] << std::endl;
+                    intRegsUsed++;
+                }
             }
         }
 
@@ -881,49 +973,52 @@ struct FunctionCallNode : ASTNode
         // Call the function.
         if (isIndirect)
         {
-            auto lookupResult = lookupVariable(functionName);
-            if (lookupResult.first)
+            if (calleeExpr)
             {
-                const VarInfo& vi = lookupResult.second;
-                Type vt = vi.type;
-                std::string addr;
-                if (vi.isStackParameter)
-                    addr = "[rbp + " + std::to_string(vi.index) + "]";
-                else
-                    addr = "[rbp - " + std::to_string(vi.index) + "]";
-                std::string loadInstr = loadScalarToRaxInstruction(vt, addr);
-                f << std::left << std::setw(COMMENT_COLUMN) << loadInstr << ";; Load function pointer " << functionName << std::endl;
-            }
-            else if (globalVariables.count(functionName))
-            {
-                Type gt = globalVariables[functionName];
-                std::string globalSym = globalAsmSymbol(functionName);
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global function-pointer slot" << std::endl;
-                std::string loadInstr = loadScalarToRaxInstruction(gt, "[rcx]");
-                f << std::left << std::setw(COMMENT_COLUMN) << loadInstr << ";; Load global function pointer " << functionName << std::endl;
-            }
-            else if (functionReturnTypes.count(functionName))
-            {
-                if (declaredExternalFunctions.count(functionName))
-                    referencedExternalFunctions.insert(functionName);
-                referencedRegularFunctions.insert(functionName);
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rax, [" + functionAsmSymbol(functionName) + "]" << ";; Load function address" << std::endl;
+                // Expression-based indirect call (e.g. fns[i](...)): evaluate callee, result in rax.
+                calleeExpr->emitCode(f);
             }
             else
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; unresolved function pointer" << std::endl;
+                auto lookupResult = lookupVariable(functionName);
+                if (lookupResult.first)
+                {
+                    const VarInfo& vi = lookupResult.second;
+                    Type vt = vi.type;
+                    std::string addr;
+                    if (vi.isStackParameter)
+                        addr = "[rbp + " + std::to_string(vi.index) + "]";
+                    else
+                        addr = "[rbp - " + std::to_string(vi.index) + "]";
+                    std::string loadInstr = loadScalarToRaxInstruction(vt, addr);
+                    f << std::left << std::setw(COMMENT_COLUMN) << loadInstr << ";; Load function pointer " << functionName << std::endl;
+                }
+                else if (globalVariables.count(functionName))
+                {
+                    Type gt = globalVariables[functionName];
+                    std::string globalSym = globalAsmSymbol(functionName);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global function-pointer slot" << std::endl;
+                    std::string loadInstr = loadScalarToRaxInstruction(gt, "[rcx]");
+                    f << std::left << std::setw(COMMENT_COLUMN) << loadInstr << ";; Load global function pointer " << functionName << std::endl;
+                }
+                else if (functionReturnTypes.count(functionName))
+                {
+                    if (declaredExternalFunctions.count(functionName))
+                        referencedExternalFunctions.insert(functionName);
+                    referencedRegularFunctions.insert(functionName);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rax, [" + functionAsmSymbol(functionName) + "]" << ";; Load function address" << std::endl;
+                }
+                else
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; unresolved function pointer" << std::endl;
+                }
             }
 
             f << std::left << std::setw(COMMENT_COLUMN) << "\tcall rax" << ";; Indirect function call through pointer" << std::endl;
         }
         else
         {
-            if (callFunctionName != functionName)
-            {
-                declaredExternalFunctions.insert(callFunctionName);
-                referencedExternalFunctions.insert(callFunctionName);
-            }
-            else if (declaredExternalFunctions.count(callFunctionName))
+            if (declaredExternalFunctions.count(callFunctionName))
                 referencedExternalFunctions.insert(callFunctionName);
             else
                 referencedRegularFunctions.insert(callFunctionName);
@@ -977,11 +1072,12 @@ struct FunctionNode : ASTNode
     std::vector<std::vector<size_t>> parameterDimensions; // per-parameter array dims (if declared with [])
     std::vector<std::unique_ptr<ASTNode>> body;
     bool isExternal;
+    bool isStaticLinkage; // true for file-scope static functions
     bool isPrototype; // true for declaration-only forward declarations (no body)
     bool isVariadic;  // true if declared with ...
 
-    FunctionNode(const std::string& name, Type rtype, std::vector<std::pair<Type, std::string>> params, std::vector<std::vector<size_t>> paramDims, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern, bool variadic = false, bool prototype = false, int l = 0, int c = 0)
-        : name(name), line(l), col(c), returnType(rtype), parameters(std::move(params)), parameterDimensions(std::move(paramDims)), body(std::move(body)), isExternal(isExtern), isPrototype(prototype), isVariadic(variadic) {}
+    FunctionNode(const std::string& name, Type rtype, std::vector<std::pair<Type, std::string>> params, std::vector<std::vector<size_t>> paramDims, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern, bool isStaticFn = false, bool variadic = false, bool prototype = false, int l = 0, int c = 0)
+        : name(name), line(l), col(c), returnType(rtype), parameters(std::move(params)), parameterDimensions(std::move(paramDims)), body(std::move(body)), isExternal(isExtern), isStaticLinkage(isStaticFn), isPrototype(prototype), isVariadic(variadic) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1030,7 +1126,12 @@ struct FunctionNode : ASTNode
         {
             const AbiArgLocation& loc = abiLocations[i];
             if (!loc.stackPassed && !loc.isFloat)
-                fixedGpUsed++;
+            {
+                if (loc.secondIntRegIndex != -1)
+                    fixedGpUsed += 2;
+                else
+                    fixedGpUsed++;
+            }
             if (!loc.stackPassed && loc.isFloat)
                 fixedFpUsed++;
             if (loc.stackPassed)
@@ -1118,9 +1219,22 @@ struct FunctionNode : ASTNode
                       <<  instruction << ";; Save double parameter " << i << " from " << reg << std::endl;
                 }
             } else {
-                std::string instr = "\tmov [rbp - " + std::to_string(offset) + "], " + paramRegisters[loc.intRegIndex];
-                f << std::left << std::setw(COMMENT_COLUMN) << instr
-                  << ";; Save parameter " << i << " from " << paramRegisters[loc.intRegIndex] << std::endl;
+                if (loc.secondIntRegIndex != -1)
+                {
+                    // 2-register struct: save first qword at [rbp - offset], second at [rbp - (offset-8)]
+                    std::string instr0 = "\tmov [rbp - " + std::to_string(offset) + "], " + paramRegisters[loc.intRegIndex];
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr0
+                      << ";; Save struct param " << i << " slot 0 from " << paramRegisters[loc.intRegIndex] << std::endl;
+                    std::string instr1 = "\tmov [rbp - " + std::to_string(offset - 8) + "], " + paramRegisters[loc.secondIntRegIndex];
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr1
+                      << ";; Save struct param " << i << " slot 1 from " << paramRegisters[loc.secondIntRegIndex] << std::endl;
+                }
+                else
+                {
+                    std::string instr = "\tmov [rbp - " + std::to_string(offset) + "], " + paramRegisters[loc.intRegIndex];
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr
+                      << ";; Save parameter " << i << " from " << paramRegisters[loc.intRegIndex] << std::endl;
+                }
             }
         }
 
@@ -1176,15 +1290,17 @@ struct FunctionNode : ASTNode
 struct StructLiteralNode : ASTNode
 {
     std::string structName;
+    bool isUnionLiteral = false;
     std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> initializers;
     int line = 0;
     int col = 0;
 
     StructLiteralNode(std::string name,
+                      bool isUnion,
                       std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> inits,
                       int l = 0,
                       int c = 0)
-        : structName(std::move(name)), initializers(std::move(inits)), line(l), col(c) {}
+        : structName(std::move(name)), isUnionLiteral(isUnion), initializers(std::move(inits)), line(l), col(c) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -1783,12 +1899,20 @@ struct DereferenceNode : ASTNode
         std::string instruction = loadScalarToRaxInstruction(pt, "[rax]");
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Dereference pointer" << std::endl;
     }
+
+    bool emitAddress(std::ofstream& f) const override
+    {
+        operand->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; Address through dereference" << std::endl;
+        return true;
+    }
 };
 
 
 struct AddressOfNode : ASTNode
 {
     std::string Identifier;
+    std::unique_ptr<ASTNode> operand;
     const FunctionNode* currentFunction;
     int line = 0;
     int col = 0;
@@ -1796,10 +1920,30 @@ struct AddressOfNode : ASTNode
     AddressOfNode(const std::string& id, const FunctionNode* func, int addrLine = 0, int addrCol = 0)
         : Identifier(id), currentFunction(func), line(addrLine), col(addrCol) {}
 
-    void emitData(std::ofstream& f) const override {}
+    AddressOfNode(std::unique_ptr<ASTNode> op, const FunctionNode* func, int addrLine = 0, int addrCol = 0)
+        : operand(std::move(op)), currentFunction(func), line(addrLine), col(addrCol) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        if (operand)
+            operand->emitData(f);
+    }
 
     void emitCode(std::ofstream& f) const override
     {
+        if (operand)
+        {
+            if (!operand->emitAddress(f))
+            {
+                reportError(line, col, "Address-of requires an addressable lvalue expression");
+                hadError = true;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; invalid address-of fallback" << std::endl;
+                return;
+            }
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Materialize address-of result" << std::endl;
+            return;
+        }
+
         auto lookupResult = lookupVariable(Identifier);
         bool found = lookupResult.first;
         bool isGlobal = false;
@@ -2132,7 +2276,7 @@ struct PostfixIndexNode : ASTNode
         indexExpr->emitData(f);
     }
 
-    void emitCode(std::ofstream& f) const override
+    bool emitAddress(std::ofstream& f) const override
     {
         baseExpr->emitCode(f);
         f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save base pointer" << std::endl;
@@ -2146,10 +2290,23 @@ struct PostfixIndexNode : ASTNode
               << ";; Scale index by element size" << std::endl;
         }
         f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, rax" << ";; Compute indexed address" << std::endl;
+                return true;
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        emitAddress(f);
 
         if (yieldsPointer)
         {
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Intermediate multidim index yields pointer" << std::endl;
+            return;
+        }
+
+        // Aggregate elements are passed/consumed by address in this backend.
+        if (resultType.pointerLevel == 0 && (resultType.base == Type::STRUCT || resultType.base == Type::UNION))
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Indexed aggregate element address" << std::endl;
             return;
         }
 
@@ -2205,7 +2362,7 @@ struct MemberAccessNode : ASTNode
             computeExprType(this, scopes, nullptr);
     }
 
-    void emitAddress(std::ofstream& f) const
+    bool emitAddress(std::ofstream& f) const override
     {
         ensureResolved();
         if (throughPointer)
@@ -2255,6 +2412,7 @@ struct MemberAccessNode : ASTNode
         }
 
         f << std::left << std::setw(COMMENT_COLUMN) << ("\tadd rcx, " + std::to_string(memberOffset)) << ";; Add member offset" << std::endl;
+        return true;
     }
 
     void emitCode(std::ofstream& f) const override
@@ -2421,11 +2579,12 @@ struct PostfixUpdateNode : ASTNode
     std::unique_ptr<ASTNode> target;
     std::string op;
     Type valueType{Type::INT,0};
+    bool returnOldResult = true;
     int line = 0;
     int col = 0;
 
-    PostfixUpdateNode(std::unique_ptr<ASTNode> t, std::string oper, int l = 0, int c = 0)
-        : target(std::move(t)), op(std::move(oper)), line(l), col(c) {}
+    PostfixUpdateNode(std::unique_ptr<ASTNode> t, std::string oper, int l = 0, int c = 0, bool returnOld = true)
+        : target(std::move(t)), op(std::move(oper)), returnOldResult(returnOld), line(l), col(c) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -2463,7 +2622,92 @@ struct PostfixUpdateNode : ASTNode
             t = ma->resultType;
             if (ma->isBitField)
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rax" << ";; Postfix update on bit-fields is not supported" << std::endl;
+                // rcx already == address of containing storage unit (from emitAddress above).
+                // Implement postfix read-modify-write on bit-field.
+                size_t storeSize = sizeOfType(ma->resultType);
+                // 1. Load storage unit into rax (zero-extend).
+                if (storeSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, byte [rcx]" << ";; Load bit-field storage" << std::endl;
+                else if (storeSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, word [rcx]" << ";; Load bit-field storage" << std::endl;
+                else if (storeSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov eax, dword [rcx]" << ";; Load bit-field storage" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, qword [rcx]" << ";; Load bit-field storage" << std::endl;
+                // 2. Keep a copy of the original storage word for writeback.
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, rax" << ";; Copy storage for modify" << std::endl;
+                // 3. Extract old bit-field value to rax.
+                int bfOffset = ma->bitFieldOffset;
+                int bfWidth  = ma->bitFieldWidth;
+                if (bfOffset > 0)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tshr rax, " + std::to_string(bfOffset)) << ";; Shift field to LSB" << std::endl;
+                uint64_t baseMask = (bfWidth >= 64) ? ~0ULL : ((1ULL << bfWidth) - 1ULL);
+                if (bfWidth < 64)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rax, " + std::to_string(baseMask)) << ";; Mask to field width" << std::endl;
+                // Sign-extend if signed field.
+                if (!ma->resultType.isUnsigned && ma->resultType.base != Type::CHAR && bfWidth < 64)
+                {
+                    int signShift = 64 - bfWidth;
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tshl rax, " + std::to_string(signShift)) << ";; Prepare sign extension" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tsar rax, " + std::to_string(signShift)) << ";; Sign-extend field" << std::endl;
+                }
+                // 4. Save old (sign-extended) value when postfix semantics are requested.
+                if (returnOldResult)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Preserve old bit-field value" << std::endl;
+                // 5. Compute new value.
+                if (op == "++")
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Increment bit-field" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Decrement bit-field" << std::endl;
+                // 6. Truncate new value to bit-field width.
+                if (bfWidth < 64)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rax, " + std::to_string(baseMask)) << ";; Truncate to field width" << std::endl;
+                // 7. Position bits into storage slot.
+                if (bfOffset > 0)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tshl rax, " + std::to_string(bfOffset)) << ";; Shift to storage position" << std::endl;
+                // 8. Clear old bits in storage copy and merge new bits.
+                uint64_t shiftedMask = (bfOffset == 0) ? baseMask : (baseMask << bfOffset);
+                uint64_t clearMask   = ~shiftedMask;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rdx, " + std::to_string(clearMask)) << ";; Clear old field bits" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tor  rdx, rax" << ";; Merge new field bits" << std::endl;
+                // 9. Write back.
+                if (storeSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov byte [rcx], dl" << ";; Write back storage" << std::endl;
+                else if (storeSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov word [rcx], dx" << ";; Write back storage" << std::endl;
+                else if (storeSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov dword [rcx], edx" << ";; Write back storage" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rcx], rdx" << ";; Write back storage" << std::endl;
+                if (returnOldResult)
+                {
+                    // 10. Return old value for postfix.
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Bit-field postfix result" << std::endl;
+                }
+                else
+                {
+                    // Prefix should evaluate to the updated field value.
+                    size_t loadSize = sizeOfType(ma->resultType);
+                    if (loadSize == 1)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, byte [rcx]" << ";; Reload updated bit-field storage" << std::endl;
+                    else if (loadSize == 2)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, word [rcx]" << ";; Reload updated bit-field storage" << std::endl;
+                    else if (loadSize == 4)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov eax, dword [rcx]" << ";; Reload updated bit-field storage" << std::endl;
+                    else
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, qword [rcx]" << ";; Reload updated bit-field storage" << std::endl;
+
+                    if (bfOffset > 0)
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tshr rax, " + std::to_string(bfOffset)) << ";; Align updated bit field" << std::endl;
+                    if (bfWidth < 64)
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rax, " + std::to_string(baseMask)) << ";; Mask updated bit field" << std::endl;
+                    if (!ma->resultType.isUnsigned && ma->resultType.base != Type::CHAR && bfWidth < 64)
+                    {
+                        int signShift = 64 - bfWidth;
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tshl rax, " + std::to_string(signShift)) << ";; Prepare updated sign extension" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tsar rax, " + std::to_string(signShift)) << ";; Sign-extend updated bit field" << std::endl;
+                    }
+                }
                 return;
             }
         }
@@ -2474,8 +2718,9 @@ struct PostfixUpdateNode : ASTNode
         }
 
         std::string instruction = loadScalarToRaxInstruction(t, "[rcx]");
-        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load postfix old value" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Preserve old value for expression result" << std::endl;
+        f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load update source value" << std::endl;
+        if (returnOldResult)
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Preserve old value for postfix result" << std::endl;
 
         bool isFloat = (t.pointerLevel == 0 && t.base == Type::FLOAT);
         bool isDouble = (t.pointerLevel == 0 && t.base == Type::DOUBLE);
@@ -2528,7 +2773,8 @@ struct PostfixUpdateNode : ASTNode
             instruction = "\tmov qword [rcx], rax";
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store updated postfix value" << std::endl;
 
-        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Restore old postfix result" << std::endl;
+        if (returnOldResult)
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Restore old postfix result" << std::endl;
     }
 };
 
@@ -4576,7 +4822,7 @@ struct IdentifierNode : ASTNode
             }
             else if (functionReturnTypes.find(name) != functionReturnTypes.end())
             {
-                std::string instruction = "\tlea rax, [" + name + "]";
+                std::string instruction = "\tlea rax, [" + functionAsmSymbol(name) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load function designator address " << name << std::endl;
             }
             else
@@ -4588,6 +4834,41 @@ struct IdentifierNode : ASTNode
     }
 
     const std::string* getIdentifierName() const override { return &name; }
+
+    bool emitAddress(std::ofstream& f) const override
+    {
+        auto lookupResult = lookupVariable(name);
+        if (lookupResult.first)
+        {
+            const VarInfo& info = lookupResult.second;
+            if (info.isStaticStorage)
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [" + info.uniqueName + "]") << ";; Address of static local variable" << std::endl;
+            else if (info.isStackParameter)
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp + " + std::to_string(info.index + 16) + "]") << ";; Address of stack parameter" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(info.index) + "]") << ";; Address of local variable" << std::endl;
+            return true;
+        }
+
+        auto git = globalVariables.find(name);
+        if (git != globalVariables.end())
+        {
+            std::string globalSym = globalAsmSymbol(name);
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [" + globalSym + "]") << ";; Address of global variable" << std::endl;
+            return true;
+        }
+
+        auto fit = functionReturnTypes.find(name);
+        if (fit != functionReturnTypes.end())
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [" + functionAsmSymbol(name) + "]") << ";; Address of function designator" << std::endl;
+            return true;
+        }
+
+        reportError(line, col, "Use of undefined variable '" + name + "'");
+        hadError = true;
+        return false;
+    }
 
     bool isConstant() const override
     {

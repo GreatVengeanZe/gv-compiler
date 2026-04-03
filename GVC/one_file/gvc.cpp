@@ -181,6 +181,7 @@ struct AbiArgLocation
     size_t stackSize = 0;
     size_t spillOffset = 0;
     int intRegIndex = -1;
+    int secondIntRegIndex = -1; // For small structs needing two integer registers
     int floatRegIndex = -1;
 };
 
@@ -199,10 +200,26 @@ static std::vector<AbiArgLocation> computeAbiArgLocations(const std::vector<Type
 
         if (isSmallStructValueType(types[i]))
         {
-            loc.stackPassed = true;
-            loc.stackSize = stackPassSize(types[i]);
-            loc.stackOffset = nextStackOffset;
-            nextStackOffset += loc.stackSize;
+            size_t sz = sizeOfType(types[i]);
+            int regsNeeded = (sz <= 8) ? 1 : 2;
+            if (nextIntReg + regsNeeded <= 6)
+            {
+                // Pass in integer registers per SysV AMD64 ABI
+                loc.intRegIndex = nextIntReg;
+                if (regsNeeded == 2)
+                    loc.secondIntRegIndex = nextIntReg + 1;
+                nextIntReg += regsNeeded;
+                nextSpillSlot += regsNeeded;
+                loc.spillOffset = nextSpillSlot * 8;
+            }
+            else
+            {
+                // Not enough registers; fall back to stack
+                loc.stackPassed = true;
+                loc.stackSize = stackPassSize(types[i]);
+                loc.stackOffset = nextStackOffset;
+                nextStackOffset += loc.stackSize;
+            }
         }
         else if (loc.isFloat)
         {
@@ -698,6 +715,7 @@ enum TokenType
     TOKEN_SEMICOLON,
     TOKEN_SIZEOF,
     TOKEN_NOT,
+    TOKEN_BITWISE_NOT,
     TOKEN_ASSIGN,
     TOKEN_SHORT,
     TOKEN_LONG,
@@ -789,6 +807,7 @@ std::string tokenTypeToString(TokenType t)
         case TOKEN_SEMICOLON: return ";";
         case TOKEN_ASSIGN: return "=";
         case TOKEN_NOT: return "!";
+        case TOKEN_BITWISE_NOT: return "~";
         case TOKEN_ADD: return "+";
         case TOKEN_ADD_ASSIGN: return "+=";
         case TOKEN_INCREMENT: return "++";
@@ -1605,6 +1624,12 @@ if (isdigit(ch) || (ch == '.' && isdigit(peek())))
             return Token{ TOKEN_XOR, "^", tokenLine, tokenCol };
         }
 
+        else if (ch == '~')
+        {
+            advance();
+            return Token{ TOKEN_BITWISE_NOT, "~", tokenLine, tokenCol };
+        }
+
         else if (ch == '\0')
 	    {
             return Token{ TOKEN_EOF, "", tokenLine, tokenCol };
@@ -1636,6 +1661,10 @@ struct ASTNode
 
     // helper used by small call optimizations on direct string-literal arguments.
     virtual const std::string* getStringLiteralValue() const { return nullptr; }
+
+    // Emit lvalue address into rcx when the expression is addressable.
+    // Returns true on success.
+    virtual bool emitAddress(std::ofstream& f) const { (void)f; return false; }
 
     // optional compile-time size for object represented by this expression
     // (used for string-literal-backed pointers in sizeof handling)
@@ -1886,6 +1915,37 @@ struct LogicalNotNode : ASTNode
     }
 };
 
+struct BitwiseNotNode : ASTNode
+{
+    std::unique_ptr<ASTNode> operand;
+    int line = 0;
+    int col = 0;
+
+    BitwiseNotNode(std::unique_ptr<ASTNode> expr, int l = 0, int c = 0)
+        : operand(std::move(expr)), line(l), col(c) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        operand->emitData(f);
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        operand->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tnot rax" << ";; Bitwise not" << std::endl;
+    }
+
+    bool isConstant() const override
+    {
+        return operand && operand->isConstant();
+    }
+
+    int getConstantValue() const override
+    {
+        return ~operand->getConstantValue();
+    }
+};
+
 struct TernaryNode : ASTNode
 {
     std::unique_ptr<ASTNode> conditionExpr;
@@ -1961,6 +2021,7 @@ struct FunctionCallNode : ASTNode
     mutable std::string optimizedLiteralValue;
     int line = 0;
     int col = 0;
+    std::unique_ptr<ASTNode> calleeExpr; // non-null for expression-based call targets (e.g. fns[i](...))
 
     FunctionCallNode(const std::string& name, std::vector<std::unique_ptr<ASTNode>> args, int l = 0, int c = 0)
         : functionName(name), arguments(std::move(args)), line(l), col(c) {}
@@ -2021,6 +2082,8 @@ struct FunctionCallNode : ASTNode
         {
             arg->emitData(f); // Emit data for string literal
         }
+        if (calleeExpr)
+            calleeExpr->emitData(f);
     }
 
     Type resolvedReturnType(bool& haveRetType) const
@@ -2121,6 +2184,24 @@ struct FunctionCallNode : ASTNode
                     }
                 }
 
+                // Fallback: any addressable lvalue expression (e.g. *p, obj.m, arr[i]).
+                if (srcReg != "rax")
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tpush " + srcReg) << ";; Preserve va_list source register" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Preserve va_list source" << std::endl;
+
+                if (arguments[0]->emitAddress(f))
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop r11" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rcx], r11" << ";; va_list cursor init via lvalue address" << std::endl;
+                    return true;
+                }
+
+                if (srcReg != "rax")
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tpop " + srcReg) << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << std::endl;
+
                 return false;
             };
 
@@ -2183,6 +2264,13 @@ struct FunctionCallNode : ASTNode
                         f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov " + dstReg + ", qword [" + globalSym + "]") << ";; load va_list cursor (global)" << std::endl;
                         return true;
                     }
+                }
+
+                // Fallback: any addressable lvalue expression that stores a va_list pointer.
+                if (arguments[0]->emitAddress(f))
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tmov " + dstReg + ", qword [rcx]") << ";; load va_list cursor via lvalue address" << std::endl;
+                    return true;
                 }
 
                 return false;
@@ -2371,10 +2459,14 @@ struct FunctionCallNode : ASTNode
             if (!abiLocations[argIndex].stackPassed)
                 continue;
 
-            arguments[argIndex]->emitCode(f);
             size_t passSize = abiLocations[argIndex].stackSize;
             if (isSmallStructValueType(passTypes[argIndex]))
             {
+                // Load struct value into rax/rdx using address if available, otherwise direct emit
+                if (arguments[argIndex]->emitAddress(f))
+                    emitLoadSmallStructFromAddress(f, passTypes[argIndex], "rcx", "stack struct arg");
+                else
+                    arguments[argIndex]->emitCode(f);
                 f << std::left << std::setw(COMMENT_COLUMN) << ("\tsub rsp, " + std::to_string(passSize)) << ";; Reserve stack space for struct argument " << argIndex << std::endl;
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tmov [rsp], rax" << ";; Store first struct arg slot" << std::endl;
                 if (passSize > 8)
@@ -2382,6 +2474,7 @@ struct FunctionCallNode : ASTNode
             }
             else
             {
+                arguments[argIndex]->emitCode(f);
                 f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Push argument " << argIndex << " onto stack" << std::endl;
             }
         }
@@ -2410,8 +2503,18 @@ struct FunctionCallNode : ASTNode
                 }
             }
 
-            // evaluate the argument expression (result in rax)
-            arguments[i]->emitCode(f);
+            // evaluate the argument expression (result in rax/rdx for structs, rax for scalars)
+            if (isSmallStructValueType(passTypes[i]))
+            {
+                if (arguments[i]->emitAddress(f))
+                    emitLoadSmallStructFromAddress(f, passTypes[i], "rcx", "struct arg");
+                else
+                    arguments[i]->emitCode(f);
+            }
+            else
+            {
+                arguments[i]->emitCode(f);
+            }
 
             // Determine argument type to pass and convert value accordingly.
             Type actual = {Type::INT,0};
@@ -2481,9 +2584,23 @@ struct FunctionCallNode : ASTNode
                 floatRegCount++;
                 floatRegsUsed++;
             } else {
-                std::string instruction = "\tmov " + argRegisters[abiLocations[i].intRegIndex] + ", rax";
-                f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Pass argument " << i << " in " << argRegisters[abiLocations[i].intRegIndex] << std::endl;
-                intRegsUsed++;
+                if (abiLocations[i].secondIntRegIndex != -1)
+                {
+                    // 2-register small struct: assign second reg first to avoid clobbering rdx
+                    f << std::left << std::setw(COMMENT_COLUMN)
+                      << ("\tmov " + argRegisters[abiLocations[i].secondIntRegIndex] + ", rdx")
+                      << ";; Pass struct arg " << i << " slot 1 in " << argRegisters[abiLocations[i].secondIntRegIndex] << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN)
+                      << ("\tmov " + argRegisters[abiLocations[i].intRegIndex] + ", rax")
+                      << ";; Pass struct arg " << i << " slot 0 in " << argRegisters[abiLocations[i].intRegIndex] << std::endl;
+                    intRegsUsed += 2;
+                }
+                else
+                {
+                    std::string instruction = "\tmov " + argRegisters[abiLocations[i].intRegIndex] + ", rax";
+                    f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Pass argument " << i << " in " << argRegisters[abiLocations[i].intRegIndex] << std::endl;
+                    intRegsUsed++;
+                }
             }
         }
 
@@ -2494,49 +2611,52 @@ struct FunctionCallNode : ASTNode
         // Call the function.
         if (isIndirect)
         {
-            auto lookupResult = lookupVariable(functionName);
-            if (lookupResult.first)
+            if (calleeExpr)
             {
-                const VarInfo& vi = lookupResult.second;
-                Type vt = vi.type;
-                std::string addr;
-                if (vi.isStackParameter)
-                    addr = "[rbp + " + std::to_string(vi.index) + "]";
-                else
-                    addr = "[rbp - " + std::to_string(vi.index) + "]";
-                std::string loadInstr = loadScalarToRaxInstruction(vt, addr);
-                f << std::left << std::setw(COMMENT_COLUMN) << loadInstr << ";; Load function pointer " << functionName << std::endl;
-            }
-            else if (globalVariables.count(functionName))
-            {
-                Type gt = globalVariables[functionName];
-                std::string globalSym = globalAsmSymbol(functionName);
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global function-pointer slot" << std::endl;
-                std::string loadInstr = loadScalarToRaxInstruction(gt, "[rcx]");
-                f << std::left << std::setw(COMMENT_COLUMN) << loadInstr << ";; Load global function pointer " << functionName << std::endl;
-            }
-            else if (functionReturnTypes.count(functionName))
-            {
-                if (declaredExternalFunctions.count(functionName))
-                    referencedExternalFunctions.insert(functionName);
-                referencedRegularFunctions.insert(functionName);
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rax, [" + functionAsmSymbol(functionName) + "]" << ";; Load function address" << std::endl;
+                // Expression-based indirect call (e.g. fns[i](...)): evaluate callee, result in rax.
+                calleeExpr->emitCode(f);
             }
             else
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; unresolved function pointer" << std::endl;
+                auto lookupResult = lookupVariable(functionName);
+                if (lookupResult.first)
+                {
+                    const VarInfo& vi = lookupResult.second;
+                    Type vt = vi.type;
+                    std::string addr;
+                    if (vi.isStackParameter)
+                        addr = "[rbp + " + std::to_string(vi.index) + "]";
+                    else
+                        addr = "[rbp - " + std::to_string(vi.index) + "]";
+                    std::string loadInstr = loadScalarToRaxInstruction(vt, addr);
+                    f << std::left << std::setw(COMMENT_COLUMN) << loadInstr << ";; Load function pointer " << functionName << std::endl;
+                }
+                else if (globalVariables.count(functionName))
+                {
+                    Type gt = globalVariables[functionName];
+                    std::string globalSym = globalAsmSymbol(functionName);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rcx, [" + globalSym + "]" << ";; Load global function-pointer slot" << std::endl;
+                    std::string loadInstr = loadScalarToRaxInstruction(gt, "[rcx]");
+                    f << std::left << std::setw(COMMENT_COLUMN) << loadInstr << ";; Load global function pointer " << functionName << std::endl;
+                }
+                else if (functionReturnTypes.count(functionName))
+                {
+                    if (declaredExternalFunctions.count(functionName))
+                        referencedExternalFunctions.insert(functionName);
+                    referencedRegularFunctions.insert(functionName);
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tlea rax, [" + functionAsmSymbol(functionName) + "]" << ";; Load function address" << std::endl;
+                }
+                else
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; unresolved function pointer" << std::endl;
+                }
             }
 
             f << std::left << std::setw(COMMENT_COLUMN) << "\tcall rax" << ";; Indirect function call through pointer" << std::endl;
         }
         else
         {
-            if (callFunctionName != functionName)
-            {
-                declaredExternalFunctions.insert(callFunctionName);
-                referencedExternalFunctions.insert(callFunctionName);
-            }
-            else if (declaredExternalFunctions.count(callFunctionName))
+            if (declaredExternalFunctions.count(callFunctionName))
                 referencedExternalFunctions.insert(callFunctionName);
             else
                 referencedRegularFunctions.insert(callFunctionName);
@@ -2590,11 +2710,12 @@ struct FunctionNode : ASTNode
     std::vector<std::vector<size_t>> parameterDimensions; // per-parameter array dims (if declared with [])
     std::vector<std::unique_ptr<ASTNode>> body;
     bool isExternal;
+    bool isStaticLinkage; // true for file-scope static functions
     bool isPrototype; // true for declaration-only forward declarations (no body)
     bool isVariadic;  // true if declared with ...
 
-    FunctionNode(const std::string& name, Type rtype, std::vector<std::pair<Type, std::string>> params, std::vector<std::vector<size_t>> paramDims, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern, bool variadic = false, bool prototype = false, int l = 0, int c = 0)
-        : name(name), line(l), col(c), returnType(rtype), parameters(std::move(params)), parameterDimensions(std::move(paramDims)), body(std::move(body)), isExternal(isExtern), isPrototype(prototype), isVariadic(variadic) {}
+    FunctionNode(const std::string& name, Type rtype, std::vector<std::pair<Type, std::string>> params, std::vector<std::vector<size_t>> paramDims, std::vector<std::unique_ptr<ASTNode>> body, bool isExtern, bool isStaticFn = false, bool variadic = false, bool prototype = false, int l = 0, int c = 0)
+        : name(name), line(l), col(c), returnType(rtype), parameters(std::move(params)), parameterDimensions(std::move(paramDims)), body(std::move(body)), isExternal(isExtern), isStaticLinkage(isStaticFn), isPrototype(prototype), isVariadic(variadic) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -2643,7 +2764,12 @@ struct FunctionNode : ASTNode
         {
             const AbiArgLocation& loc = abiLocations[i];
             if (!loc.stackPassed && !loc.isFloat)
-                fixedGpUsed++;
+            {
+                if (loc.secondIntRegIndex != -1)
+                    fixedGpUsed += 2;
+                else
+                    fixedGpUsed++;
+            }
             if (!loc.stackPassed && loc.isFloat)
                 fixedFpUsed++;
             if (loc.stackPassed)
@@ -2726,9 +2852,22 @@ struct FunctionNode : ASTNode
                       <<  instruction << ";; Save double parameter " << i << " from " << reg << std::endl;
                 }
             } else {
-                std::string instr = "\tmov [rbp - " + std::to_string(offset) + "], " + paramRegisters[loc.intRegIndex];
-                f << std::left << std::setw(COMMENT_COLUMN) << instr
-                  << ";; Save parameter " << i << " from " << paramRegisters[loc.intRegIndex] << std::endl;
+                if (loc.secondIntRegIndex != -1)
+                {
+                    // 2-register struct: save first qword at [rbp - offset], second at [rbp - (offset-8)]
+                    std::string instr0 = "\tmov [rbp - " + std::to_string(offset) + "], " + paramRegisters[loc.intRegIndex];
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr0
+                      << ";; Save struct param " << i << " slot 0 from " << paramRegisters[loc.intRegIndex] << std::endl;
+                    std::string instr1 = "\tmov [rbp - " + std::to_string(offset - 8) + "], " + paramRegisters[loc.secondIntRegIndex];
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr1
+                      << ";; Save struct param " << i << " slot 1 from " << paramRegisters[loc.secondIntRegIndex] << std::endl;
+                }
+                else
+                {
+                    std::string instr = "\tmov [rbp - " + std::to_string(offset) + "], " + paramRegisters[loc.intRegIndex];
+                    f << std::left << std::setw(COMMENT_COLUMN) << instr
+                      << ";; Save parameter " << i << " from " << paramRegisters[loc.intRegIndex] << std::endl;
+                }
             }
         }
 
@@ -2784,15 +2923,17 @@ struct FunctionNode : ASTNode
 struct StructLiteralNode : ASTNode
 {
     std::string structName;
+    bool isUnionLiteral = false;
     std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> initializers;
     int line = 0;
     int col = 0;
 
     StructLiteralNode(std::string name,
+                      bool isUnion,
                       std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> inits,
                       int l = 0,
                       int c = 0)
-        : structName(std::move(name)), initializers(std::move(inits)), line(l), col(c) {}
+        : structName(std::move(name)), isUnionLiteral(isUnion), initializers(std::move(inits)), line(l), col(c) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -3388,12 +3529,20 @@ struct DereferenceNode : ASTNode
         std::string instruction = loadScalarToRaxInstruction(pt, "[rax]");
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Dereference pointer" << std::endl;
     }
+
+    bool emitAddress(std::ofstream& f) const override
+    {
+        operand->emitCode(f);
+        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rcx, rax" << ";; Address through dereference" << std::endl;
+        return true;
+    }
 };
 
 
 struct AddressOfNode : ASTNode
 {
     std::string Identifier;
+    std::unique_ptr<ASTNode> operand;
     const FunctionNode* currentFunction;
     int line = 0;
     int col = 0;
@@ -3401,10 +3550,30 @@ struct AddressOfNode : ASTNode
     AddressOfNode(const std::string& id, const FunctionNode* func, int addrLine = 0, int addrCol = 0)
         : Identifier(id), currentFunction(func), line(addrLine), col(addrCol) {}
 
-    void emitData(std::ofstream& f) const override {}
+    AddressOfNode(std::unique_ptr<ASTNode> op, const FunctionNode* func, int addrLine = 0, int addrCol = 0)
+        : operand(std::move(op)), currentFunction(func), line(addrLine), col(addrCol) {}
+
+    void emitData(std::ofstream& f) const override
+    {
+        if (operand)
+            operand->emitData(f);
+    }
 
     void emitCode(std::ofstream& f) const override
     {
+        if (operand)
+        {
+            if (!operand->emitAddress(f))
+            {
+                reportError(line, col, "Address-of requires an addressable lvalue expression");
+                hadError = true;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, 0" << ";; invalid address-of fallback" << std::endl;
+                return;
+            }
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Materialize address-of result" << std::endl;
+            return;
+        }
+
         auto lookupResult = lookupVariable(Identifier);
         bool found = lookupResult.first;
         bool isGlobal = false;
@@ -3737,7 +3906,7 @@ struct PostfixIndexNode : ASTNode
         indexExpr->emitData(f);
     }
 
-    void emitCode(std::ofstream& f) const override
+    bool emitAddress(std::ofstream& f) const override
     {
         baseExpr->emitCode(f);
         f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Save base pointer" << std::endl;
@@ -3751,10 +3920,23 @@ struct PostfixIndexNode : ASTNode
               << ";; Scale index by element size" << std::endl;
         }
         f << std::left << std::setw(COMMENT_COLUMN) << "\tadd rcx, rax" << ";; Compute indexed address" << std::endl;
+                return true;
+    }
+
+    void emitCode(std::ofstream& f) const override
+    {
+        emitAddress(f);
 
         if (yieldsPointer)
         {
             f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Intermediate multidim index yields pointer" << std::endl;
+            return;
+        }
+
+        // Aggregate elements are passed/consumed by address in this backend.
+        if (resultType.pointerLevel == 0 && (resultType.base == Type::STRUCT || resultType.base == Type::UNION))
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, rcx" << ";; Indexed aggregate element address" << std::endl;
             return;
         }
 
@@ -3810,7 +3992,7 @@ struct MemberAccessNode : ASTNode
             computeExprType(this, scopes, nullptr);
     }
 
-    void emitAddress(std::ofstream& f) const
+    bool emitAddress(std::ofstream& f) const override
     {
         ensureResolved();
         if (throughPointer)
@@ -3860,6 +4042,7 @@ struct MemberAccessNode : ASTNode
         }
 
         f << std::left << std::setw(COMMENT_COLUMN) << ("\tadd rcx, " + std::to_string(memberOffset)) << ";; Add member offset" << std::endl;
+        return true;
     }
 
     void emitCode(std::ofstream& f) const override
@@ -4026,11 +4209,12 @@ struct PostfixUpdateNode : ASTNode
     std::unique_ptr<ASTNode> target;
     std::string op;
     Type valueType{Type::INT,0};
+    bool returnOldResult = true;
     int line = 0;
     int col = 0;
 
-    PostfixUpdateNode(std::unique_ptr<ASTNode> t, std::string oper, int l = 0, int c = 0)
-        : target(std::move(t)), op(std::move(oper)), line(l), col(c) {}
+    PostfixUpdateNode(std::unique_ptr<ASTNode> t, std::string oper, int l = 0, int c = 0, bool returnOld = true)
+        : target(std::move(t)), op(std::move(oper)), returnOldResult(returnOld), line(l), col(c) {}
 
     void emitData(std::ofstream& f) const override
     {
@@ -4068,7 +4252,80 @@ struct PostfixUpdateNode : ASTNode
             t = ma->resultType;
             if (ma->isBitField)
             {
-                f << std::left << std::setw(COMMENT_COLUMN) << "\txor rax, rax" << ";; Postfix update on bit-fields is not supported" << std::endl;
+                // rcx already == address of containing storage unit (from emitAddress above).
+                // Implement postfix read-modify-write on bit-field.
+                size_t storeSize = sizeOfType(ma->resultType);
+                if (storeSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, byte [rcx]" << ";; Load bit-field storage" << std::endl;
+                else if (storeSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, word [rcx]" << ";; Load bit-field storage" << std::endl;
+                else if (storeSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov eax, dword [rcx]" << ";; Load bit-field storage" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, qword [rcx]" << ";; Load bit-field storage" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rdx, rax" << ";; Copy storage for modify" << std::endl;
+                int bfOffset = ma->bitFieldOffset;
+                int bfWidth  = ma->bitFieldWidth;
+                if (bfOffset > 0)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tshr rax, " + std::to_string(bfOffset)) << ";; Shift field to LSB" << std::endl;
+                uint64_t baseMask = (bfWidth >= 64) ? ~0ULL : ((1ULL << bfWidth) - 1ULL);
+                if (bfWidth < 64)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rax, " + std::to_string(baseMask)) << ";; Mask to field width" << std::endl;
+                if (!ma->resultType.isUnsigned && ma->resultType.base != Type::CHAR && bfWidth < 64)
+                {
+                    int signShift = 64 - bfWidth;
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tshl rax, " + std::to_string(signShift)) << ";; Prepare sign extension" << std::endl;
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tsar rax, " + std::to_string(signShift)) << ";; Sign-extend field" << std::endl;
+                }
+                if (returnOldResult)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Preserve old bit-field value" << std::endl;
+                if (op == "++")
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tinc rax" << ";; Increment bit-field" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tdec rax" << ";; Decrement bit-field" << std::endl;
+                if (bfWidth < 64)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rax, " + std::to_string(baseMask)) << ";; Truncate to field width" << std::endl;
+                if (bfOffset > 0)
+                    f << std::left << std::setw(COMMENT_COLUMN) << ("\tshl rax, " + std::to_string(bfOffset)) << ";; Shift to storage position" << std::endl;
+                uint64_t shiftedMask = (bfOffset == 0) ? baseMask : (baseMask << bfOffset);
+                uint64_t clearMask   = ~shiftedMask;
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rdx, " + std::to_string(clearMask)) << ";; Clear old field bits" << std::endl;
+                f << std::left << std::setw(COMMENT_COLUMN) << "\tor  rdx, rax" << ";; Merge new field bits" << std::endl;
+                if (storeSize == 1)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov byte [rcx], dl" << ";; Write back storage" << std::endl;
+                else if (storeSize == 2)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov word [rcx], dx" << ";; Write back storage" << std::endl;
+                else if (storeSize == 4)
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov dword [rcx], edx" << ";; Write back storage" << std::endl;
+                else
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tmov qword [rcx], rdx" << ";; Write back storage" << std::endl;
+                if (returnOldResult)
+                {
+                    f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Bit-field postfix result" << std::endl;
+                }
+                else
+                {
+                    size_t loadSize = sizeOfType(ma->resultType);
+                    if (loadSize == 1)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, byte [rcx]" << ";; Reload updated bit-field storage" << std::endl;
+                    else if (loadSize == 2)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmovzx eax, word [rcx]" << ";; Reload updated bit-field storage" << std::endl;
+                    else if (loadSize == 4)
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov eax, dword [rcx]" << ";; Reload updated bit-field storage" << std::endl;
+                    else
+                        f << std::left << std::setw(COMMENT_COLUMN) << "\tmov rax, qword [rcx]" << ";; Reload updated bit-field storage" << std::endl;
+
+                    if (bfOffset > 0)
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tshr rax, " + std::to_string(bfOffset)) << ";; Align updated bit field" << std::endl;
+                    if (bfWidth < 64)
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tand rax, " + std::to_string(baseMask)) << ";; Mask updated bit field" << std::endl;
+                    if (!ma->resultType.isUnsigned && ma->resultType.base != Type::CHAR && bfWidth < 64)
+                    {
+                        int signShift = 64 - bfWidth;
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tshl rax, " + std::to_string(signShift)) << ";; Prepare updated sign extension" << std::endl;
+                        f << std::left << std::setw(COMMENT_COLUMN) << ("\tsar rax, " + std::to_string(signShift)) << ";; Sign-extend updated bit field" << std::endl;
+                    }
+                }
                 return;
             }
         }
@@ -4080,7 +4337,8 @@ struct PostfixUpdateNode : ASTNode
 
         std::string instruction = loadScalarToRaxInstruction(t, "[rcx]");
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load postfix old value" << std::endl;
-        f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Preserve old value for expression result" << std::endl;
+        if (returnOldResult)
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tpush rax" << ";; Preserve old value for postfix result" << std::endl;
 
         bool isFloat = (t.pointerLevel == 0 && t.base == Type::FLOAT);
         bool isDouble = (t.pointerLevel == 0 && t.base == Type::DOUBLE);
@@ -4133,7 +4391,8 @@ struct PostfixUpdateNode : ASTNode
             instruction = "\tmov qword [rcx], rax";
         f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Store updated postfix value" << std::endl;
 
-        f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Restore old postfix result" << std::endl;
+        if (returnOldResult)
+            f << std::left << std::setw(COMMENT_COLUMN) << "\tpop rax" << ";; Restore old postfix result" << std::endl;
     }
 };
 
@@ -6182,7 +6441,7 @@ struct IdentifierNode : ASTNode
             }
             else if (functionReturnTypes.find(name) != functionReturnTypes.end())
             {
-                std::string instruction = "\tlea rax, [" + name + "]";
+                std::string instruction = "\tlea rax, [" + functionAsmSymbol(name) + "]";
                 f << std::left << std::setw(COMMENT_COLUMN) << instruction << ";; Load function designator address " << name << std::endl;
             }
             else
@@ -6194,6 +6453,41 @@ struct IdentifierNode : ASTNode
     }
 
     const std::string* getIdentifierName() const override { return &name; }
+
+    bool emitAddress(std::ofstream& f) const override
+    {
+        auto lookupResult = lookupVariable(name);
+        if (lookupResult.first)
+        {
+            const VarInfo& info = lookupResult.second;
+            if (info.isStaticStorage)
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [" + info.uniqueName + "]") << ";; Address of static local variable" << std::endl;
+            else if (info.isStackParameter)
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp + " + std::to_string(info.index + 16) + "]") << ";; Address of stack parameter" << std::endl;
+            else
+                f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [rbp - " + std::to_string(info.index) + "]") << ";; Address of local variable" << std::endl;
+            return true;
+        }
+
+        auto git = globalVariables.find(name);
+        if (git != globalVariables.end())
+        {
+            std::string globalSym = globalAsmSymbol(name);
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [" + globalSym + "]") << ";; Address of global variable" << std::endl;
+            return true;
+        }
+
+        auto fit = functionReturnTypes.find(name);
+        if (fit != functionReturnTypes.end())
+        {
+            f << std::left << std::setw(COMMENT_COLUMN) << ("\tlea rcx, [" + functionAsmSymbol(name) + "]") << ";; Address of function designator" << std::endl;
+            return true;
+        }
+
+        reportError(line, col, "Use of undefined variable '" + name + "'");
+        hadError = true;
+        return false;
+    }
 
     bool isConstant() const override
     {
@@ -6391,7 +6685,8 @@ class Parser
                                         std::string* nameOut,
                                         Type& outType,
                                         int* nameLineOut = nullptr,
-                                        int* nameColOut = nullptr)
+                                        int* nameColOut = nullptr,
+                                        std::vector<size_t>* dimsOut = nullptr)
     {
         if (currentToken.type != TOKEN_LPAREN)
             return false;
@@ -6427,6 +6722,25 @@ class Parser
                 eat(TOKEN_IDENTIFIER);
         }
 
+        while (currentToken.type == TOKEN_LBRACKET)
+        {
+            eat(TOKEN_LBRACKET);
+            size_t dim = 0;
+            if (currentToken.type == TOKEN_NUMBER)
+            {
+                dim = std::stoul(currentToken.value);
+                eat(TOKEN_NUMBER);
+            }
+            else if (currentToken.type != TOKEN_RBRACKET)
+            {
+                reportError(currentToken.line, currentToken.col,
+                            "Expected constant array size in function pointer array declarator");
+                hadError = true;
+            }
+            eat(TOKEN_RBRACKET);
+            if (dimsOut)
+                dimsOut->push_back(dim);
+        }
         eat(TOKEN_RPAREN);
 
         std::vector<Type> paramTypes;
@@ -6469,6 +6783,8 @@ class Parser
         }
         if (auto ln = dynamic_cast<const LogicalNotNode*>(node))
             return std::make_unique<LogicalNotNode>(cloneExpr(ln->operand.get(), currentFunction), ln->line, ln->col);
+        if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+            return std::make_unique<BitwiseNotNode>(cloneExpr(bn->operand.get(), currentFunction), bn->line, bn->col);
         if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
             return std::make_unique<BinaryOpNode>(bin->op, cloneExpr(bin->left.get(), currentFunction), cloneExpr(bin->right.get(), currentFunction));
         if (auto lor = dynamic_cast<const LogicalOrNode*>(node))
@@ -6512,7 +6828,7 @@ class Parser
             std::vector<std::pair<std::string, std::unique_ptr<ASTNode>>> inits;
             for (const auto& init : sl->initializers)
                 inits.push_back({init.first, cloneExpr(init.second.get(), currentFunction)});
-            return std::make_unique<StructLiteralNode>(sl->structName, std::move(inits), sl->line, sl->col);
+            return std::make_unique<StructLiteralNode>(sl->structName, sl->isUnionLiteral, std::move(inits), sl->line, sl->col);
         }
         if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
         {
@@ -6533,12 +6849,31 @@ class Parser
         if (auto dn = dynamic_cast<const DereferenceNode*>(node))
             return std::make_unique<DereferenceNode>(cloneExpr(dn->operand.get(), currentFunction), currentFunction);
         if (auto ao = dynamic_cast<const AddressOfNode*>(node))
+        {
+            if (ao->operand)
+                return std::make_unique<AddressOfNode>(cloneExpr(ao->operand.get(), currentFunction), currentFunction, ao->line, ao->col);
             return std::make_unique<AddressOfNode>(ao->Identifier, currentFunction, ao->line, ao->col);
+        }
         if (auto so = dynamic_cast<const SizeofNode*>(node))
         {
             if (so->isType)
                 return std::make_unique<SizeofNode>(so->typeOperand, currentFunction);
             return std::make_unique<SizeofNode>(cloneExpr(so->expr.get(), currentFunction), currentFunction);
+        }
+        if (auto cast = dynamic_cast<const CastNode*>(node))
+            return std::make_unique<CastNode>(cast->targetType, cloneExpr(cast->operand.get(), currentFunction), cast->line, cast->col, currentFunction);
+        if (auto asg = dynamic_cast<const AssignmentNode*>(node))
+        {
+            std::vector<std::unique_ptr<ASTNode>> idx;
+            for (const auto& i : asg->indices)
+                idx.push_back(cloneExpr(i.get(), currentFunction));
+            return std::make_unique<AssignmentNode>(asg->identifier, cloneExpr(asg->expression.get(), currentFunction), asg->dereferenceLevel, std::move(idx), asg->line, asg->col);
+        }
+        if (auto iasg = dynamic_cast<const IndirectAssignmentNode*>(node))
+        {
+            auto cloned = std::make_unique<IndirectAssignmentNode>(cloneExpr(iasg->pointerExpr.get(), currentFunction), cloneExpr(iasg->expression.get(), currentFunction), 0, iasg->col);
+            cloned->valueType = iasg->valueType;
+            return cloned;
         }
         return std::make_unique<NumberNode>(0);
     }
@@ -7221,6 +7556,7 @@ class Parser
     }
 
     std::unique_ptr<ASTNode> parseStructInitializerBody(const std::string& structName,
+                                                        bool isUnionLiteral,
                                                         int startLine,
                                                         int startCol,
                                                         const FunctionNode* currentFunction = nullptr)
@@ -7232,7 +7568,7 @@ class Parser
         auto sit = structTypes.find(structName);
         if (sit == structTypes.end())
         {
-            reportError(startLine, startCol, "Unknown struct type '" + structName + "'");
+            reportError(startLine, startCol, std::string("Unknown ") + (isUnionLiteral ? "union" : "struct") + " type '" + structName + "'");
             hadError = true;
         }
 
@@ -7244,7 +7580,7 @@ class Parser
                 eat(TOKEN_DOT);
                 if (currentToken.type != TOKEN_IDENTIFIER)
                 {
-                    reportError(currentToken.line, currentToken.col, "Expected member name after '.' in struct initializer");
+                    reportError(currentToken.line, currentToken.col, std::string("Expected member name after '.' in ") + (isUnionLiteral ? "union" : "struct") + " initializer");
                     hadError = true;
                     break;
                 }
@@ -7254,9 +7590,15 @@ class Parser
             }
             else
             {
-                if (sit != structTypes.end() && positionalIndex < sit->second.members.size())
-                    memberName = sit->second.members[positionalIndex].name;
-                ++positionalIndex;
+                if (sit != structTypes.end() && !sit->second.members.empty())
+                {
+                    if (isUnionLiteral)
+                        memberName = sit->second.members[0].name;
+                    else if (positionalIndex < sit->second.members.size())
+                        memberName = sit->second.members[positionalIndex].name;
+                }
+                if (!isUnionLiteral)
+                    ++positionalIndex;
             }
 
             auto expr = assignmentExpression(currentFunction);
@@ -7268,7 +7610,7 @@ class Parser
         }
 
         eat(TOKEN_RBRACE);
-        return std::make_unique<StructLiteralNode>(structName, std::move(initializers), startLine, startCol);
+        return std::make_unique<StructLiteralNode>(structName, isUnionLiteral, std::move(initializers), startLine, startCol);
     }
 
     std::unique_ptr<ASTNode> parseStructCompoundLiteral(const FunctionNode* currentFunction = nullptr)
@@ -7289,14 +7631,15 @@ class Parser
 
         eat(TOKEN_RPAREN);
 
-        if (typeTok != TOKEN_STRUCT || ptrLevel != 0 || currentToken.type != TOKEN_LBRACE)
+        bool isAggregateType = (typeTok == TOKEN_STRUCT || typeTok == TOKEN_UNION);
+        if (!isAggregateType || ptrLevel != 0 || currentToken.type != TOKEN_LBRACE)
         {
-            reportError(openParen.line, openParen.col, "Only struct compound literals are supported in this context");
+            reportError(openParen.line, openParen.col, "Only struct/union compound literals are supported in this context");
             hadError = true;
             return std::make_unique<NumberNode>(0);
         }
 
-        return parseStructInitializerBody(structName, openParen.line, openParen.col, currentFunction);
+        return parseStructInitializerBody(structName, typeTok == TOKEN_UNION, openParen.line, openParen.col, currentFunction);
     }
 
 
@@ -7359,9 +7702,11 @@ class Parser
 
                     if (calleeName.empty())
                     {
-                        reportError(l, c, "Unsupported call target expression");
-                        hadError = true;
-                        node = std::make_unique<NumberNode>(0);
+                        // Expression-based callee (e.g. fns[i](...)) — build call node
+                        // with calleeExpr so the semantic pass can resolve the type.
+                        auto callNode = std::make_unique<FunctionCallNode>("", std::move(arguments), l, c);
+                        callNode->calleeExpr = std::move(node);
+                        node = std::move(callNode);
                     }
                     else
                     {
@@ -7411,10 +7756,21 @@ class Parser
         if (token.type == TOKEN_INCREMENT || token.type == TOKEN_DECREMENT)
         {
             eat(token.type); // Consume the operator
-            Token idToken = currentToken;
-            std::string identifier = idToken.value;
-            eat(TOKEN_IDENTIFIER); // Consume the identifier
-            return std::make_unique<UnaryOpNode>(token.value, identifier, true, idToken.line, idToken.col); // true for prefix
+            auto target = factor(currentFunction);
+
+            if (auto id = dynamic_cast<IdentifierNode*>(target.get()))
+                return std::make_unique<UnaryOpNode>(token.value, id->name, true, id->line, id->col);
+
+            bool lvalueLike = dynamic_cast<MemberAccessNode*>(target.get()) ||
+                             dynamic_cast<DereferenceNode*>(target.get());
+            if (!lvalueLike)
+            {
+                reportError(token.line, token.col, "Prefix ++/-- requires an assignable identifier, member, or dereference expression");
+                hadError = true;
+                return std::make_unique<NumberNode>(0);
+            }
+
+            return std::make_unique<PostfixUpdateNode>(std::move(target), token.value, token.line, token.col, false);
         }
 
         // sizeof operator
@@ -7423,27 +7779,25 @@ class Parser
             eat(TOKEN_SIZEOF);
             if (currentToken.type == TOKEN_LPAREN)
             {
+                // sizeof can take either a parenthesized type-name or any unary
+                // expression. Detect type-name using one-token lookahead after '('.
+                Token afterLParen = lexer.peekToken();
+                bool sawType = startsTypeSpecifier(afterLParen);
+                if (!sawType)
+                {
+                    auto exprNode = factor(currentFunction);
+                    return std::make_unique<SizeofNode>(std::move(exprNode), currentFunction);
+                }
+
                 eat(TOKEN_LPAREN);
-                // attempt to parse a type-name sequence as for declarations
-                bool sawType = startsTypeSpecifier(currentToken);
                 TokenType tt = TOKEN_INT;
                 bool sawUnsigned = false;
                 std::string sizeofStructName;
-                if (sawType)
-                    tt = parseTypeSpecifiers(sawUnsigned, &sizeofStructName);
-                if (sawType)
-                {
-                    int ptrLevel = parsePointerDeclaratorLevel();
-                    Type t = makeType(tt, ptrLevel, sawUnsigned, false, sizeofStructName);
-                    eat(TOKEN_RPAREN);
-                    return std::make_unique<SizeofNode>(t, currentFunction);
-                }
-                else
-                {
-                    auto exprNode = condition(currentFunction);
-                    eat(TOKEN_RPAREN);
-                    return std::make_unique<SizeofNode>(std::move(exprNode), currentFunction);
-                }
+                tt = parseTypeSpecifiers(sawUnsigned, &sizeofStructName);
+                int ptrLevel = parsePointerDeclaratorLevel();
+                Type t = makeType(tt, ptrLevel, sawUnsigned, false, sizeofStructName);
+                eat(TOKEN_RPAREN);
+                return std::make_unique<SizeofNode>(t, currentFunction);
             }
             else
             {
@@ -7458,6 +7812,13 @@ class Parser
             eat(TOKEN_NOT);
             auto operand = factor(currentFunction);
             return std::make_unique<LogicalNotNode>(std::move(operand), token.line, token.col);
+        }
+
+        else if (token.type == TOKEN_BITWISE_NOT)
+        {
+            eat(TOKEN_BITWISE_NOT);
+            auto operand = factor(currentFunction);
+            return std::make_unique<BitwiseNotNode>(std::move(operand), token.line, token.col);
         }
 
 else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
@@ -7482,14 +7843,19 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         {
             Token andToken = token;
             eat(TOKEN_AND);
-            if (currentToken.type != TOKEN_IDENTIFIER)
+            auto operand = factor(currentFunction);
+            bool lvalueLike = dynamic_cast<IdentifierNode*>(operand.get()) ||
+                             dynamic_cast<ArrayAccessNode*>(operand.get()) ||
+                             dynamic_cast<PostfixIndexNode*>(operand.get()) ||
+                             dynamic_cast<MemberAccessNode*>(operand.get()) ||
+                             dynamic_cast<DereferenceNode*>(operand.get());
+            if (!lvalueLike)
             {
-                reportError(currentToken.line, currentToken.col, "Expected Identifier after &");
-                std::exit(1);
+                reportError(andToken.line, andToken.col, "Address-of requires an lvalue expression");
+                hadError = true;
+                return std::make_unique<NumberNode>(0);
             }
-            std::string Identifier = currentToken.value;
-            eat(TOKEN_IDENTIFIER);
-            return std::make_unique<AddressOfNode>(Identifier, currentFunction, andToken.line, andToken.col);
+            return std::make_unique<AddressOfNode>(std::move(operand), currentFunction, andToken.line, andToken.col);
         }
 
         else if (token.type == TOKEN_CHAR_LITERAL)
@@ -7515,7 +7881,8 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
         else if (token.type == TOKEN_IDENTIFIER)
 	    {
-            // Handle variables or function calls
+            // Handle variable/function designator and parse all postfix forms
+            // through applyPostfix() so indexing is represented consistently.
             std::string identifier = token.value;
             eat(TOKEN_IDENTIFIER);
 
@@ -7524,37 +7891,6 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             {
                 return std::make_unique<NumberNode>(enumIt->second);
             }
-
-            // Handle array indexing
-            std::vector<std::unique_ptr<ASTNode>> indices;
-            while(currentToken.type == TOKEN_LBRACKET)
-            {
-                eat(TOKEN_LBRACKET);
-                indices.push_back(condition(currentFunction));
-                eat(TOKEN_RBRACKET);
-            }
-
-            if (!indices.empty())
-            {
-                auto node = std::make_unique<ArrayAccessNode>(identifier, std::move(indices), currentFunction, token.line, token.col);
-                return applyPostfix(std::move(node), token.line, token.col);
-            }
-
-            if (currentToken.type == TOKEN_INCREMENT || currentToken.type == TOKEN_DECREMENT)
-            {
-                Token opToken = currentToken;
-                eat(opToken.type); // Consume the operator
-                return std::make_unique<UnaryOpNode>(opToken.value, identifier, false, token.line, token.col); // false for postfix
-            }
-
-            // Check if this is a function call
-            if (currentToken.type == TOKEN_LPAREN)
-            {
-                auto node = functionCall(identifier, token.line, token.col, currentFunction);
-                return applyPostfix(std::move(node), token.line, token.col);
-            }
-
-            // Otherwise it's a variable or parameter
             auto node = std::make_unique<IdentifierNode>(identifier, token.line, token.col, currentFunction);
             return applyPostfix(std::move(node), token.line, token.col);
         }
@@ -7603,12 +7939,12 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
                 // Compound literal: (struct T) { ... }
                 if (currentToken.type == TOKEN_LBRACE
-                    && castTargetType.base == Type::STRUCT
+                    && (castTargetType.base == Type::STRUCT || castTargetType.base == Type::UNION)
                     && !castWasFunctionPointer
                     && castTargetType.pointerLevel == 0)
                 {
                     return parseStructInitializerBody(
-                        castTargetType.structName, token.line, token.col, currentFunction);
+                        castTargetType.structName, castTargetType.base == Type::UNION, token.line, token.col, currentFunction);
                 }
 
                 // Otherwise it is a cast expression.
@@ -8053,11 +8389,12 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
                 bool isFunctionPtrDeclarator = false;
                 Type functionPtrType;
+                std::vector<size_t> dimensions;
                 if (currentToken.type == TOKEN_LPAREN && lexer.peekToken().type == TOKEN_MUL)
                 {
                     int declLine = token.line;
                     int declCol = token.col;
-                    if (!parseFunctionPointerDeclarator(baseType, &identifier, functionPtrType, &declLine, &declCol))
+                    if (!parseFunctionPointerDeclarator(baseType, &identifier, functionPtrType, &declLine, &declCol, &dimensions))
                         break;
                     isFunctionPtrDeclarator = true;
                     idToken = Token{TOKEN_IDENTIFIER, identifier, declLine, declCol};
@@ -8076,7 +8413,6 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     eat(TOKEN_IDENTIFIER);
                 }
 
-                std::vector<size_t> dimensions;
                 while (currentToken.type == TOKEN_LBRACKET)
                 {
                     eat(TOKEN_LBRACKET);
@@ -8124,9 +8460,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
                 if (isFunctionPtrDeclarator && !dimensions.empty())
                 {
-                    reportError(idToken.line, idToken.col,
-                                "Arrays of function pointers are not supported yet");
-                    hadError = true;
+                    // Arrays of function pointers are supported: just continue with declaration.
                 }
 
                 if (isFunctionPtrDeclarator)
@@ -8203,7 +8537,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     {
                         eat(TOKEN_ASSIGN);
                         if (baseType.pointerLevel == 0 && (baseType.base == Type::STRUCT || baseType.base == Type::UNION) && currentToken.type == TOKEN_LBRACE)
-                            initializer = parseStructInitializerBody(baseType.structName, idToken.line, idToken.col, currentFunction);
+                            initializer = parseStructInitializerBody(baseType.structName, baseType.base == Type::UNION, idToken.line, idToken.col, currentFunction);
                         else
                             initializer = assignmentExpression(currentFunction);
                     }
@@ -8641,7 +8975,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
 
         // Generic expression statement (e.g. (a>b)?foo():bar(); )
         else if (token.type == TOKEN_LPAREN || token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL ||
-             token.type == TOKEN_CHAR_LITERAL || token.type == TOKEN_STRING_LITERAL || token.type == TOKEN_NOT ||
+               token.type == TOKEN_CHAR_LITERAL || token.type == TOKEN_STRING_LITERAL || token.type == TOKEN_NOT || token.type == TOKEN_BITWISE_NOT ||
              token.type == TOKEN_SIZEOF || token.type == TOKEN_ADD || token.type == TOKEN_SUB || token.type == TOKEN_AND ||
              token.type == TOKEN_INCREMENT || token.type == TOKEN_DECREMENT)
         {
@@ -8726,7 +9060,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                 std::string name = currentToken.value;
                 eat(TOKEN_IDENTIFIER);
                 eat(TOKEN_SEMICOLON);
-                auto functionNode = std::make_unique<FunctionNode>(name, makeType(TOKEN_VOID), std::vector<std::pair<Type, std::string>>(), std::vector<std::vector<size_t>>(), std::vector<std::unique_ptr<ASTNode>>(), isExternal, false, false, nameToken.line, nameToken.col);
+                auto functionNode = std::make_unique<FunctionNode>(name, makeType(TOKEN_VOID), std::vector<std::pair<Type, std::string>>(), std::vector<std::vector<size_t>>(), std::vector<std::unique_ptr<ASTNode>>(), isExternal, false, false, false, nameToken.line, nameToken.col);
                 return functionNode;
             }
         }
@@ -9019,6 +9353,11 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             reportError(nameToken.line, nameToken.col, "Storage class specifier is not valid for function return type");
             hadError = true;
         }
+        if (isExternal && returnStatic)
+        {
+            reportError(nameToken.line, nameToken.col, "Function cannot be both extern and static");
+            hadError = true;
+        }
 
         // Parse the parameters list for a function
         eat(TOKEN_LPAREN);
@@ -9053,7 +9392,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
                     auto fn = std::make_unique<FunctionNode>(
                         name, finalReturnType, std::vector<std::pair<Type, std::string>>{},
                         std::vector<std::vector<size_t>>{}, std::vector<std::unique_ptr<ASTNode>>{},
-                        isExternal, false, false, nameToken.line, nameToken.col);
+                        isExternal, returnStatic, false, false, nameToken.line, nameToken.col);
                     eat(TOKEN_SEMICOLON);
                     return fn;
                 }
@@ -9198,7 +9537,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
             finalReturnType.pointerLevel += returnPtrLevel;
             if (finalReturnType.pointerLevel > 0)
                 finalReturnType.isConst = false;
-            auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, true, nameToken.line, nameToken.col);
+            auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, returnStatic, isVariadic, true, nameToken.line, nameToken.col);
             eat(TOKEN_SEMICOLON);
             return functionNode;
         }
@@ -9208,7 +9547,7 @@ else if (token.type == TOKEN_NUMBER || token.type == TOKEN_FLOAT_LITERAL)
         finalReturnType.pointerLevel += returnPtrLevel;
         if (finalReturnType.pointerLevel > 0)
             finalReturnType.isConst = false;
-        auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, isVariadic, false, nameToken.line, nameToken.col);
+        auto functionNode = std::make_unique<FunctionNode>(name, finalReturnType, parameters, parameterDimensions, std::vector<std::unique_ptr<ASTNode>>(), isExternal, returnStatic, isVariadic, false, nameToken.line, nameToken.col);
 
         if (isExternal)
         {
@@ -9565,9 +9904,22 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
     if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
     {
         if (!fc->functionName.empty())
-            markRegularFunctionReference(fc->functionName, refs);
+        {
+            if (fc->functionName == "main" || declaredExternalFunctions.count(fc->functionName) == 0)
+                refs.insert(fc->functionName);
+        }
+        else if (fc->calleeExpr)
+        {
+            if (auto calleeId = dynamic_cast<const IdentifierNode*>(fc->calleeExpr.get()))
+            {
+                if (calleeId->name == "main" || declaredExternalFunctions.count(calleeId->name) == 0)
+                    refs.insert(calleeId->name);
+            }
+        }
         for (const auto& arg : fc->arguments)
             collectReferencedFunctionsExpr(arg.get(), refs);
+        if (fc->calleeExpr)
+            collectReferencedFunctionsExpr(fc->calleeExpr.get(), refs);
         return;
     }
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
@@ -9598,6 +9950,11 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
     if (auto ln = dynamic_cast<const LogicalNotNode*>(node))
     {
         collectReferencedFunctionsExpr(ln->operand.get(), refs);
+        return;
+    }
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+    {
+        collectReferencedFunctionsExpr(bn->operand.get(), refs);
         return;
     }
     if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node))
@@ -9634,7 +9991,14 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
     }
     if (auto ad = dynamic_cast<const AddressOfNode*>(node))
     {
-        markRegularFunctionReference(ad->Identifier, refs);
+        if (ad->operand)
+        {
+            collectReferencedFunctionsExpr(ad->operand.get(), refs);
+        }
+        else
+        {
+            markRegularFunctionReference(ad->Identifier, refs);
+        }
         return;
     }
     if (auto so = dynamic_cast<const SizeofNode*>(node))
@@ -11265,6 +11629,8 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
             markRegularFunctionReference(fc->functionName, refs);
         for (const auto& arg : fc->arguments)
             collectReferencedFunctionsExpr(arg.get(), refs);
+        if (fc->calleeExpr)
+            collectReferencedFunctionsExpr(fc->calleeExpr.get(), refs);
         return;
     }
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
@@ -11295,6 +11661,11 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
     if (auto ln = dynamic_cast<const LogicalNotNode*>(node))
     {
         collectReferencedFunctionsExpr(ln->operand.get(), refs);
+        return;
+    }
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+    {
+        collectReferencedFunctionsExpr(bn->operand.get(), refs);
         return;
     }
     if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node))
@@ -11331,7 +11702,14 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
     }
     if (auto ad = dynamic_cast<const AddressOfNode*>(node))
     {
-        markRegularFunctionReference(ad->Identifier, refs);
+        if (ad->operand)
+        {
+            collectReferencedFunctionsExpr(ad->operand.get(), refs);
+        }
+        else
+        {
+            markRegularFunctionReference(ad->Identifier, refs);
+        }
         return;
     }
     if (auto so = dynamic_cast<const SizeofNode*>(node))
@@ -11480,7 +11858,10 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 {
     // Reset the global stack and index counter
     functionVariableIndex = 0;
-    enableFunctionReachabilityFilter = useReachabilityFilter;
+    // The current reachability pass is order-sensitive for some macro-expanded
+    // translation units (for example stb_ds implementation blocks). Disable
+    // pruning so definition/codegen remains consistent.
+    enableFunctionReachabilityFilter = false;
     emittedExternalFunctions.clear();
     declaredExternalFunctions.clear();
     referencedExternalFunctions.clear();
@@ -11494,14 +11875,22 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 
     // Collect external declarations up front so call emission can mark usage
     // regardless of declaration order.
+    std::unordered_set<std::string> locallyDefinedFunctions;
     for (const auto& node : ast)
     {
         if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
         {
             if (fn->isExternal)
                 declaredExternalFunctions.insert(fn->name);
+            else if (!fn->isPrototype)
+                locallyDefinedFunctions.insert(fn->name);
         }
     }
+
+    // If a symbol has both an extern declaration and a local definition,
+    // treat it as locally defined for this translation unit.
+    for (const auto& name : locallyDefinedFunctions)
+        declaredExternalFunctions.erase(name);
 
     if (enableFunctionReachabilityFilter)
     {
@@ -11580,12 +11969,37 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 
     {
         std::ofstream tf(textTmpPath);
+        std::unordered_set<std::string> locallyDefinedRegularFunctions;
+        for (const auto& node : ast)
+        {
+            if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
+            {
+                if (!fn->isExternal && !fn->isPrototype && shouldEmitFunctionBody(fn->name))
+                    locallyDefinedRegularFunctions.insert(fn->name);
+            }
+        }
+
         for (const auto& node : ast)
             node->emitCode(tf);
+
+        for (const auto& name : referencedRegularFunctions)
+        {
+            if (name == "main")
+                continue;
+            if (declaredExternalFunctions.count(name) > 0)
+                continue;
+            if (locallyDefinedRegularFunctions.count(name) > 0)
+                continue;
+
+            const std::string asmName = functionAsmSymbol(name);
+            tf << std::endl << "extrn '" << asmName << "' as " << asmName << std::endl;
+        }
 
         for (const auto& name : referencedExternalFunctions)
         {
             if (!declaredExternalFunctions.count(name))
+                continue;
+            if (locallyDefinedRegularFunctions.count(name) > 0)
                 continue;
             if (emittedExternalFunctions.insert(name).second)
             {
@@ -11634,6 +12048,17 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
         f << "section '.text' executable" << std::endl;
         if (shouldExportMain)
             f  << std::endl << "public main" << std::endl;
+        for (const auto& node : ast)
+        {
+            auto fn = dynamic_cast<const FunctionNode*>(node.get());
+            if (!fn)
+                continue;
+            if (fn->name == "main")
+                continue;
+            if (fn->isExternal || fn->isStaticLinkage || fn->isPrototype || !shouldEmitFunctionBody(fn->name))
+                continue;
+            f << "public " << functionAsmSymbol(fn->name) << std::endl;
+        }
         f << textPayload;
     }
 
@@ -11685,10 +12110,36 @@ static std::pair<int,int> bestEffortNodeLocation(const ASTNode* node)
     if (auto un = dynamic_cast<const UnaryOpNode*>(node)) return {un->line, un->col};
     if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node)) return {pu->line, pu->col};
     if (auto ln = dynamic_cast<const LogicalNotNode*>(node)) return {ln->line, ln->col};
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node)) return {bn->line, bn->col};
     if (auto tn = dynamic_cast<const TernaryNode*>(node)) return {tn->line, tn->col};
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node)) return bestEffortNodeLocation(bin->left.get());
     if (auto ret = dynamic_cast<const ReturnNode*>(node)) return bestEffortNodeLocation(ret->expression.get());
     return {0,0};
+}
+
+static bool inferAggregateTypeFromMemberName(const std::string& memberName, Type& outType)
+{
+    std::string foundName;
+    int matches = 0;
+    for (const auto& it : structTypes)
+    {
+        for (const auto& m : it.second.members)
+        {
+            if (m.name == memberName)
+            {
+                foundName = it.first;
+                ++matches;
+                break;
+            }
+        }
+    }
+
+    if (matches == 1)
+    {
+        outType = makeType(TOKEN_STRUCT, 0, false, false, foundName);
+        return true;
+    }
+    return false;
 }
 
 // simple compatibility predicate.  We accept the following cases:
@@ -11841,10 +12292,17 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     }
     if (auto ao = dynamic_cast<const AddressOfNode*>(node))
     {
-        auto lookupResult = lookupInScopes(scopes, ao->Identifier);
         Type bt = {Type::INT,0};
-        if (lookupResult.first) bt = lookupResult.second.type;
-        else if (globalVariables.count(ao->Identifier)) bt = globalVariables[ao->Identifier];
+        if (ao->operand)
+        {
+            bt = computeExprType(ao->operand.get(), scopes, currentFunction);
+        }
+        else
+        {
+            auto lookupResult = lookupInScopes(scopes, ao->Identifier);
+            if (lookupResult.first) bt = lookupResult.second.type;
+            else if (globalVariables.count(ao->Identifier)) bt = globalVariables[ao->Identifier];
+        }
         bt.pointerLevel++;
         return bt;
     }
@@ -11861,6 +12319,13 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     }
     if (dynamic_cast<const LogicalNotNode*>(node))
     {
+        return {Type::INT,0};
+    }
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+    {
+        Type t = computeExprType(bn->operand.get(), scopes, currentFunction);
+        if (t.pointerLevel == 0 && isIntegerScalarType(t))
+            return t;
         return {Type::INT,0};
     }
     if (auto lor = dynamic_cast<const LogicalOrNode*>(node))
@@ -12036,14 +12501,69 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     }
     if (auto ma = dynamic_cast<const MemberAccessNode*>(node))
     {
+        auto recoverPointerLikeType = [&](const ASTNode* expr) -> Type
+        {
+            if (!expr) return {Type::INT,0};
+            if (auto castBase = dynamic_cast<const CastNode*>(expr))
+            {
+                if (castBase->targetType.pointerLevel > 0)
+                    return castBase->targetType;
+                if (castBase->targetType.base == Type::STRUCT || castBase->targetType.base == Type::UNION)
+                {
+                    Type promoted = castBase->targetType;
+                    promoted.pointerLevel = 1;
+                    return promoted;
+                }
+            }
+            if (auto binBase = dynamic_cast<const BinaryOpNode*>(expr))
+            {
+                if (binBase->op == "+" || binBase->op == "-")
+                {
+                    if (auto leftCast = dynamic_cast<const CastNode*>(binBase->left.get()))
+                    {
+                        Type rt = computeExprType(binBase->right.get(), scopes, currentFunction);
+                        Type lc = leftCast->targetType;
+                        if ((lc.base == Type::STRUCT || lc.base == Type::UNION) && lc.pointerLevel == 0)
+                            lc.pointerLevel = 1;
+                        if (lc.pointerLevel > 0 && rt.pointerLevel == 0 && isIntegerScalarType(rt))
+                            return lc;
+                    }
+                }
+            }
+            return {Type::INT,0};
+        };
+
         Type bt = computeExprType(ma->baseExpr.get(), scopes, currentFunction);
+        if (ma->throughPointer && bt.pointerLevel == 0)
+        {
+            Type recovered = recoverPointerLikeType(ma->baseExpr.get());
+            if (recovered.pointerLevel > 0)
+                bt = recovered;
+        }
+        if (!ma->throughPointer && (bt.pointerLevel != 0 || (bt.base != Type::STRUCT && bt.base != Type::UNION)))
+        {
+            if (auto dn = dynamic_cast<const DereferenceNode*>(ma->baseExpr.get()))
+            {
+                Type recovered = recoverPointerLikeType(dn->operand.get());
+                if (recovered.pointerLevel > 0)
+                {
+                    recovered.pointerLevel--;
+                    bt = recovered;
+                }
+            }
+        }
         Type st = bt;
         if (ma->throughPointer)
         {
             if (st.pointerLevel > 0)
                 st.pointerLevel--;
-            else
-                st = {Type::INT, 0};
+        }
+
+        if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
+        {
+            Type inferred{Type::INT,0};
+            if (inferAggregateTypeFromMemberName(ma->memberName, inferred))
+                st = inferred;
         }
 
         if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
@@ -12086,7 +12606,7 @@ static Type computeExprType(const ASTNode* node, const std::stack<std::map<std::
     }
     if (auto sl = dynamic_cast<const StructLiteralNode*>(node))
     {
-        return makeType(TOKEN_STRUCT, 0, false, false, sl->structName);
+        return makeType(sl->isUnionLiteral ? TOKEN_UNION : TOKEN_STRUCT, 0, false, false, sl->structName);
     }
     return {Type::INT,0};
 }
@@ -12240,6 +12760,21 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
 
     if (auto ao = dynamic_cast<const AddressOfNode*>(node))
     {
+        if (ao->operand)
+        {
+            semanticCheckExpression(ao->operand.get(), scopes, currentFunction);
+            if (auto id = dynamic_cast<const IdentifierNode*>(ao->operand.get()))
+            {
+                auto local = lookupInScopes(scopes, id->name);
+                if (local.first && local.second.isRegisterStorage)
+                {
+                    reportError(ao->line, ao->col, "Cannot take address of register-qualified variable '" + id->name + "'");
+                    hadError = true;
+                }
+            }
+            return;
+        }
+
         auto local = lookupInScopes(scopes, ao->Identifier);
         if (local.first && local.second.isRegisterStorage)
         {
@@ -12258,6 +12793,19 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         if (!scalar)
         {
             reportError(ln->line, ln->col, "Operator '!' requires a scalar operand");
+            hadError = true;
+        }
+        return;
+    }
+
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+    {
+        semanticCheckExpression(bn->operand.get(), scopes, currentFunction);
+        Type t = computeExprType(bn->operand.get(), scopes, currentFunction);
+        bool integerLike = (t.pointerLevel == 0) && isIntegerScalarType(t);
+        if (!integerLike)
+        {
+            reportError(bn->line, bn->col, "Operator '~' requires an integer operand");
             hadError = true;
         }
         return;
@@ -12316,6 +12864,30 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         Type pt = computeExprType(iasg->pointerExpr.get(), scopes, currentFunction);
         if (pt.pointerLevel == 0)
         {
+            if (auto castPtr = dynamic_cast<const CastNode*>(iasg->pointerExpr.get()))
+            {
+                Type recovered = castPtr->targetType;
+                if ((recovered.base == Type::STRUCT || recovered.base == Type::UNION) && recovered.pointerLevel == 0)
+                    recovered.pointerLevel = 1;
+                if (recovered.pointerLevel > 0)
+                    pt = recovered;
+            }
+            else if (auto binPtr = dynamic_cast<const BinaryOpNode*>(iasg->pointerExpr.get()))
+            {
+                if ((binPtr->op == "+" || binPtr->op == "-") &&
+                    dynamic_cast<const CastNode*>(binPtr->left.get()))
+                {
+                    auto leftCast = dynamic_cast<const CastNode*>(binPtr->left.get());
+                    Type recovered = leftCast->targetType;
+                    if ((recovered.base == Type::STRUCT || recovered.base == Type::UNION) && recovered.pointerLevel == 0)
+                        recovered.pointerLevel = 1;
+                    if (recovered.pointerLevel > 0)
+                        pt = recovered;
+                }
+            }
+        }
+        if (pt.pointerLevel == 0)
+        {
             reportError(iasg->line, iasg->col, "Left side of indirect assignment must be a pointer");
             hadError = true;
             return;
@@ -12357,6 +12929,46 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             semanticCheckExpression(arg.get(), scopes, currentFunction);
             Type t = computeExprType(arg.get(), scopes, currentFunction);
             mut->argTypes.push_back(t);
+        }
+
+        // Expression-based call target (e.g. fns[i](...)).
+        if (fc->calleeExpr)
+        {
+            semanticCheckExpression(fc->calleeExpr.get(), scopes, currentFunction);
+            Type calleeT = computeExprType(fc->calleeExpr.get(), scopes, currentFunction);
+            if (!calleeT.isFunctionPointer)
+            {
+                reportError(fc->line, fc->col, "Called expression is not a function or function pointer");
+                hadError = true;
+                return;
+            }
+            mut->isIndirect = true;
+            std::string sigKey = calleeT.functionSignatureKey;
+            if (fnPtrReturnTypes.count(sigKey))
+                mut->indirectReturnType = fnPtrReturnTypes[sigKey];
+            if (fnPtrParamTypes.count(sigKey))
+                mut->indirectParamTypes = fnPtrParamTypes[sigKey];
+            if (fnPtrVariadic.count(sigKey))
+                mut->indirectVariadic = fnPtrVariadic[sigKey];
+            if (fnPtrHasPrototype.count(sigKey))
+                mut->indirectHasPrototype = fnPtrHasPrototype[sigKey];
+
+            if (mut->indirectHasPrototype)
+            {
+                const auto& params = mut->indirectParamTypes;
+                bool variadic = mut->indirectVariadic;
+                if (!variadic && params.size() != fc->arguments.size())
+                {
+                    reportError(fc->line, fc->col, "Function call has wrong number of arguments");
+                    hadError = true;
+                }
+                else if (variadic && fc->arguments.size() < params.size())
+                {
+                    reportError(fc->line, fc->col, "Function call has too few arguments");
+                    hadError = true;
+                }
+            }
+            return;
         }
 
         bool handledByFunctionPointer = false;
@@ -12516,18 +13128,70 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
 
     if (auto ma = dynamic_cast<const MemberAccessNode*>(node))
     {
+        auto recoverPointerLikeType = [&](const ASTNode* expr) -> Type
+        {
+            if (!expr) return {Type::INT,0};
+            if (auto castBase = dynamic_cast<const CastNode*>(expr))
+            {
+                if (castBase->targetType.pointerLevel > 0)
+                    return castBase->targetType;
+                if (castBase->targetType.base == Type::STRUCT || castBase->targetType.base == Type::UNION)
+                {
+                    Type promoted = castBase->targetType;
+                    promoted.pointerLevel = 1;
+                    return promoted;
+                }
+            }
+            if (auto binBase = dynamic_cast<const BinaryOpNode*>(expr))
+            {
+                if (binBase->op == "+" || binBase->op == "-")
+                {
+                    if (auto leftCast = dynamic_cast<const CastNode*>(binBase->left.get()))
+                    {
+                        Type rt = computeExprType(binBase->right.get(), scopes, currentFunction);
+                        Type lc = leftCast->targetType;
+                        if ((lc.base == Type::STRUCT || lc.base == Type::UNION) && lc.pointerLevel == 0)
+                            lc.pointerLevel = 1;
+                        if (lc.pointerLevel > 0 && rt.pointerLevel == 0 && isIntegerScalarType(rt))
+                            return lc;
+                    }
+                }
+            }
+            return {Type::INT,0};
+        };
+
         semanticCheckExpression(ma->baseExpr.get(), scopes, currentFunction);
         Type bt = computeExprType(ma->baseExpr.get(), scopes, currentFunction);
+        if (ma->throughPointer && bt.pointerLevel == 0)
+        {
+            Type recovered = recoverPointerLikeType(ma->baseExpr.get());
+            if (recovered.pointerLevel > 0)
+                bt = recovered;
+        }
+        if (!ma->throughPointer && (bt.pointerLevel != 0 || (bt.base != Type::STRUCT && bt.base != Type::UNION)))
+        {
+            if (auto dn = dynamic_cast<const DereferenceNode*>(ma->baseExpr.get()))
+            {
+                Type recovered = recoverPointerLikeType(dn->operand.get());
+                if (recovered.pointerLevel > 0)
+                {
+                    recovered.pointerLevel--;
+                    bt = recovered;
+                }
+            }
+        }
         Type st = bt;
         if (ma->throughPointer)
         {
-            if (st.pointerLevel == 0)
-            {
-                reportError(ma->line, ma->col, "Operator '->' requires a pointer operand");
-                hadError = true;
-                return;
-            }
-            st.pointerLevel--;
+            if (st.pointerLevel > 0)
+                st.pointerLevel--;
+        }
+
+        if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
+        {
+            Type inferred{Type::INT,0};
+            if (inferAggregateTypeFromMemberName(ma->memberName, inferred))
+                st = inferred;
         }
 
         if (st.pointerLevel != 0 || (st.base != Type::STRUCT && st.base != Type::UNION))
@@ -12570,9 +13234,16 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
         auto sit = structTypes.find(sl->structName);
         if (sit == structTypes.end())
         {
-            reportError(sl->line, sl->col, "Unknown struct type '" + sl->structName + "'");
+            reportError(sl->line, sl->col,
+                        std::string("Unknown ") + (sl->isUnionLiteral ? "union" : "struct") + " type '" + sl->structName + "'");
             hadError = true;
             return;
+        }
+
+        if (sl->isUnionLiteral && sl->initializers.size() > 1)
+        {
+            reportError(sl->line, sl->col, "Union initializer must contain at most one member initializer");
+            hadError = true;
         }
 
         for (const auto& init : sl->initializers)
@@ -12580,7 +13251,8 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             auto member = findStructMember(sl->structName, init.first);
             if (!member)
             {
-                reportError(sl->line, sl->col, "Struct '" + sl->structName + "' has no member named '" + init.first + "'");
+                reportError(sl->line, sl->col,
+                            std::string(sl->isUnionLiteral ? "Union" : "Struct") + " '" + sl->structName + "' has no member named '" + init.first + "'");
                 hadError = true;
                 continue;
             }
@@ -12590,7 +13262,7 @@ static void semanticCheckExpression(const ASTNode* node, std::stack<std::map<std
             if (!typesCompatible(member->type, rhs))
             {
                 reportError(sl->line, sl->col,
-                            "Type mismatch in struct initializer: cannot assign '" + rhs.toString() +
+                            "Type mismatch in " + std::string(sl->isUnionLiteral ? "union" : "struct") + " initializer: cannot assign '" + rhs.toString() +
                             "' to member '" + init.first + "' of type '" + member->type.toString() + "'");
                 hadError = true;
             }
@@ -13324,7 +13996,7 @@ int main(int argc, char** argv)
     bool flagC = false;
     bool flagE = false;
     bool flagRun = false;
-    std::string inputPath;
+    std::vector<std::string> inputPaths;
     std::string outputPath;
     std::string asmOutPath;
     std::string objOutPath;
@@ -13518,16 +14190,11 @@ int main(int argc, char** argv)
         }
         else
         {
-            if (!inputPath.empty())
-            {
-                std::cerr << "Multiple input files are not supported\n";
-                return 1;
-            }
-            inputPath = arg;
+            inputPaths.push_back(arg);
         }
     }
 
-    if (inputPath.empty())
+    if (inputPaths.empty())
     {
         printUsage(argv[0]);
         return 1;
@@ -13551,18 +14218,19 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    sourceFileName = inputPath;
-    std::ifstream inFile(inputPath);
-    if (!inFile.is_open())
+    if (inputPaths.size() > 1)
     {
-        std::cerr << "Error opening file: " << inputPath << std::endl;
-        return -1;
+        if (!asmOutPath.empty() || !objOutPath.empty())
+        {
+            std::cerr << "--asm-out/--obj-out require exactly one input file\n";
+            return 1;
+        }
+        if ((flagS || flagC || flagE) && !outputPath.empty())
+        {
+            std::cerr << "-o with -E/-S/-c requires exactly one input file\n";
+            return 1;
+        }
     }
-
-    std::stringstream buff;
-    buff << inFile.rdbuf();
-    std::string source = buff.str();
-    inFile.close();
 
     auto runSystemPreprocessor = [&](const std::string& inPath, std::string& outText) -> bool
     {
@@ -13615,33 +14283,67 @@ int main(int argc, char** argv)
         return true;
     };
 
-    if (useSystemPreprocessor && source.find("#include <") != std::string::npos)
+    auto loadAndPreprocessSource = [&](const std::string& inputPath, std::string& source) -> bool
     {
-        std::string externalPreprocessed;
-        if (runSystemPreprocessor(inputPath, externalPreprocessed))
-            source = externalPreprocessed;
-    }
+        sourceFileName = inputPath;
+        std::ifstream inFile(inputPath);
+        if (!inFile.is_open())
+        {
+            std::cerr << "Error opening file: " << inputPath << std::endl;
+            return false;
+        }
 
-    Preprocessor preprocessor;
-    std::unordered_map<std::string, std::string> defines;
-    for (const auto& d : preprocDefines)
-    {
-        size_t eq = d.find('=');
-        if (eq == std::string::npos)
-            defines[d] = "1";
-        else
-            defines[d.substr(0, eq)] = d.substr(eq + 1);
-    }
-    source = preprocessor.processCode(source, defines);
+        std::stringstream buff;
+        buff << inFile.rdbuf();
+        source = buff.str();
+        inFile.close();
+
+        if (useSystemPreprocessor && source.find("#include <") != std::string::npos)
+        {
+            std::string externalPreprocessed;
+            if (runSystemPreprocessor(inputPath, externalPreprocessed))
+                source = externalPreprocessed;
+        }
+
+        Preprocessor preprocessor;
+        std::unordered_map<std::string, std::string> defines;
+        for (const auto& d : preprocDefines)
+        {
+            size_t eq = d.find('=');
+            if (eq == std::string::npos)
+                defines[d] = "1";
+            else
+                defines[d.substr(0, eq)] = d.substr(eq + 1);
+        }
+        source = preprocessor.processCode(source, defines);
+        return true;
+    };
 
     if (flagE)
     {
+        if (!outputPath.empty() && inputPaths.size() > 1)
+        {
+            std::cerr << "-E with -o supports exactly one input file\n";
+            return 1;
+        }
+
         if (outputPath.empty())
         {
-            std::cout << source;
+            for (size_t i = 0; i < inputPaths.size(); ++i)
+            {
+                std::string source;
+                if (!loadAndPreprocessSource(inputPaths[i], source))
+                    return -1;
+                std::cout << source;
+                if (i + 1 < inputPaths.size())
+                    std::cout << "\n";
+            }
         }
         else
         {
+            std::string source;
+            if (!loadAndPreprocessSource(inputPaths[0], source))
+                return -1;
             std::ofstream ppOut(outputPath);
             if (!ppOut.is_open())
             {
@@ -13653,41 +14355,63 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    Lexer lexer(source);
-    Parser parser(lexer);
-    auto ast = parser.parse();
-    semanticPass(ast);
-
-    if (!compileErrors.empty())
+    struct UnitOutput
     {
-        std::cerr << "Compilation failed with " << compileErrors.size() << " error(s)\n";
-        return 1;
+        std::string inputPath;
+        std::string asmFile;
+        std::string objFile;
+    };
+
+    std::vector<UnitOutput> units;
+    units.reserve(inputPaths.size());
+    for (const auto& in : inputPaths)
+    {
+        std::string base = stripExtension(in);
+        UnitOutput u;
+        u.inputPath = in;
+        u.asmFile = base + ".asm";
+        u.objFile = base + ".o";
+        units.push_back(std::move(u));
     }
 
-    std::string base = stripExtension(inputPath);
-    std::string asmFile = base + ".asm";
-    std::string objFile = base + ".o";
-    std::string exeFile = base;
+    std::string exeFile = stripExtension(inputPaths[0]);
 
     if (!outputPath.empty())
     {
-        if (flagS) asmFile = outputPath;
-        else if (flagC) objFile = outputPath;
-        else exeFile = outputPath;
+        if (flagS && inputPaths.size() == 1) units[0].asmFile = outputPath;
+        else if (flagC && inputPaths.size() == 1) units[0].objFile = outputPath;
+        else if (!flagS && !flagC) exeFile = outputPath;
     }
 
-    if (!asmOutPath.empty()) asmFile = asmOutPath;
-    if (!objOutPath.empty()) objFile = objOutPath;
+    if (!asmOutPath.empty()) units[0].asmFile = asmOutPath;
+    if (!objOutPath.empty()) units[0].objFile = objOutPath;
     if (!exeOutPath.empty()) exeFile = exeOutPath;
 
+    for (const auto& unit : units)
     {
-        std::ofstream file(asmFile);
+        std::string source;
+        if (!loadAndPreprocessSource(unit.inputPath, source))
+            return -1;
+
+        size_t errBefore = compileErrors.size();
+        Lexer lexer(source);
+        Parser parser(lexer);
+        auto ast = parser.parse();
+        semanticPass(ast);
+
+        if (compileErrors.size() > errBefore)
+        {
+            std::cerr << "Compilation failed with " << compileErrors.size() << " error(s)\n";
+            return 1;
+        }
+
+        std::ofstream file(unit.asmFile);
         if (!file.is_open())
         {
-            std::cerr << "Error creating output assembly file: " << asmFile << std::endl;
+            std::cerr << "Error creating output assembly file: " << unit.asmFile << std::endl;
             return -1;
         }
-        bool useReachabilityFilter = !flagS && !flagC;
+        bool useReachabilityFilter = !flagS && !flagC && inputPaths.size() == 1;
         generateCode(ast, file, useReachabilityFilter);
     }
 
@@ -13696,8 +14420,9 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    for (const auto& unit : units)
     {
-        std::string cmd = fasmCmd + " " + shellQuote(asmFile) + " " + shellQuote(objFile);
+        std::string cmd = fasmCmd + " " + shellQuote(unit.asmFile) + " " + shellQuote(unit.objFile);
         int rc = std::system(cmd.c_str());
         if (rc != 0)
         {
@@ -13712,7 +14437,10 @@ int main(int argc, char** argv)
     }
 
     {
-        std::string cmd = ccCmd + " " + shellQuote(objFile) + " -o " + shellQuote(exeFile);
+        std::string cmd = ccCmd;
+        for (const auto& unit : units)
+            cmd += " " + shellQuote(unit.objFile);
+        cmd += " -o " + shellQuote(exeFile);
         for (const auto& a : linkArgs)
             cmd += " " + shellQuote(a);
         int rc = std::system(cmd.c_str());

@@ -581,6 +581,12 @@ public:
             return Token{ TOKEN_XOR, "^", tokenLine, tokenCol };
         }
 
+        else if (ch == '~')
+        {
+            advance();
+            return Token{ TOKEN_BITWISE_NOT, "~", tokenLine, tokenCol };
+        }
+
         else if (ch == '\0')
 	    {
             return Token{ TOKEN_EOF, "", tokenLine, tokenCol };

@@ -26,9 +26,22 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
     if (auto fc = dynamic_cast<const FunctionCallNode*>(node))
     {
         if (!fc->functionName.empty())
-            markRegularFunctionReference(fc->functionName, refs);
+        {
+            if (fc->functionName == "main" || declaredExternalFunctions.count(fc->functionName) == 0)
+                refs.insert(fc->functionName);
+        }
+        else if (fc->calleeExpr)
+        {
+            if (auto calleeId = dynamic_cast<const IdentifierNode*>(fc->calleeExpr.get()))
+            {
+                if (calleeId->name == "main" || declaredExternalFunctions.count(calleeId->name) == 0)
+                    refs.insert(calleeId->name);
+            }
+        }
         for (const auto& arg : fc->arguments)
             collectReferencedFunctionsExpr(arg.get(), refs);
+        if (fc->calleeExpr)
+            collectReferencedFunctionsExpr(fc->calleeExpr.get(), refs);
         return;
     }
     if (auto bin = dynamic_cast<const BinaryOpNode*>(node))
@@ -59,6 +72,11 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
     if (auto ln = dynamic_cast<const LogicalNotNode*>(node))
     {
         collectReferencedFunctionsExpr(ln->operand.get(), refs);
+        return;
+    }
+    if (auto bn = dynamic_cast<const BitwiseNotNode*>(node))
+    {
+        collectReferencedFunctionsExpr(bn->operand.get(), refs);
         return;
     }
     if (auto pu = dynamic_cast<const PostfixUpdateNode*>(node))
@@ -95,7 +113,14 @@ static void collectReferencedFunctionsExpr(const ASTNode* node, std::unordered_s
     }
     if (auto ad = dynamic_cast<const AddressOfNode*>(node))
     {
-        markRegularFunctionReference(ad->Identifier, refs);
+        if (ad->operand)
+        {
+            collectReferencedFunctionsExpr(ad->operand.get(), refs);
+        }
+        else
+        {
+            markRegularFunctionReference(ad->Identifier, refs);
+        }
         return;
     }
     if (auto so = dynamic_cast<const SizeofNode*>(node))
@@ -244,7 +269,10 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 {
     // Reset the global stack and index counter
     functionVariableIndex = 0;
-    enableFunctionReachabilityFilter = useReachabilityFilter;
+    // The current reachability pass is order-sensitive for some macro-expanded
+    // translation units (for example stb_ds implementation blocks). Disable
+    // pruning so definition/codegen remains consistent.
+    enableFunctionReachabilityFilter = false;
     emittedExternalFunctions.clear();
     declaredExternalFunctions.clear();
     referencedExternalFunctions.clear();
@@ -258,14 +286,22 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 
     // Collect external declarations up front so call emission can mark usage
     // regardless of declaration order.
+    std::unordered_set<std::string> locallyDefinedFunctions;
     for (const auto& node : ast)
     {
         if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
         {
             if (fn->isExternal)
                 declaredExternalFunctions.insert(fn->name);
+            else if (!fn->isPrototype)
+                locallyDefinedFunctions.insert(fn->name);
         }
     }
+
+    // If a symbol has both an extern declaration and a local definition,
+    // treat it as locally defined for this translation unit.
+    for (const auto& name : locallyDefinedFunctions)
+        declaredExternalFunctions.erase(name);
 
     if (enableFunctionReachabilityFilter)
     {
@@ -344,12 +380,37 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 
     {
         std::ofstream tf(textTmpPath);
+        std::unordered_set<std::string> locallyDefinedRegularFunctions;
+        for (const auto& node : ast)
+        {
+            if (auto fn = dynamic_cast<const FunctionNode*>(node.get()))
+            {
+                if (!fn->isExternal && !fn->isPrototype && shouldEmitFunctionBody(fn->name))
+                    locallyDefinedRegularFunctions.insert(fn->name);
+            }
+        }
+
         for (const auto& node : ast)
             node->emitCode(tf);
+
+        for (const auto& name : referencedRegularFunctions)
+        {
+            if (name == "main")
+                continue;
+            if (declaredExternalFunctions.count(name) > 0)
+                continue;
+            if (locallyDefinedRegularFunctions.count(name) > 0)
+                continue;
+
+            const std::string asmName = functionAsmSymbol(name);
+            tf << std::endl << "extrn '" << asmName << "' as " << asmName << std::endl;
+        }
 
         for (const auto& name : referencedExternalFunctions)
         {
             if (!declaredExternalFunctions.count(name))
+                continue;
+            if (locallyDefinedRegularFunctions.count(name) > 0)
                 continue;
             if (emittedExternalFunctions.insert(name).second)
             {
@@ -398,6 +459,17 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
         f << "section '.text' executable" << std::endl;
         if (shouldExportMain)
             f  << std::endl << "public main" << std::endl;
+        for (const auto& node : ast)
+        {
+            auto fn = dynamic_cast<const FunctionNode*>(node.get());
+            if (!fn)
+                continue;
+            if (fn->name == "main")
+                continue;
+            if (fn->isExternal || fn->isStaticLinkage || fn->isPrototype || !shouldEmitFunctionBody(fn->name))
+                continue;
+            f << "public " << functionAsmSymbol(fn->name) << std::endl;
+        }
         f << textPayload;
     }
 

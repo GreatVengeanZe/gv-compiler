@@ -123,7 +123,7 @@ int main(int argc, char** argv)
     bool flagC = false;
     bool flagE = false;
     bool flagRun = false;
-    std::string inputPath;
+    std::vector<std::string> inputPaths;
     std::string outputPath;
     std::string asmOutPath;
     std::string objOutPath;
@@ -318,16 +318,11 @@ int main(int argc, char** argv)
         }
         else
         {
-            if (!inputPath.empty())
-            {
-                std::cerr << "Multiple input files are not supported\n";
-                return 1;
-            }
-            inputPath = arg;
+            inputPaths.push_back(arg);
         }
     }
 
-    if (inputPath.empty())
+    if (inputPaths.empty())
     {
         printUsage(argv[0]);
         return 1;
@@ -351,18 +346,19 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    sourceFileName = inputPath;
-    std::ifstream inFile(inputPath);
-    if (!inFile.is_open())
+    if (inputPaths.size() > 1)
     {
-        std::cerr << "Error opening file: " << inputPath << std::endl;
-        return -1;
+        if (!asmOutPath.empty() || !objOutPath.empty())
+        {
+            std::cerr << "--asm-out/--obj-out require exactly one input file\n";
+            return 1;
+        }
+        if ((flagS || flagC || flagE) && !outputPath.empty())
+        {
+            std::cerr << "-o with -E/-S/-c requires exactly one input file\n";
+            return 1;
+        }
     }
-
-    std::stringstream buff;
-    buff << inFile.rdbuf();
-    std::string source = buff.str();
-    inFile.close();
 
     auto runSystemPreprocessor = [&](const std::string& inPath, std::string& outText) -> bool
     {
@@ -415,33 +411,67 @@ int main(int argc, char** argv)
         return true;
     };
 
-    if (useSystemPreprocessor && source.find("#include <") != std::string::npos)
+    auto loadAndPreprocessSource = [&](const std::string& inputPath, std::string& source) -> bool
     {
-        std::string externalPreprocessed;
-        if (runSystemPreprocessor(inputPath, externalPreprocessed))
-            source = externalPreprocessed;
-    }
+        sourceFileName = inputPath;
+        std::ifstream inFile(inputPath);
+        if (!inFile.is_open())
+        {
+            std::cerr << "Error opening file: " << inputPath << std::endl;
+            return false;
+        }
 
-    Preprocessor preprocessor;
-    std::unordered_map<std::string, std::string> defines;
-    for (const auto& d : preprocDefines)
-    {
-        size_t eq = d.find('=');
-        if (eq == std::string::npos)
-            defines[d] = "1";
-        else
-            defines[d.substr(0, eq)] = d.substr(eq + 1);
-    }
-    source = preprocessor.processCode(source, defines);
+        std::stringstream buff;
+        buff << inFile.rdbuf();
+        source = buff.str();
+        inFile.close();
+
+        if (useSystemPreprocessor && source.find("#include <") != std::string::npos)
+        {
+            std::string externalPreprocessed;
+            if (runSystemPreprocessor(inputPath, externalPreprocessed))
+                source = externalPreprocessed;
+        }
+
+        Preprocessor preprocessor;
+        std::unordered_map<std::string, std::string> defines;
+        for (const auto& d : preprocDefines)
+        {
+            size_t eq = d.find('=');
+            if (eq == std::string::npos)
+                defines[d] = "1";
+            else
+                defines[d.substr(0, eq)] = d.substr(eq + 1);
+        }
+        source = preprocessor.processCode(source, defines);
+        return true;
+    };
 
     if (flagE)
     {
+        if (!outputPath.empty() && inputPaths.size() > 1)
+        {
+            std::cerr << "-E with -o supports exactly one input file\n";
+            return 1;
+        }
+
         if (outputPath.empty())
         {
-            std::cout << source;
+            for (size_t i = 0; i < inputPaths.size(); ++i)
+            {
+                std::string source;
+                if (!loadAndPreprocessSource(inputPaths[i], source))
+                    return -1;
+                std::cout << source;
+                if (i + 1 < inputPaths.size())
+                    std::cout << "\n";
+            }
         }
         else
         {
+            std::string source;
+            if (!loadAndPreprocessSource(inputPaths[0], source))
+                return -1;
             std::ofstream ppOut(outputPath);
             if (!ppOut.is_open())
             {
@@ -453,41 +483,64 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    Lexer lexer(source);
-    Parser parser(lexer);
-    auto ast = parser.parse();
-    semanticPass(ast);
-
-    if (!compileErrors.empty())
+    struct UnitOutput
     {
-        std::cerr << "Compilation failed with " << compileErrors.size() << " error(s)\n";
-        return 1;
+        std::string inputPath;
+        std::string asmFile;
+        std::string objFile;
+    };
+
+    std::vector<UnitOutput> units;
+    units.reserve(inputPaths.size());
+    for (const auto& in : inputPaths)
+    {
+        std::string base = stripExtension(in);
+        UnitOutput u;
+        u.inputPath = in;
+        u.asmFile = base + ".asm";
+        u.objFile = base + ".o";
+        units.push_back(std::move(u));
     }
 
-    std::string base = stripExtension(inputPath);
-    std::string asmFile = base + ".asm";
-    std::string objFile = base + ".o";
-    std::string exeFile = base;
+    std::string exeFile = stripExtension(inputPaths[0]);
 
     if (!outputPath.empty())
     {
-        if (flagS) asmFile = outputPath;
-        else if (flagC) objFile = outputPath;
-        else exeFile = outputPath;
+        if (flagS && inputPaths.size() == 1) units[0].asmFile = outputPath;
+        else if (flagC && inputPaths.size() == 1) units[0].objFile = outputPath;
+        else if (!flagS && !flagC) exeFile = outputPath;
     }
 
-    if (!asmOutPath.empty()) asmFile = asmOutPath;
-    if (!objOutPath.empty()) objFile = objOutPath;
+    if (!asmOutPath.empty()) units[0].asmFile = asmOutPath;
+    if (!objOutPath.empty()) units[0].objFile = objOutPath;
     if (!exeOutPath.empty()) exeFile = exeOutPath;
 
+    for (const auto& unit : units)
     {
-        std::ofstream file(asmFile);
+        std::string source;
+        if (!loadAndPreprocessSource(unit.inputPath, source))
+            return -1;
+
+        size_t errBefore = compileErrors.size();
+        Lexer lexer(source);
+        Parser parser(lexer);
+        auto ast = parser.parse();
+        semanticPass(ast);
+
+        if (compileErrors.size() > errBefore)
+        {
+            std::cerr << "Compilation failed with " << compileErrors.size() << " error(s)\n";
+            return 1;
+        }
+
+        std::ofstream file(unit.asmFile);
         if (!file.is_open())
         {
-            std::cerr << "Error creating output assembly file: " << asmFile << std::endl;
+            std::cerr << "Error creating output assembly file: " << unit.asmFile << std::endl;
             return -1;
         }
-        bool useReachabilityFilter = !flagS && !flagC;
+        // Multi-file builds need cross-TU callable functions preserved.
+        bool useReachabilityFilter = !flagS && !flagC && inputPaths.size() == 1;
         generateCode(ast, file, useReachabilityFilter);
     }
 
@@ -496,8 +549,9 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    for (const auto& unit : units)
     {
-        std::string cmd = fasmCmd + " " + shellQuote(asmFile) + " " + shellQuote(objFile);
+        std::string cmd = fasmCmd + " " + shellQuote(unit.asmFile) + " " + shellQuote(unit.objFile);
         int rc = std::system(cmd.c_str());
         if (rc != 0)
         {
@@ -512,7 +566,10 @@ int main(int argc, char** argv)
     }
 
     {
-        std::string cmd = ccCmd + " " + shellQuote(objFile) + " -o " + shellQuote(exeFile);
+        std::string cmd = ccCmd;
+        for (const auto& unit : units)
+            cmd += " " + shellQuote(unit.objFile);
+        cmd += " -o " + shellQuote(exeFile);
         for (const auto& a : linkArgs)
             cmd += " " + shellQuote(a);
         int rc = std::system(cmd.c_str());
