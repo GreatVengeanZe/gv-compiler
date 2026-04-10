@@ -1,4 +1,4 @@
-#include "preprocessor.h"
+#include "preprocessor.hpp"
 
 static bool localLookupName(const std::stack<std::map<std::string, VarInfo>>& s, const std::string& name)
 {

@@ -1,5 +1,5 @@
-#include "compiler.h"
-#include "lexer.h"
+#include "compiler.hpp"
+#include "lexer.hpp"
 
 std::unordered_map<std::string, StructTypeInfo> structTypes;
 int anonymousStructCounter = 0;

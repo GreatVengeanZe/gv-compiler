@@ -37,10 +37,10 @@ test-new-features-suite: test-new-features test-new-features-negative
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Header dependencies
-main.o: main.cpp preprocessor.h parser.h ast.h lexer.h compiler.h
-codegen.o: codegen.cpp preprocessor.h parser.h ast.h lexer.h compiler.h
-semantic.o: semantic.cpp preprocessor.h parser.h ast.h lexer.h compiler.h
-globals.o: globals.cpp lexer.h compiler.h
+main.o: main.cpp preprocessor.hpp parser.hpp ast.hpp lexer.hpp compiler.hpp
+codegen.o: codegen.cpp preprocessor.hpp parser.hpp ast.hpp lexer.hpp compiler.hpp
+semantic.o: semantic.cpp preprocessor.hpp parser.hpp ast.hpp lexer.hpp compiler.hpp
+globals.o: globals.cpp lexer.hpp compiler.hpp
 
 
 # # Clean up generated files

@@ -1,4 +1,4 @@
-#include "preprocessor.h"
+#include "preprocessor.hpp"
 
 void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstream& f, bool useReachabilityFilter = true);
 void semanticPass(const std::vector<std::unique_ptr<ASTNode>>& ast);

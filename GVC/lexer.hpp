@@ -1,5 +1,5 @@
 #pragma once
-#include "compiler.h"
+#include "compiler.hpp"
 
 class Lexer
 {

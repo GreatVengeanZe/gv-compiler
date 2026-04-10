@@ -1,4 +1,4 @@
-#include "preprocessor.h"
+#include "preprocessor.hpp"
 
 
 static void markRegularFunctionReference(const std::string& name, std::unordered_set<std::string>& refs)
