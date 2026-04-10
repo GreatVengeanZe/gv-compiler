@@ -1,3 +1,7 @@
 *.c linguist-vendored
-Makefile linguist-vendored
+*.h linguist-vendored
 *.asm linguist-vendored
+*.S linguist-vendored
+*.inc linguist-vendored
+*.inl linguist-vendored
+Makefile linguist-vendored
