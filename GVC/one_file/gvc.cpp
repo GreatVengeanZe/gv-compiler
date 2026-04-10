@@ -12003,7 +12003,7 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
                 continue;
             if (emittedExternalFunctions.insert(name).second)
             {
-                tf << std::endl << "extrn '" << name << "' as _" << name << std::endl;
+                tf << std::endl << "extrn \"" << name << "\" as _" << name << std::endl;
                 tf << name << " = PLT _" << name << std::endl;
             }
         }
@@ -12045,7 +12045,7 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 
     if (hasText)
     {
-        f << "section '.text' executable" << std::endl;
+        f << "section \".text\" executable" << std::endl;
         if (shouldExportMain)
             f  << std::endl << "public main" << std::endl;
         for (const auto& node : ast)
@@ -12066,7 +12066,7 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
     {
         if (hasText)
             f << std::endl;
-        f << "section '.data' writable" << std::endl;
+        f << "section \".data\" writable" << std::endl;
         f << dataPayload;
     }
 }
