@@ -4,4 +4,8 @@
 *.S linguist-vendored
 *.inc linguist-vendored
 *.inl linguist-vendored
+<<<<<<< HEAD
 Makefile linguist-vendored
+=======
+Makefile linguist-vendored
+>>>>>>> KiryatGat_1406_GV_Compiler/HEAD
