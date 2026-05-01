@@ -131,6 +131,42 @@ public:
         return token;
     }
 
+    // Check if current position starts with « (U+00AB, UTF-8: 0xC2 0xAB)
+    bool isAtLeftDoubleAngle()
+    {
+        return pos + 1 < source.size() && 
+               static_cast<unsigned char>(source[pos]) == 0xC2 && 
+               static_cast<unsigned char>(source[pos + 1]) == 0xAB;
+    }
+
+    // Check if current position starts with » (U+00BB, UTF-8: 0xC2 0xBB)
+    bool isAtRightDoubleAngle()
+    {
+        return pos + 1 < source.size() && 
+               static_cast<unsigned char>(source[pos]) == 0xC2 && 
+               static_cast<unsigned char>(source[pos + 1]) == 0xBB;
+    }
+
+    // Advance past « (2 bytes in UTF-8)
+    void advancePastLeftDoubleAngle()
+    {
+        if (isAtLeftDoubleAngle())
+        {
+            pos += 2;
+            col += 1; // Count the Unicode character as one column
+        }
+    }
+
+    // Advance past » (2 bytes in UTF-8)
+    void advancePastRightDoubleAngle()
+    {
+        if (isAtRightDoubleAngle())
+        {
+            pos += 2;
+            col += 1; // Count the Unicode character as one column
+        }
+    }
+
     Lexer(const std::string& source) : source(source) {}
 
      
@@ -153,12 +189,24 @@ public:
             // otherwise fall through to error
         }
 
-        if (ch == '"')
+        if (ch == '"' || isAtLeftDoubleAngle())
         {
-            advance(); // Consume the opening quote
-            std::string str;
-            while (peek() != '"' && peek() != '\0')
+            // Handle both " and « as opening quotes
+            if (ch == '"')
+                advance(); // Consume the opening quote
+            else
             {
+                if (pos + 10 < source.size())
+                {
+                    std::string peekBytes = source.substr(pos, 10);
+                }
+                advancePastLeftDoubleAngle(); // Consume « (2 bytes)
+            }
+
+            std::string str;
+            while (peek() != '\0')
+            {
+                // Check for line continuations
                 if (peek() == '\\' && pos + 1 < source.size() && source[pos + 1] == '\n')
                 {
                     advance();
@@ -172,6 +220,14 @@ public:
                     advance();
                     continue;
                 }
+
+                // Check for closing quote (either " or », depending on opening)
+                if (ch == '"' && peek() == '"')
+                    break;
+                if (ch != '"' && isAtRightDoubleAngle())
+                    break;
+
+                // Handle escape sequences
                 if (peek() == '\\') // escape sequence
                 {
                     advance(); // consume '\'
@@ -183,13 +239,27 @@ public:
                     str += advance();
                 }
             }
-            if (peek() != '"')
+
+            // Check for proper closing quote
+            bool closingFound = false;
+            if (ch == '"' && peek() == '"')
+                closingFound = true;
+            else if (ch != '"' && isAtRightDoubleAngle())
+                closingFound = true;
+
+            if (!closingFound)
             {
                 reportError(tokenLine, tokenCol, "Expected closing quote for string literal");
                 // attempt to recover by returning what we have so far
                 return Token{ TOKEN_STRING_LITERAL, str, tokenLine, tokenCol };
             }
-            advance(); // Consume the closing quote
+
+            // Consume the closing quote
+            if (ch == '"')
+                advance(); // Consume "
+            else
+                advancePastRightDoubleAngle(); // Consume »
+
             return Token{ TOKEN_STRING_LITERAL, str, tokenLine, tokenCol };
         }
 

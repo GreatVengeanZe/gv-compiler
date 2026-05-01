@@ -58,6 +58,18 @@ private:
         return rtrim(ltrim(s));
     }
 
+    static bool isAtLeftDoubleAngle(const std::string& s, size_t i)
+    {
+        return i + 1 < s.size() && static_cast<unsigned char>(s[i]) == 0xC2 &&
+               static_cast<unsigned char>(s[i + 1]) == 0xAB;
+    }
+
+    static bool isAtRightDoubleAngle(const std::string& s, size_t i)
+    {
+        return i + 1 < s.size() && static_cast<unsigned char>(s[i]) == 0xC2 &&
+               static_cast<unsigned char>(s[i + 1]) == 0xBB;
+    }
+
     static std::string joinTokens(const std::vector<std::string>& tokens)
     {
         std::string out;
@@ -400,6 +412,23 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
                 continue;
             }
 
+            if (!inString && !inChar && isAtLeftDoubleAngle(line, i))
+            {
+                out.push_back(line[i]);
+                out.push_back(line[i + 1]);
+                inString = true;
+                ++i;
+                continue;
+            }
+            if (inString && !inChar && isAtRightDoubleAngle(line, i))
+            {
+                out.push_back(line[i]);
+                out.push_back(line[i + 1]);
+                inString = false;
+                ++i;
+                continue;
+            }
+
             out.push_back(c);
             if (escape)
             {
@@ -516,26 +545,46 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
                 continue;
             }
 
-            if (c == '"' || c == '\'')
+            if (c == '"' || c == '\'' || isAtLeftDoubleAngle(text, i))
             {
-                char quote = c;
-                size_t start = i++;
+                bool isFrench = isAtLeftDoubleAngle(text, i);
+                size_t start = i;
+                if (isFrench)
+                    i += 2;
+                else
+                    ++i;
                 bool escape = false;
                 while (i < text.size())
                 {
-                    char d = text[i++];
                     if (escape)
                     {
                         escape = false;
+                        ++i;
                         continue;
                     }
+                    char d = text[i];
                     if (d == '\\')
                     {
                         escape = true;
+                        ++i;
                         continue;
                     }
-                    if (d == quote)
+                    if (isFrench)
+                    {
+                        if (isAtRightDoubleAngle(text, i))
+                        {
+                            i += 2;
+                            break;
+                        }
+                        ++i;
+                        continue;
+                    }
+                    if (d == c)
+                    {
+                        ++i;
                         break;
+                    }
+                    ++i;
                 }
                 tokens.push_back(text.substr(start, i - start));
                 continue;
@@ -643,6 +692,22 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
                 continue;
             }
 
+            if (!inString && !inChar && isAtLeftDoubleAngle(text, i))
+            {
+                out.push_back(text[i]);
+                out.push_back(text[i + 1]);
+                inString = true;
+                ++i;
+                continue;
+            }
+            if (inString && !inChar && isAtRightDoubleAngle(text, i))
+            {
+                out.push_back(text[i]);
+                out.push_back(text[i + 1]);
+                inString = false;
+                ++i;
+                continue;
+            }
             out.push_back(c);
             if (escape)
             {

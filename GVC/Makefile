@@ -46,8 +46,7 @@ globals.o: globals.cpp lexer.hpp compiler.hpp
 # # Clean up generated files
 clean:
 	rm -f $(COMPILER_EXEC) $(COMPILER_OBJS) $(OUTPUT_ASM) $(OUTPUT_OBJ) $(OUTPUT_EXEC)
-	rm -f test_new_features.asm test_new_features.o test_new_features
-	rm -f should_not_build.asm should_not_build.o should_not_build
+	rm -f test test.asm test.o
 
 # Phony targets
 .PHONY: all clean test-new-features test-new-features-keep test-new-features-negative test-new-features-suite

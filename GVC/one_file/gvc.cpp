@@ -1174,6 +1174,42 @@ public:
         return token;
     }
 
+    // Check if current position starts with « (U+00AB, UTF-8: 0xC2 0xAB)
+    bool isAtLeftDoubleAngle()
+    {
+        return pos + 1 < source.size() && 
+               static_cast<unsigned char>(source[pos]) == 0xC2 && 
+               static_cast<unsigned char>(source[pos + 1]) == 0xAB;
+    }
+
+    // Check if current position starts with » (U+00BB, UTF-8: 0xC2 0xBB)
+    bool isAtRightDoubleAngle()
+    {
+        return pos + 1 < source.size() && 
+               static_cast<unsigned char>(source[pos]) == 0xC2 && 
+               static_cast<unsigned char>(source[pos + 1]) == 0xBB;
+    }
+
+    // Advance past « (2 bytes in UTF-8)
+    void advancePastLeftDoubleAngle()
+    {
+        if (isAtLeftDoubleAngle())
+        {
+            pos += 2;
+            col += 1; // Count the Unicode character as one column
+        }
+    }
+
+    // Advance past » (2 bytes in UTF-8)
+    void advancePastRightDoubleAngle()
+    {
+        if (isAtRightDoubleAngle())
+        {
+            pos += 2;
+            col += 1; // Count the Unicode character as one column
+        }
+    }
+
     Lexer(const std::string& source) : source(source) {}
 
      
@@ -1196,12 +1232,18 @@ public:
             // otherwise fall through to error
         }
 
-        if (ch == '"')
+        if (ch == '"' || isAtLeftDoubleAngle())
         {
-            advance(); // Consume the opening quote
+            // Handle both " and « as opening quotes
+            if (ch == '"')
+                advance(); // Consume the opening quote
+            else
+                advancePastLeftDoubleAngle(); // Consume « (2 bytes)
+
             std::string str;
-            while (peek() != '"' && peek() != '\0')
+            while (peek() != '\0')
             {
+                // Check for line continuations
                 if (peek() == '\\' && pos + 1 < source.size() && source[pos + 1] == '\n')
                 {
                     advance();
@@ -1215,6 +1257,14 @@ public:
                     advance();
                     continue;
                 }
+
+                // Check for closing quote (either " or », depending on opening)
+                if (ch == '"' && peek() == '"')
+                    break;
+                if (ch != '"' && isAtRightDoubleAngle())
+                    break;
+
+                // Handle escape sequences
                 if (peek() == '\\') // escape sequence
                 {
                     advance(); // consume '\'
@@ -1226,13 +1276,27 @@ public:
                     str += advance();
                 }
             }
-            if (peek() != '"')
+
+            // Check for proper closing quote
+            bool closingFound = false;
+            if (ch == '"' && peek() == '"')
+                closingFound = true;
+            else if (ch != '"' && isAtRightDoubleAngle())
+                closingFound = true;
+
+            if (!closingFound)
             {
                 reportError(tokenLine, tokenCol, "Expected closing quote for string literal");
                 // attempt to recover by returning what we have so far
                 return Token{ TOKEN_STRING_LITERAL, str, tokenLine, tokenCol };
             }
-            advance(); // Consume the closing quote
+
+            // Consume the closing quote
+            if (ch == '"')
+                advance(); // Consume "
+            else
+                advancePastRightDoubleAngle(); // Consume »
+
             return Token{ TOKEN_STRING_LITERAL, str, tokenLine, tokenCol };
         }
 
@@ -9829,6 +9893,18 @@ private:
         return std::isalnum(uch) || ch == '_';
     }
 
+    static bool isAtLeftDoubleAngle(const std::string& s, size_t i)
+    {
+        return i + 1 < s.size() && static_cast<unsigned char>(s[i]) == 0xC2 &&
+               static_cast<unsigned char>(s[i + 1]) == 0xAB;
+    }
+
+    static bool isAtRightDoubleAngle(const std::string& s, size_t i)
+    {
+        return i + 1 < s.size() && static_cast<unsigned char>(s[i]) == 0xC2 &&
+               static_cast<unsigned char>(s[i + 1]) == 0xBB;
+    }
+
     static std::string ltrim(const std::string& s)
     {
         size_t i = 0;
@@ -10212,6 +10288,23 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
                 continue;
             }
 
+            if (!inString && !inChar && isAtLeftDoubleAngle(line, i))
+            {
+                out.push_back(line[i]);
+                out.push_back(line[i + 1]);
+                inString = true;
+                ++i;
+                continue;
+            }
+            if (inString && !inChar && isAtRightDoubleAngle(line, i))
+            {
+                out.push_back(line[i]);
+                out.push_back(line[i + 1]);
+                inString = false;
+                ++i;
+                continue;
+            }
+
             out.push_back(c);
             if (escape)
             {
@@ -10328,26 +10421,46 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
                 continue;
             }
 
-            if (c == '"' || c == '\'')
+            if (c == '"' || c == '\'' || isAtLeftDoubleAngle(text, i))
             {
-                char quote = c;
-                size_t start = i++;
+                bool isFrench = isAtLeftDoubleAngle(text, i);
+                size_t start = i;
+                if (isFrench)
+                    i += 2;
+                else
+                    ++i;
                 bool escape = false;
                 while (i < text.size())
                 {
-                    char d = text[i++];
                     if (escape)
                     {
                         escape = false;
+                        ++i;
                         continue;
                     }
+                    char d = text[i];
                     if (d == '\\')
                     {
                         escape = true;
+                        ++i;
                         continue;
                     }
-                    if (d == quote)
+                    if (isFrench)
+                    {
+                        if (isAtRightDoubleAngle(text, i))
+                        {
+                            i += 2;
+                            break;
+                        }
+                        ++i;
+                        continue;
+                    }
+                    if (d == c)
+                    {
+                        ++i;
                         break;
+                    }
+                    ++i;
                 }
                 tokens.push_back(text.substr(start, i - start));
                 continue;
@@ -10452,6 +10565,23 @@ static void collectReferencedFunctionsStatement(const ASTNode* node, std::unorde
                     ++i;
                 if (i < text.size() && text[i] == '\n')
                     out.push_back('\n');
+                continue;
+            }
+
+            if (!inString && !inChar && isAtLeftDoubleAngle(text, i))
+            {
+                out.push_back(text[i]);
+                out.push_back(text[i + 1]);
+                inString = true;
+                ++i;
+                continue;
+            }
+            if (inString && !inChar && isAtRightDoubleAngle(text, i))
+            {
+                out.push_back(text[i]);
+                out.push_back(text[i + 1]);
+                inString = false;
+                ++i;
                 continue;
             }
 
@@ -12003,7 +12133,7 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
                 continue;
             if (emittedExternalFunctions.insert(name).second)
             {
-                tf << std::endl << "extrn \"" << name << "\" as _" << name << std::endl;
+                tf << std::endl << "extrn '" << name << "' as _" << name << std::endl;
                 tf << name << " = PLT _" << name << std::endl;
             }
         }
@@ -12045,7 +12175,7 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
 
     if (hasText)
     {
-        f << "section \".text\" executable" << std::endl;
+        f << "section '.text' executable" << std::endl;
         if (shouldExportMain)
             f  << std::endl << "public main" << std::endl;
         for (const auto& node : ast)
@@ -12066,7 +12196,7 @@ void generateCode(const std::vector<std::unique_ptr<ASTNode>>& ast, std::ofstrea
     {
         if (hasText)
             f << std::endl;
-        f << "section \".data\" writable" << std::endl;
+        f << "section '.data' writable" << std::endl;
         f << dataPayload;
     }
 }
